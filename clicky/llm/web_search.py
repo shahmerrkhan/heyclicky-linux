@@ -1,4 +1,4 @@
-"""Web search via Tavily, for questions typed with a `/s` prefix.
+"""Web search via Tavily, for questions typed with a `/s` prefix (see prefixes.py).
 
 Results go to Gemini as plain text, clearly marked as untrusted reference
 material, and come back to the bubble as a "sources:" line of links.
@@ -25,8 +25,6 @@ from tavily.errors import TimeoutError as TavilyTimeoutError
 
 logger = logging.getLogger(__name__)
 
-
-SEARCH_PREFIX = "/s"
 
 # Fixed search shape: "advanced" depth costs 2 credits per search.
 SEARCH_DEPTH = "advanced"
@@ -61,16 +59,6 @@ class SearchOutcome:
     @property
     def ok(self) -> bool:
         return self.error_kind is None
-
-
-def split_search_prefix(prompt: str) -> tuple[bool, str]:
-    """`/s what's new in python` → (True, "what's new in python")."""
-    stripped = prompt.strip()
-    if stripped == SEARCH_PREFIX:
-        return True, ""
-    if stripped.startswith(SEARCH_PREFIX + " "):
-        return True, stripped[len(SEARCH_PREFIX) :].strip()
-    return False, prompt
 
 
 def site_name(url: str) -> str:

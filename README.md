@@ -8,7 +8,7 @@ Clicky is the little AI buddy that lives next to your cursor. Hit a hotkey, ask 
 
 Clicky has two modes you can flip between in the input bar:
 
-- **Vision mode** (default): screenshot + question → Gemini (called directly; start a question with `/s` to add Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
+- **Vision mode** (default): screenshot + question → Gemini (called directly; start a question with `/p` for the strong model or `/s` to add Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
 - **Code mode**: prompt → spawns `claude -p` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) as a subprocess in a configured workspace → its progress (text + tool calls) streams into the same bubble. Lets you ask Clicky to *do* things in a directory, not just describe what it sees.
 
 ## Quick start
@@ -36,9 +36,17 @@ No proxy or server is needed: the app calls the Gemini API directly. (The `worke
 
 A blue triangle icon shows up in the system tray. Without a `GEMINI_API_KEY` or `TAVILY_API_KEY` Clicky still starts (Code mode works); a tray notification tells you what's off until the key is set. Press **Ctrl+Alt+Space** to open the input.
 
-## Strong model, fast model
+## Fast model, strong model, and `/p`
 
-Every question goes to the strong model first (`GEMINI_MODEL`, default `gemini-3.8-flash`, medium thinking). If it hasn't produced its first word within 10 seconds, it's cancelled and the same screenshot and question go to the fast model (`GEMINI_FAST_MODEL`, default `gemini-3.5-flash-lite`, low thinking). A "busy" error gets one retry after 2 seconds inside that window; a used-up daily or per-minute limit switches to the other model straight away. The fast model gets its own 10-second window and one retry. When the fast model gives the answer, the bubble footer says so. Closing the bubble cancels everything in flight.
+Every question goes to the **fast model** first (`GEMINI_FAST_MODEL`, default `gemini-3.5-flash-lite`, medium thinking) with a 10-second first-word timer. If it fails, the **strong model** (`GEMINI_MODEL`, default `gemini-3.8-flash`, medium thinking) takes over with a 20-second timer. They alternate fast → strong for 3 rounds, with a 3-second pause between rounds, and then Clicky shows an error.
+
+- Each try gets one retry after 2 seconds if the model says it's busy.
+- Busy, a used-up limit, too slow (no first word in time), and an empty answer all move on to the other model. A blocked answer (safety filter) is shown with its reason. A bad key, unknown model, or bad request stops right away.
+- A model that reports its **daily** limit used up is skipped until midnight Pacific, so later questions go straight to the other one. If both are at their daily limits you get the error immediately.
+- Start a question with **`/p`** to ask the strong model first, with a 90-second timer. If it fails, the footer says why and the fast model answers instead (no alternating after that).
+- Prefixes: `/p` (strong) and `/s` (search) work in any order and any case — `/p /s`, `/S /P`, `/ps`, `/Sp`. A small **strong** / **search** chip in the input bar shows what a typed prefix will do. Prefixes only apply in vision mode.
+- The footer always names the model that answered, e.g. `answered by the strong model (gemini-3.8-flash) after 3 tries — the fast model was busy`. While switching, the bubble shows `trying <model>…`.
+- Once an answer starts it is never cut off. Closing the bubble cancels everything in flight. Both models share one conversation history.
 
 ## Web search (`/s`)
 
@@ -85,8 +93,8 @@ Screenshot (mss, all monitors)
    ↓
 (/s only) Tavily web search → results as untrusted text
    ↓
-Gemini API (google-genai SDK): strong model, 10 s first-word timer
-   ↓ busy → retry once · too slow / limit → fast model
+Gemini API (google-genai SDK): fast model first (10 s first-word timer),
+   ↓ fails → strong model (20 s), alternating 3 rounds · /p → strong (90 s) then fast
    ↓ streamed chunks
 Bubble UI (text streaming, then sources + notes + usage footer)
    ↓ [POINT:x,y] if present (0-1000 scale, x across then y down)
@@ -97,7 +105,8 @@ Convert to screen pixels (clamped) → blue cursor bezier animation
 |---|---|---|
 | State machine | `clicky/state.py` | `CompanionManager.swift` |
 | LLM streaming client | `clicky/llm/gemini.py` | `ClaudeAPI.swift` |
-| Strong/fast model switch + retry | `clicky/llm/model_router.py` | (new) |
+| Fast/strong model order, retry, fallback | `clicky/llm/model_router.py` | (new) |
+| `/p` and `/s` prefixes | `clicky/llm/prefixes.py` | (new) |
 | Web search (Tavily) | `clicky/llm/web_search.py` | (new) |
 | POINT parser | `clicky/llm/point_parser.py` | `CompanionManager.parsePointingCoordinates` |
 | Screenshot | `clicky/screen/capture.py` | `CompanionScreenCaptureUtility.swift` |

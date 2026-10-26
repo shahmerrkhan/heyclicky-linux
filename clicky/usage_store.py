@@ -6,6 +6,9 @@ many of those used web search. Failed, blocked, and cut-off answers aren't
 counted, and a retry or a switch to the fast model never counts twice.
 "Today" follows Google's quota day, which resets at midnight Pacific time.
 
+Gemini models that report their daily limit used up are remembered until
+the same midnight-Pacific reset, so later questions skip them.
+
 Tavily credits are counted per calendar month (reset on the 1st, local time)
 whenever a search succeeds — Tavily charges for the search even if Gemini
 then fails to answer. When Tavily reports the credits are used up, search is
@@ -20,7 +23,7 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -37,6 +40,7 @@ class Usage:
     day: str = ""  # Pacific calendar date, ISO format
     questions: int = 0
     searches: int = 0  # successful answers today that used web search
+    daily_limited_models: list[str] = field(default_factory=list)
     month: str = ""  # local calendar month, "YYYY-MM"
     search_credits: int = 0
     search_credits_exhausted: bool = False
@@ -85,6 +89,15 @@ class UsageTracker:
             self._usage.searches += 1
         self._save()
 
+    def is_daily_limited(self, model: str) -> bool:
+        return model in self.usage.daily_limited_models
+
+    def mark_daily_limited(self, model: str) -> None:
+        self._roll_over()
+        if model not in self._usage.daily_limited_models:
+            self._usage.daily_limited_models.append(model)
+            self._save()
+
     def record_search_credits(self, credits: int) -> None:
         self._roll_over()
         self._usage.search_credits += credits
@@ -101,6 +114,7 @@ class UsageTracker:
             self._usage.day = today
             self._usage.questions = 0
             self._usage.searches = 0
+            self._usage.daily_limited_models = []
         month = _this_month()
         if self._usage.month != month:
             self._usage.month = month
@@ -117,6 +131,7 @@ class UsageTracker:
                     day=str(data.get("day", "")),
                     questions=int(data.get("questions", 0)),
                     searches=int(data.get("searches", 0)),
+                    daily_limited_models=[str(m) for m in data.get("daily_limited_models", [])],
                     month=str(data.get("month", "")),
                     search_credits=int(data.get("search_credits", 0)),
                     search_credits_exhausted=bool(data.get("search_credits_exhausted", False)),

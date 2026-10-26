@@ -18,6 +18,7 @@ from .llm.claude_code import ClaudeCodeClient, ClaudeCodeError, ClaudeCodeReques
 from .llm.gemini import ConversationTurn, GeminiClient, GeminiReply, GeminiRequest, LabeledImage
 from .llm.model_router import ModelChoice, ModelRouter, RoutedAnswer, RouterError
 from .llm.point_parser import PointingResult, parse_point_tag
+from .llm.prefixes import parse_prefixes
 from .llm.prompts import COMPANION_TEXT_RESPONSE_SYSTEM_PROMPT
 from .screen.capture import CapturedScreen, capture_all_screens, capture_region
 from .screen.monitors import find_monitor_at_global_point
@@ -28,7 +29,6 @@ from .llm.web_search import (
     format_for_model,
     one_link_per_site,
     site_name,
-    split_search_prefix,
 )
 from .state_store import AgentMode, PersistedState, load_state, save_state
 from .ui.design import Colors
@@ -61,9 +61,9 @@ class CompanionStateMachine(QObject):
     """Central orchestrator. Equivalent to CompanionManager.swift.
 
     Two operating modes:
-      - vision (default): screenshot + question (+ Tavily web results when the
-        question starts with /s) → Gemini, strong model first with a timed
-        switch to the fast model → streamed answer + [POINT] cursor animation.
+      - vision (default): screenshot + question (+ Tavily web results with
+        /s) → Gemini, fast model first with the strong model as backup (or
+        strong first with /p) → streamed answer + [POINT] cursor animation.
       - code: question → spawn `claude -p` as a subprocess in a configured
         workspace → stream Claude Code's progress (text + tool chips) into
         the same bubble.
@@ -207,9 +207,13 @@ class CompanionStateMachine(QObject):
                 self._set_state(CompanionState.IDLE)
                 return
 
-            wants_search, question = split_search_prefix(prompt)
-            if wants_search and not question:
-                self._overlay.update_bubble_text('type a question after /s, e.g. "/s latest python release".')
+            parsed_prompt = parse_prefixes(prompt)
+            question = parsed_prompt.question
+            if parsed_prompt.has_prefix and not question:
+                prefix = parsed_prompt.prefix_text
+                self._overlay.update_bubble_text(
+                    f'type a question after {prefix}, e.g. "{prefix} latest python release".'
+                )
                 self._set_state(CompanionState.IDLE)
                 return
             router = self._ensure_clients()
@@ -226,7 +230,7 @@ class CompanionStateMachine(QObject):
             else:
                 screens = await asyncio.to_thread(capture_all_screens, primary_index)
 
-            if wants_search:
+            if parsed_prompt.search:
                 search, search_note = await self._run_search(question)
                 self._overlay.update_bubble_text("…")
             request = self._build_vision_request(question, screens, search)
@@ -242,6 +246,8 @@ class CompanionStateMachine(QObject):
                 request=request,
                 system_prompt=COMPANION_TEXT_RESPONSE_SYSTEM_PROMPT,
                 on_text=show_streaming,
+                on_status=self._overlay.update_bubble_text,
+                prefer_strong=parsed_prompt.strong,
             )
             reply = answer.reply
             parsed = parse_point_tag(reply.text)
@@ -285,16 +291,22 @@ class CompanionStateMachine(QObject):
             self._gemini = GeminiClient(api_key=settings.gemini_api_key, max_tokens=settings.max_tokens)
             self._router = ModelRouter(
                 client=self._gemini,
-                strong=ModelChoice(
-                    model=settings.gemini_model,
-                    thinking_level=settings.gemini_thinking_level,
-                    first_word_timeout_s=settings.first_word_timeout_s,
-                ),
                 fast=ModelChoice(
+                    role="fast",
                     model=settings.gemini_fast_model,
                     thinking_level=settings.gemini_fast_thinking_level,
                     first_word_timeout_s=settings.fast_first_word_timeout_s,
                 ),
+                strong=ModelChoice(
+                    role="strong",
+                    model=settings.gemini_model,
+                    thinking_level=settings.gemini_thinking_level,
+                    first_word_timeout_s=settings.strong_takeover_timeout_s,
+                ),
+                strong_on_request_timeout_s=settings.strong_request_timeout_s,
+                limits=self._usage,
+                rounds=settings.fallback_rounds,
+                round_pause_s=settings.round_pause_s,
                 retry_wait_s=settings.retry_wait_s,
             )
         if self._web_search is None and settings.tavily_api_key.strip():
@@ -376,10 +388,8 @@ class CompanionStateMachine(QObject):
         if search_note:
             sections.append(html.escape(search_note))
 
-        if answer is not None and answer.used_fast_model:
-            sections.append(
-                html.escape(f"answered by the fast model ({answer.model}) — {answer.switch_reason}.")
-            )
+        if answer is not None:
+            sections.append(html.escape(_answered_by_line(answer)))
 
         usage = self._usage.usage
         reset_local = next_reset().astimezone().strftime("%H:%M")
@@ -490,6 +500,16 @@ def _gemini_setup_problem() -> str | None:
             f"{ENV_FILE} (or remove the empty lines to use the defaults) and restart clicky."
         )
     return None
+
+
+def _answered_by_line(answer: RoutedAnswer) -> str:
+    """e.g. "answered by the strong model (gemini-3.8-flash) after 3 tries — the fast model was busy"."""
+    line = f"answered by the {answer.choice.role} model ({answer.choice.model})"
+    if answer.tries > 1:
+        line += f" after {answer.tries} tries"
+    if answer.first_failure_reason:
+        line += f" — {answer.first_failure_reason}"
+    return line + "."
 
 
 def _credits_used_up_note() -> str:

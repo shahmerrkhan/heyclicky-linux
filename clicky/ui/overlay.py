@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..llm.prefixes import parse_prefixes
 from .area_selector import AreaSelectorOverlay
 from .cursor import BlueCursor
 from .design import Colors, Radius
@@ -110,7 +111,16 @@ class _InputCard(QWidget):
         _palette = self._line_edit.palette()
         _palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(Colors.TEXT_ON_METAL_PLACEHOLDER))
         self._line_edit.setPalette(_palette)
+        self._line_edit.textChanged.connect(self._refresh_prefix_chip)
         row.addWidget(self._line_edit, stretch=1)
+
+        # Shows "strong" / "search" while a /p, /s (or /ps, /sp) prefix is typed
+        # in vision mode. Uses the router's own parser so it always matches.
+        self._prefix_chip = QLabel("", self._card)
+        self._prefix_chip.setObjectName("prefixChip")
+        self._prefix_chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._prefix_chip.hide()
+        row.addWidget(self._prefix_chip)
 
         self._badge = QFrame(self._card)
         self._badge.setObjectName("badge")
@@ -260,6 +270,14 @@ class _InputCard(QWidget):
                 border-color: #b3261e;
                 color: white;
             }}
+            QLabel#prefixChip {{
+                background-color: {Colors.ACCENT_BLUE_DEEP};
+                border-radius: 8px;
+                color: white;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 600;
+            }}
             QFrame#badge {{
                 background-color: rgba(31, 111, 208, 60);
                 border: 1px solid rgba(31, 111, 208, 140);
@@ -330,9 +348,21 @@ class _InputCard(QWidget):
         self._line_edit.setPlaceholderText(
             "ask claude code…" if self._mode == "code" else "ask clicky anything…"
         )
+        self._refresh_prefix_chip()
         self.adjustSize()
 
     # --- internals ---------------------------------------------------------
+
+    def _refresh_prefix_chip(self) -> None:
+        labels: list[str] = []
+        if self._mode == "vision":
+            parsed = parse_prefixes(self._line_edit.text())
+            if parsed.strong:
+                labels.append("strong")
+            if parsed.search:
+                labels.append("search")
+        self._prefix_chip.setText(" · ".join(labels))
+        self._prefix_chip.setVisible(bool(labels))
 
     def _on_mode_button_clicked(self) -> None:
         new_mode = "code" if self._mode_btn.isChecked() else "vision"

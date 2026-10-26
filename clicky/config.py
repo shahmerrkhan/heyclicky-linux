@@ -33,25 +33,34 @@ class Settings(BaseSettings):
     )
     gemini_model: str = Field(
         default="gemini-3.8-flash",
-        description="Strong Gemini model, tried first for every vision question.",
+        description="Strong Gemini model: backup when the fast one fails, or first with /p.",
     )
     gemini_thinking_level: str = Field(default="medium", description="Thinking level for GEMINI_MODEL.")
     gemini_fast_model: str = Field(
         default="gemini-3.5-flash-lite",
-        description="Fast Gemini model, used when the strong one is too slow, busy, or out of quota.",
+        description="Fast Gemini model, answers every question first (unless /p).",
     )
     gemini_fast_thinking_level: str = Field(
-        default="low",
+        default="medium",
         description="Thinking level for GEMINI_FAST_MODEL.",
-    )
-    first_word_timeout_s: float = Field(
-        default=10.0,
-        description="Seconds the strong model (attempt + retry) gets to produce its first word.",
     )
     fast_first_word_timeout_s: float = Field(
         default=10.0,
-        description="Seconds the fast model (attempt + retry) gets to produce its first word.",
+        description="Seconds the fast model (attempt + busy retry) gets to produce its first word.",
     )
+    strong_takeover_timeout_s: float = Field(
+        default=20.0,
+        description="Seconds the strong model gets when it takes over from a failed fast model.",
+    )
+    strong_request_timeout_s: float = Field(
+        default=90.0,
+        description="Seconds the strong model gets when asked for with /p.",
+    )
+    fallback_rounds: int = Field(
+        default=3,
+        description="Rounds of fast-then-strong tries before giving up (default flow only).",
+    )
+    round_pause_s: float = Field(default=3.0, description="Pause between fallback rounds.")
     retry_wait_s: float = Field(default=2.0, description="Wait before retrying a busy model.")
 
     tavily_api_key: str = Field(
@@ -107,7 +116,7 @@ class Settings(BaseSettings):
         level = value.strip().lower()
         if level in ALLOWED_THINKING_LEVELS:
             return level
-        fallback = "medium" if info.field_name == "gemini_thinking_level" else "low"
+        fallback = "medium"
         logger.warning(
             "%s=%r isn't one of %s; using %r",
             info.field_name.upper(),

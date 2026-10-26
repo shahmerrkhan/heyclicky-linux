@@ -1,27 +1,30 @@
-"""Strong-model-first answering with a timed switch to the fast model.
+"""Fast-model-first answering, with the strong model as backup or on request.
 
-For one question:
-  1. Ask the strong model. A first-word timer covers this attempt and its
-     single retry together: if no text has arrived when it runs out, the
-     request is cancelled and the fast model takes over.
-  2. "Busy" errors (503 and friends, network drops) get one retry after a
-     short wait, as long as the timer has room for it; otherwise switch.
-  3. A per-minute or daily limit on one model switches to the other model.
-  4. The fast model gets its own first-word timer and the same single retry.
-  5. Errors a switch can't fix (bad key, model not found, bad request) stop
-     right away.
+Default order (no /p): fast, strong, fast, strong, ... for `rounds` rounds,
+with a short pause between rounds, then an error.
+With /p: strong (long timer), then fast, then an error. No alternating.
+
+Each try is one model under one first-word timer that also covers a single
+retry after a "busy" error. A try fails when the model is too slow (no first
+word in time), busy, at a per-minute or daily limit, or sends back an empty
+answer; the next try in the order then takes over. A daily limit also skips
+that model for the rest of the question and is remembered (until midnight
+Pacific) so later questions go straight to the other model. A blocked answer
+is shown as-is. Bad key, unknown model, and bad request stop right away.
 
 Once the first word arrives the answer streams to the end with no time limit.
-The whole thing runs inside the caller's asyncio task, so cancelling that
-task (bubble closed, app quitting) cancels any timer, retry wait, or request.
+Everything runs inside the caller's asyncio task, so cancelling that task
+(bubble closed, app quitting) cancels any timer, pause, retry, or request.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import Callable
+from enum import Enum, auto
+from typing import Callable, Protocol
 
 from .gemini import (
     GeminiClient,
@@ -35,38 +38,65 @@ from .gemini import (
 logger = logging.getLogger(__name__)
 
 
-_LIMIT_KINDS = (GeminiErrorKind.RATE_LIMITED, GeminiErrorKind.DAILY_QUOTA)
+class FailureKind(Enum):
+    TOO_SLOW = auto()
+    BUSY = auto()
+    RATE_LIMITED = auto()
+    DAILY_QUOTA = auto()
+    EMPTY = auto()
+    # These stop right away; switching models can't fix them.
+    BAD_KEY = auto()
+    MODEL_NOT_FOUND = auto()
+    OTHER = auto()
+
+
+_FATAL_KINDS = (FailureKind.BAD_KEY, FailureKind.MODEL_NOT_FOUND, FailureKind.OTHER)
+
+_FROM_GEMINI = {
+    GeminiErrorKind.BUSY: FailureKind.BUSY,
+    GeminiErrorKind.RATE_LIMITED: FailureKind.RATE_LIMITED,
+    GeminiErrorKind.DAILY_QUOTA: FailureKind.DAILY_QUOTA,
+    GeminiErrorKind.BAD_KEY: FailureKind.BAD_KEY,
+    GeminiErrorKind.MODEL_NOT_FOUND: FailureKind.MODEL_NOT_FOUND,
+    GeminiErrorKind.OTHER: FailureKind.OTHER,
+}
 
 
 @dataclass(frozen=True)
 class ModelChoice:
+    role: str  # "fast" or "strong", used in user-facing messages
     model: str
     thinking_level: str
     first_word_timeout_s: float
 
 
+class DailyLimitMemory(Protocol):
+    def is_daily_limited(self, model: str) -> bool: ...
+    def mark_daily_limited(self, model: str) -> None: ...
+
+
 @dataclass
 class RoutedAnswer:
     reply: GeminiReply
-    model: str
-    used_fast_model: bool
-    # Why the strong model didn't answer (None when it did).
-    switch_reason: str | None = None
+    choice: ModelChoice
+    tries: int = 1
+    # Why the first choice didn't answer (None when it did).
+    first_failure_reason: str | None = None
     # Set when the connection broke after the answer had started streaming.
     interrupted_error: str | None = None
 
 
 class RouterError(Exception):
-    """Neither model produced an answer. `str(exc)` is the user-facing message."""
+    """No model produced an answer. `str(exc)` is the user-facing message."""
 
-    def __init__(self, message: str, kind: GeminiErrorKind | None = None) -> None:
+    def __init__(self, message: str, kind: FailureKind | None = None) -> None:
         super().__init__(message)
         self.kind = kind
 
 
 @dataclass
 class _AttemptFailure:
-    kind: GeminiErrorKind | None  # None = first-word timer ran out
+    kind: FailureKind
     detail: str
 
 
@@ -80,40 +110,91 @@ class ModelRouter:
     def __init__(
         self,
         client: GeminiClient,
-        strong: ModelChoice,
         fast: ModelChoice,
+        strong: ModelChoice,
+        strong_on_request_timeout_s: float,
+        limits: DailyLimitMemory,
+        rounds: int = 3,
+        round_pause_s: float = 3.0,
         retry_wait_s: float = 2.0,
     ) -> None:
         self._client = client
-        self._strong = strong
         self._fast = fast
+        self._strong = strong
+        self._strong_on_request = dataclasses.replace(
+            strong, first_word_timeout_s=strong_on_request_timeout_s
+        )
+        self._limits = limits
+        self._rounds = max(1, rounds)
+        self._round_pause_s = round_pause_s
         self._retry_wait_s = retry_wait_s
+
+    def _plan(self, prefer_strong: bool) -> list[tuple[int, ModelChoice]]:
+        """(round number, model) pairs in the order they're tried."""
+        if prefer_strong:
+            return [(0, self._strong_on_request), (0, self._fast)]
+        plan: list[tuple[int, ModelChoice]] = []
+        for round_number in range(self._rounds):
+            plan += [(round_number, self._fast), (round_number, self._strong)]
+        return plan
 
     async def answer(
         self,
         request: GeminiRequest,
         system_prompt: str,
         on_text: Callable[[str], None],
+        on_status: Callable[[str], None],
+        prefer_strong: bool = False,
     ) -> RoutedAnswer:
-        """Stream an answer into `on_text` (cumulative text) and return it."""
-        strong_failure: _AttemptFailure | None = None
-        try:
-            return await self._run_model(self._strong, request, system_prompt, on_text, used_fast=False)
-        except _AttemptFailed as exc:
-            strong_failure = exc.failure
-            if strong_failure.kind is not None and strong_failure.kind not in (
-                GeminiErrorKind.BUSY,
-                *_LIMIT_KINDS,
-            ):
-                raise RouterError(_fatal_message(strong_failure, self._strong.model), strong_failure.kind)
-            logger.info("switching to fast model: %s", strong_failure.detail)
+        """Stream an answer into `on_text` (cumulative text) and return it.
 
-        try:
-            answer = await self._run_model(self._fast, request, system_prompt, on_text, used_fast=True)
-        except _AttemptFailed as exc:
-            raise RouterError(_both_failed_message(strong_failure, exc.failure, self._fast.model)) from None
-        answer.switch_reason = _switch_reason(strong_failure, self._strong.first_word_timeout_s)
-        return answer
+        `on_status` gets short progress notes ("trying <model>…") while no
+        answer has started yet.
+        """
+        if self._limits.is_daily_limited(self._fast.model) and self._limits.is_daily_limited(
+            self._strong.model
+        ):
+            raise RouterError(_SAME_FAILURE_MESSAGES[FailureKind.DAILY_QUOTA], FailureKind.DAILY_QUOTA)
+
+        failures: list[tuple[ModelChoice, _AttemptFailure]] = []
+        tries = 0
+        last_round: int | None = None
+        for round_number, choice in self._plan(prefer_strong):
+            if self._limits.is_daily_limited(choice.model):
+                if not any(failed.role == choice.role for failed, _ in failures):
+                    failures.append(
+                        (choice, _AttemptFailure(FailureKind.DAILY_QUOTA, "daily limit (remembered)"))
+                    )
+                continue
+
+            if tries == 0 and choice is self._strong_on_request:
+                on_status(f"asking {choice.model} — this can take a minute…")
+            elif tries > 0 or choice.role != self._fast.role:
+                on_status(f"trying {choice.model}…")
+            if last_round is not None and round_number != last_round:
+                await asyncio.sleep(self._round_pause_s)
+            last_round = round_number
+            tries += 1
+
+            try:
+                answer = await self._run_model(choice, request, system_prompt, on_text)
+            except _AttemptFailed as exc:
+                failure = exc.failure
+                if failure.kind in _FATAL_KINDS:
+                    raise RouterError(_fatal_message(failure, choice.model), failure.kind) from None
+                if failure.kind == FailureKind.DAILY_QUOTA:
+                    self._limits.mark_daily_limited(choice.model)
+                logger.info("%s (%s) failed: %s", choice.model, choice.role, failure.detail)
+                failures.append((choice, failure))
+                continue
+
+            answer.tries = tries
+            if failures:
+                first_choice, first_failure = failures[0]
+                answer.first_failure_reason = _failure_reason(first_choice, first_failure)
+            return answer
+
+        raise RouterError(_all_failed_message(failures, tries))
 
     async def _run_model(
         self,
@@ -121,22 +202,19 @@ class ModelRouter:
         request: GeminiRequest,
         system_prompt: str,
         on_text: Callable[[str], None],
-        used_fast: bool,
     ) -> RoutedAnswer:
-        """One model's attempt plus at most one retry, all under one first-word timer."""
+        """One model's attempt plus at most one busy retry, all under one first-word timer."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + choice.first_word_timeout_s
         retried = False
         while True:
             try:
-                return await self._attempt(choice, request, system_prompt, on_text, deadline, used_fast)
+                return await self._attempt(choice, request, system_prompt, on_text, deadline)
             except _AttemptFailed as exc:
                 failure = exc.failure
                 room_left = deadline - loop.time()
                 can_retry = (
-                    failure.kind == GeminiErrorKind.BUSY
-                    and not retried
-                    and room_left > self._retry_wait_s
+                    failure.kind == FailureKind.BUSY and not retried and room_left > self._retry_wait_s
                 )
                 if not can_retry:
                     raise
@@ -153,7 +231,6 @@ class ModelRouter:
         system_prompt: str,
         on_text: Callable[[str], None],
         deadline: float,
-        used_fast: bool,
     ) -> RoutedAnswer:
         stream = self._client.stream_response(
             request=request,
@@ -170,15 +247,22 @@ class ModelRouter:
                         if reply.text:
                             break
                     else:
-                        # Stream ended with no text at all (blocked / empty):
-                        # that's a finished answer, not a reason to switch.
-                        return RoutedAnswer(reply=reply, model=choice.model, used_fast_model=used_fast)
+                        # Stream ended with no text at all. A blocked answer is
+                        # final (its message is shown); an empty one is a failure.
+                        if reply.was_blocked:
+                            return RoutedAnswer(reply=reply, choice=choice)
+                        raise _AttemptFailed(_AttemptFailure(FailureKind.EMPTY, "empty answer"))
             except TimeoutError:
                 raise _AttemptFailed(
-                    _AttemptFailure(None, f"no first word within {choice.first_word_timeout_s:g}s")
+                    _AttemptFailure(
+                        FailureKind.TOO_SLOW, f"no first word within {choice.first_word_timeout_s:g}s"
+                    )
                 ) from None
+            except _AttemptFailed:
+                raise
             except Exception as exc:  # noqa: BLE001 - classified below
-                raise _AttemptFailed(_AttemptFailure(classify_error(exc), short_error_message(exc))) from exc
+                kind = _FROM_GEMINI[classify_error(exc)]
+                raise _AttemptFailed(_AttemptFailure(kind, short_error_message(exc))) from exc
 
             # Phase 2: the answer has started — stream it to the end, never cut off.
             on_text(reply.text)
@@ -187,33 +271,30 @@ class ModelRouter:
                     on_text(reply.text)
             except Exception as exc:  # noqa: BLE001 - keep what we have
                 logger.warning("%s stream broke mid-answer: %s", choice.model, exc)
-                return RoutedAnswer(
-                    reply=reply,
-                    model=choice.model,
-                    used_fast_model=used_fast,
-                    interrupted_error=short_error_message(exc),
-                )
-            return RoutedAnswer(reply=reply, model=choice.model, used_fast_model=used_fast)
+                return RoutedAnswer(reply=reply, choice=choice, interrupted_error=short_error_message(exc))
+            return RoutedAnswer(reply=reply, choice=choice)
         finally:
             await stream.aclose()
 
 
-def _switch_reason(failure: _AttemptFailure | None, strong_timeout_s: float) -> str:
-    if failure is None:
-        return ""
-    if failure.kind is None:
-        return f"the strong model didn't start answering within {strong_timeout_s:g} s"
-    if failure.kind == GeminiErrorKind.DAILY_QUOTA:
-        return "the strong model's daily limit is used up"
-    if failure.kind == GeminiErrorKind.RATE_LIMITED:
-        return "the strong model's per-minute limit is used up"
-    return "the strong model was busy"
+def _failure_reason(choice: ModelChoice, failure: _AttemptFailure) -> str:
+    """Footer wording, e.g. "the fast model was busy"."""
+    model = f"the {choice.role} model"
+    if failure.kind == FailureKind.TOO_SLOW:
+        return f"{model} didn't start answering within {choice.first_word_timeout_s:g} s"
+    if failure.kind == FailureKind.DAILY_QUOTA:
+        return f"{model}'s daily limit is used up"
+    if failure.kind == FailureKind.RATE_LIMITED:
+        return f"{model}'s per-minute limit is used up"
+    if failure.kind == FailureKind.EMPTY:
+        return f"{model} sent back an empty answer"
+    return f"{model} was busy"
 
 
 def _fatal_message(failure: _AttemptFailure, model: str) -> str:
-    if failure.kind == GeminiErrorKind.BAD_KEY:
+    if failure.kind == FailureKind.BAD_KEY:
         return "gemini rejected the api key. check GEMINI_API_KEY in your .env file."
-    if failure.kind == GeminiErrorKind.MODEL_NOT_FOUND:
+    if failure.kind == FailureKind.MODEL_NOT_FOUND:
         return (
             f"gemini model '{model}' isn't available to your key. "
             "check GEMINI_MODEL and GEMINI_FAST_MODEL in your .env file."
@@ -223,45 +304,44 @@ def _fatal_message(failure: _AttemptFailure, model: str) -> str:
 
 # When both models failed the same way, one sentence instead of two.
 _SAME_FAILURE_MESSAGES = {
-    None: "neither gemini model started answering in time. try again in a bit.",
-    GeminiErrorKind.BUSY: "both gemini models were busy. try again in a bit.",
-    GeminiErrorKind.RATE_LIMITED: (
+    FailureKind.TOO_SLOW: "neither gemini model started answering in time. try again in a bit.",
+    FailureKind.BUSY: "both gemini models were busy. try again in a bit.",
+    FailureKind.RATE_LIMITED: (
         "both gemini models have hit their per-minute limits. they clear within a minute."
     ),
-    GeminiErrorKind.DAILY_QUOTA: (
+    FailureKind.DAILY_QUOTA: (
         "both gemini models have used up their daily limits. they reset at midnight pacific."
     ),
+    FailureKind.EMPTY: "both gemini models sent back empty answers. try again in a bit.",
 }
 
 
-def _describe_failure(failure: _AttemptFailure | None) -> str:
-    if failure is None or failure.kind is None:
+def _describe_failure(kind: FailureKind) -> str:
+    if kind == FailureKind.TOO_SLOW:
         return "didn't start answering in time"
-    if failure.kind == GeminiErrorKind.DAILY_QUOTA:
+    if kind == FailureKind.DAILY_QUOTA:
         return "has used up its daily limit (resets at midnight pacific)"
-    if failure.kind == GeminiErrorKind.RATE_LIMITED:
+    if kind == FailureKind.RATE_LIMITED:
         return "has hit its per-minute limit"
+    if kind == FailureKind.EMPTY:
+        return "sent back an empty answer"
     return "was busy"
 
 
-def _both_failed_message(
-    strong: _AttemptFailure | None,
-    fast: _AttemptFailure,
-    fast_model: str,
-) -> str:
-    if fast.kind in (GeminiErrorKind.BAD_KEY, GeminiErrorKind.MODEL_NOT_FOUND, GeminiErrorKind.OTHER):
-        return _fatal_message(fast, fast_model)
+def _all_failed_message(failures: list[tuple[ModelChoice, _AttemptFailure]], tries: int) -> str:
+    # Describe each model by how its most recent try failed.
+    last_by_role: dict[str, FailureKind] = {}
+    for choice, failure in failures:
+        last_by_role[choice.role] = failure.kind
+    kinds = set(last_by_role.values())
+    if len(last_by_role) == 2 and len(kinds) == 1:
+        return _SAME_FAILURE_MESSAGES[kinds.pop()]
 
-    strong_kind = strong.kind if strong else None
-    if strong_kind == fast.kind:
-        return _SAME_FAILURE_MESSAGES[fast.kind]
-    if strong_kind in _LIMIT_KINDS and fast.kind in _LIMIT_KINDS:
-        # One hit its daily limit, the other its per-minute limit.
-        return (
-            f"both gemini models are at their limits: the strong model {_describe_failure(strong)}, "
-            f"and the fast model {_describe_failure(fast)}. the per-minute limit clears within a minute."
-        )
-    return (
-        f"gemini couldn't answer right now: the strong model {_describe_failure(strong)}, "
-        f"and the fast model {_describe_failure(fast)}. try again in a bit."
-    )
+    parts = [f"the {role} model {_describe_failure(kind)}" for role, kind in last_by_role.items()]
+    tries_text = f"after {tries} {'try' if tries == 1 else 'tries'}"
+    message = f"gemini couldn't answer {tries_text}: {', and '.join(parts)}."
+    if FailureKind.RATE_LIMITED in kinds:
+        message += " the per-minute limit clears within a minute."
+    elif kinds != {FailureKind.DAILY_QUOTA}:
+        message += " try again in a bit."
+    return message
