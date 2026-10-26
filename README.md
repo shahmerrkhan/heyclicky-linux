@@ -8,7 +8,7 @@ Clicky is the little AI buddy that lives next to your cursor. Hit a hotkey, ask 
 
 Clicky has two modes you can flip between in the input bar:
 
-- **Vision mode** (default): screenshot + question → OpenAI vision via your Cloudflare Worker → answer streams into a bubble, optionally pointing at something on screen.
+- **Vision mode** (default): screenshot + question → Gemini (called directly; start a question with `/s` to add Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
 - **Code mode**: prompt → spawns `claude -p` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) as a subprocess in a configured workspace → its progress (text + tool calls) streams into the same bubble. Lets you ask Clicky to *do* things in a directory, not just describe what it sees.
 
 ## Quick start
@@ -23,19 +23,37 @@ sudo apt install -y python3-venv libxcb-cursor0 libxkbcommon0 libegl1 libgl1 lib
 # 3. Install Python deps (uses uv)
 make install
 
-# 4. Set up and deploy the Cloudflare Worker (see docs/SETUP_WORKER.md)
-make worker-install
-cd worker && npx wrangler login && npx wrangler secret put OPENAI_API_KEY && npx wrangler deploy
-
-# 5. Point the app at the worker
+# 4. Add your API keys
 cp .env.example .env
-# Open .env in your editor and set WORKER_URL=... to the URL wrangler printed
+# Open .env in your editor and set GEMINI_API_KEY=... (https://aistudio.google.com/apikey)
+# and, for /s web search, TAVILY_API_KEY=... (https://app.tavily.com, free plan)
 
-# 6. Run it
+# 5. Run it
 make run
 ```
 
-A blue triangle icon shows up in the system tray. Press **Ctrl+Alt+Space** to open the input.
+No proxy or server is needed: the app calls the Gemini API directly. (The `worker/` folder is from the old OpenAI setup and isn't used by vision mode anymore.)
+
+A blue triangle icon shows up in the system tray. Without a `GEMINI_API_KEY` or `TAVILY_API_KEY` Clicky still starts (Code mode works); a tray notification tells you what's off until the key is set. Press **Ctrl+Alt+Space** to open the input.
+
+## Strong model, fast model
+
+Every question goes to the strong model first (`GEMINI_MODEL`, default `gemini-3.8-flash`, medium thinking). If it hasn't produced its first word within 10 seconds, it's cancelled and the same screenshot and question go to the fast model (`GEMINI_FAST_MODEL`, default `gemini-3.5-flash-lite`, low thinking). A "busy" error gets one retry after 2 seconds inside that window; a used-up daily or per-minute limit switches to the other model straight away. The fast model gets its own 10-second window and one retry. When the fast model gives the answer, the bubble footer says so. Closing the bubble cancels everything in flight.
+
+## Web search (`/s`)
+
+Start a question with `/s ` (for example `/s latest python release`) to search the web first. The text after `/s` goes to [Tavily](https://tavily.com) as typed (advanced depth, 10 results, 2 passages per site); the results go to Gemini as untrusted reference text, and a **sources:** line with one link per site appears under the answer. Links open in the browser set by `LINK_BROWSER_COMMAND` (default `opera-gx`).
+
+Without `TAVILY_API_KEY`, or when the month's credits are used up, `/s` questions are answered without search and the bubble footer says why.
+
+## Usage estimates
+
+Under every vision answer:
+
+- `today (estimate): 12 questions, 3 with search · resets at midnight pacific` — successful answers only (failed, blocked, and cut-off ones don't count; a retry or model switch never counts twice). Google only shows the real numbers in [AI Studio](https://aistudio.google.com).
+- `search credits this month (estimate): 46 / 1000 · resets on nov 1` — Tavily credits used by successful searches (2 per search), reset on the 1st.
+
+Both are saved to `~/.local/state/clicky/usage.json`.
 
 ## The response bubble
 
@@ -65,17 +83,22 @@ Overlay (transparent fullscreen PyQt6 window)
    ↓ user types and presses Enter
 Screenshot (mss, all monitors)
    ↓
-Cloudflare Worker /chat → OpenAI API
-   ↓ SSE stream
-Bubble UI (text streaming)
-   ↓ [POINT:x,y] if present
-Blue cursor bezier animation
+(/s only) Tavily web search → results as untrusted text
+   ↓
+Gemini API (google-genai SDK): strong model, 10 s first-word timer
+   ↓ busy → retry once · too slow / limit → fast model
+   ↓ streamed chunks
+Bubble UI (text streaming, then sources + notes + usage footer)
+   ↓ [POINT:x,y] if present (0-1000 scale, x across then y down)
+Convert to screen pixels (clamped) → blue cursor bezier animation
 ```
 
 | Part | File | macOS counterpart |
 |---|---|---|
 | State machine | `clicky/state.py` | `CompanionManager.swift` |
-| LLM streaming client | `clicky/llm/claude.py` | `ClaudeAPI.swift` |
+| LLM streaming client | `clicky/llm/gemini.py` | `ClaudeAPI.swift` |
+| Strong/fast model switch + retry | `clicky/llm/model_router.py` | (new) |
+| Web search (Tavily) | `clicky/llm/web_search.py` | (new) |
 | POINT parser | `clicky/llm/point_parser.py` | `CompanionManager.parsePointingCoordinates` |
 | Screenshot | `clicky/screen/capture.py` | `CompanionScreenCaptureUtility.swift` |
 | Hotkey | `clicky/input/hotkey.py` | `GlobalPushToTalkShortcutMonitor.swift` |
@@ -83,7 +106,9 @@ Blue cursor bezier animation
 | Panel | `clicky/ui/panel.py` | `CompanionPanelView.swift` |
 | Overlay + cursor | `clicky/ui/overlay.py`, `cursor.py` | `OverlayWindow.swift` |
 | Response bubble | `clicky/ui/response_bubble.py` | `CompanionResponseOverlay.swift` |
-| Worker proxy | `worker/src/index.ts` | same idea, OpenAI-flavored |
+| Model → screen coordinate conversion | `CapturedScreen.global_point_from_normalized` in `clicky/screen/capture.py` | — |
+| Usage estimates (daily Gemini, monthly Tavily) | `clicky/usage_store.py` | (new) |
+| Worker proxy (legacy, unused by vision mode) | `worker/src/index.ts` | same idea, OpenAI-flavored |
 | Claude Code agent | `clicky/llm/claude_code.py` | (new — no macOS counterpart yet) |
 | Mode + workspace persistence | `clicky/state_store.py` | (new — no macOS counterpart yet) |
 
@@ -92,22 +117,19 @@ Blue cursor bezier animation
 - **X11 + GNOME** is the primary target. On Wayland, `pynput` global hotkeys don't work reliably on most setups — that path will come later.
 - **Default hotkey is `Ctrl+Alt+Space`** (modifier-only `Ctrl+Alt` doesn't trigger reliably on Linux). Override it in `.env`.
 - **GNOME 45+**: you need the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension for the tray icon to show up.
-- **Screenshot downscaling**: each monitor is resized to a 1600 px long edge before sending — keeps payloads small, and the app rescales the model's coordinates back to real pixels.
+- **Screenshot downscaling**: each monitor is resized to a 1600 px long edge before sending to keep payloads small. The model points on a 0-1000 scale, so the downscale never affects where the cursor lands.
 - **Cursor**: we don't touch the real system cursor (forbidden on Wayland, rude on X11). Instead we draw our own blue triangle on a transparent overlay — the original Clicky does the same.
 
 ## Development
 
 ```bash
-make worker-dev      # Run the worker locally at http://localhost:8787
-# Set WORKER_URL=http://localhost:8787 in .env
-
 make dev             # Run the app with DEBUG logging
 ```
 
 ## Roadmap
 
 - [x] Code mode — Claude Code subprocess as a Clicky backend
-- [ ] Native GUI tools (click, type, scroll) via OpenAI tool-calling, with per-action confirmation bubbles
+- [ ] Native GUI tools (click, type, scroll) via Gemini tool-calling, with per-action confirmation bubbles
 - [ ] Per-tool confirmation in Code mode via Claude Code `PreToolUse` hooks (IPC socket)
 - [ ] Microphone + AssemblyAI streaming (push-to-talk)
 - [ ] ElevenLabs TTS playback

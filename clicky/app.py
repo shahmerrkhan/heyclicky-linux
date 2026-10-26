@@ -8,12 +8,15 @@ import sys
 import qasync
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 
-from .config import settings
+from .config import ENV_FILE, settings
 from .input.hotkey import GlobalHotkeyMonitor
 from .state import CompanionStateMachine
 from .ui.overlay import Overlay
 from .ui.panel import ControlPanel
 from .ui.tray import TrayController
+
+
+logger = logging.getLogger(__name__)
 
 
 def _configure_logging() -> None:
@@ -50,6 +53,8 @@ def main() -> int:
     tray.quit_requested.connect(app.quit)
     tray.show()
 
+    _show_missing_key_notice(tray)
+
     hotkey_monitor = GlobalHotkeyMonitor(settings.hotkey)
     hotkey_monitor.triggered.connect(state_machine.trigger_open_input)
     hotkey_monitor.start()
@@ -69,6 +74,23 @@ def main() -> int:
         loop.run_until_complete(_shutdown())
 
     return exit_code
+
+
+def _show_missing_key_notice(tray: TrayController) -> None:
+    """One tray notification covering whichever API keys are missing."""
+    notes: list[str] = []
+    if not settings.gemini_api_key.strip():
+        notes.append("Vision answers won't work until GEMINI_API_KEY is set. Code mode works normally.")
+    if not settings.tavily_api_key.strip():
+        notes.append(
+            "Web search (/s) is off until TAVILY_API_KEY is set; /s questions are answered without it."
+        )
+    if not notes:
+        return
+    notice = " ".join(notes) + f" Keys go in {ENV_FILE}."
+    logger.warning(notice)
+    title = "Clicky: API keys missing" if len(notes) > 1 else "Clicky: API key missing"
+    tray.show_notice(title, notice)
 
 
 def _friendly_hotkey_label(combo: str) -> str:

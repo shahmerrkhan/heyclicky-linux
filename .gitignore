@@ -16,6 +16,8 @@ build/
 # Env
 .env
 .env.local
+.env.*
+!.env.example
 worker/.dev.vars
 
 # OS

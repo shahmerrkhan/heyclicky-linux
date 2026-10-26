@@ -175,6 +175,7 @@ class ResponseBubble(QWidget):
     """
 
     stop_requested = pyqtSignal()
+    link_clicked = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__(
@@ -217,6 +218,7 @@ class ResponseBubble(QWidget):
 
         self._label = QLabel("")
         self._label.setObjectName("bubbleText")
+        self._label.setTextFormat(Qt.TextFormat.PlainText)
         self._label.setWordWrap(True)
         self._label.setMaximumWidth(Sizes.BUBBLE_MAX_WIDTH)
         self._label.setTextInteractionFlags(
@@ -253,7 +255,25 @@ class ResponseBubble(QWidget):
         self._scroll_index = stack.indexOf(self._scroll)
         stack.setCurrentIndex(self._scroll_index)
 
-        inner.addWidget(self._text_stack, stretch=1)
+        # Footer under the answer: search sources, search/model notes,
+        # and the usage estimates. Rich text so links are clickable;
+        # clicks are emitted as `link_clicked` and the state machine picks the browser.
+        self._footer = QLabel("")
+        self._footer.setObjectName("bubbleFooter")
+        self._footer.setTextFormat(Qt.TextFormat.RichText)
+        self._footer.setWordWrap(True)
+        self._footer.setMaximumWidth(Sizes.BUBBLE_MAX_WIDTH)
+        self._footer.setOpenExternalLinks(False)
+        self._footer.linkActivated.connect(self.link_clicked.emit)
+        self._footer.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self._footer.hide()
+
+        text_column = QVBoxLayout()
+        text_column.setContentsMargins(0, 0, 0, 0)
+        text_column.setSpacing(8)
+        text_column.addWidget(self._text_stack, stretch=1)
+        text_column.addWidget(self._footer)
+        inner.addLayout(text_column, stretch=1)
 
         self._stop = QPushButton("×", self._card)
         self._stop.setObjectName("stopBtn")
@@ -283,6 +303,13 @@ class ResponseBubble(QWidget):
                 font-size: 14px;
                 background: transparent;
                 line-height: 1.4;
+            }}
+            QLabel#bubbleFooter {{
+                color: {Colors.TEXT_ON_METAL_SECONDARY};
+                font-size: 11px;
+                background: transparent;
+                border-top: 1px solid rgba(15, 17, 20, 40);
+                padding-top: 6px;
             }}
             QScrollArea#bubbleScroll {{
                 background: transparent;
@@ -337,6 +364,7 @@ class ResponseBubble(QWidget):
         if text == THINKING_SENTINEL:
             self._reset_to_auto_sizing()
             self._label.clear()
+            self.set_footer("")
             self._scroll.setFixedHeight(28)
             self._stack.setCurrentIndex(self._thinking_index)
             self._thinking.start()
@@ -360,6 +388,16 @@ class ResponseBubble(QWidget):
         if was_following:
             sb.setValue(sb.maximum())
             QTimer.singleShot(0, lambda: sb.setValue(sb.maximum()))
+
+    def set_footer(self, html: str) -> None:
+        """Rich-text footer under the answer (sources, notes, usage).
+
+        Empty string hides it. Callers must escape any untrusted text they embed.
+        """
+        self._footer.setText(html)
+        self._footer.setVisible(bool(html))
+        if not self._user_sized:
+            self.adjustSize()
 
     def show_at_global(self, global_x: int, global_y: int) -> None:
         x = global_x - DEFAULT_SHADOW_MARGIN

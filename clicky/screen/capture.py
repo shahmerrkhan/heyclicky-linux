@@ -9,6 +9,10 @@ from PIL import Image
 from .monitors import MonitorInfo, enumerate_monitors
 
 
+# Upper bound of the normalized coordinate space the model points in (0..1000).
+NORMALIZED_COORDINATE_MAX = 1000
+
+
 @dataclass
 class CapturedScreen:
     monitor: MonitorInfo
@@ -18,19 +22,33 @@ class CapturedScreen:
     is_primary_focus: bool
     is_user_region: bool = False  # True when this came from a manual area selection
 
-    def labeled_for_claude(self) -> str:
-        """The text label sent alongside the image so the LLM knows what this is."""
+    def label_for_model(self) -> str:
+        """The text label sent alongside the image so the LLM knows what this is.
+
+        Deliberately has no pixel dimensions: the model answers in a normalized
+        0-1000 space (see the system prompt), and pixel sizes next to the image
+        invite it to mix the two up.
+        """
         if self.is_user_region:
             return (
-                f"user-selected region "
-                f"(image dimensions: {self.width_pixels}x{self.height_pixels} pixels). "
-                f"the user explicitly picked this area — focus your answer on what's inside."
+                "user-selected region. "
+                "the user explicitly picked this area — focus your answer on what's inside."
             )
         focus = " — primary focus" if self.is_primary_focus else ""
-        return (
-            f"screen{self.monitor.index}{focus} "
-            f"(image dimensions: {self.width_pixels}x{self.height_pixels} pixels)"
-        )
+        return f"screen{self.monitor.index}{focus}"
+
+    def global_point_from_normalized(self, norm_x: int, norm_y: int) -> tuple[int, int]:
+        """Map a model coordinate (0-1000 across, 0-1000 down) to global screen pixels.
+
+        This is the single place where model coordinates become real pixels,
+        for full-monitor captures and user-selected regions alike. Values
+        outside 0-1000 are clamped so the cursor can never leave the captured area.
+        """
+        clamped_x = min(max(norm_x, 0), NORMALIZED_COORDINATE_MAX)
+        clamped_y = min(max(norm_y, 0), NORMALIZED_COORDINATE_MAX)
+        local_x = round(clamped_x / NORMALIZED_COORDINATE_MAX * (self.monitor.width - 1))
+        local_y = round(clamped_y / NORMALIZED_COORDINATE_MAX * (self.monitor.height - 1))
+        return self.monitor.global_from_local(local_x, local_y)
 
 
 def capture_all_screens(
@@ -41,13 +59,13 @@ def capture_all_screens(
     """Capture every connected monitor as JPEG.
 
     `primary_focus_index` is the 1-based screen index where the cursor lives — gets
-    labeled "primary focus" in its caption so Claude prioritizes it.
+    labeled "primary focus" in its caption so the model prioritizes it.
 
     Each screenshot is downscaled so its long edge fits `max_long_side` pixels.
-    This keeps payload size reasonable; Claude's vision quality on large screenshots
-    is barely affected. The pixel dimensions in the label always match the *downscaled*
-    image so Claude's coordinates land in the downscaled space — we rescale them back
-    to the monitor's real resolution before pointing the cursor.
+    This keeps payload size reasonable; vision quality on large screenshots is
+    barely affected. The model points in a normalized 0-1000 space, so the
+    downscale never leaks into coordinates — `global_point_from_normalized`
+    maps them straight to the monitor's real resolution.
     """
     monitors = enumerate_monitors()
     captures: list[CapturedScreen] = []
@@ -98,9 +116,9 @@ def capture_region(
     ``global_x, global_y, width, height`` are in the same coordinate space as
     ``MonitorInfo.x/y/width/height`` (i.e. the virtual-desktop coords mss
     reports). The returned ``CapturedScreen`` carries a synthetic ``MonitorInfo``
-    whose origin and dimensions match the region — so the existing pointing
-    coordinate rescale logic in the state machine maps the LLM's coordinates
-    back to global screen coords without any special-casing.
+    whose origin and dimensions match the region — so
+    ``global_point_from_normalized`` maps the model's coordinates back to
+    global screen coords without any special-casing.
     """
     width = max(1, int(width))
     height = max(1, int(height))

@@ -22,11 +22,9 @@ install:
 	@echo "Install complete. To run: source $(VENV)/bin/activate && python -m clicky"
 
 run:
-	@test -f .env || { echo ".env missing — run 'cp .env.example .env' and set WORKER_URL"; exit 1; }
 	$(VENV)/bin/python -m clicky
 
 dev:
-	@test -f .env || { echo ".env missing"; exit 1; }
 	LOG_LEVEL=DEBUG $(VENV)/bin/python -m clicky
 
 check-system:

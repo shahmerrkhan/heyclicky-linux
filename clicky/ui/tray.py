@@ -58,6 +58,10 @@ class TrayController(QObject):
     def hide(self) -> None:
         self._tray.hide()
 
+    def show_notice(self, title: str, message: str) -> None:
+        """Desktop notification from the tray icon (stays ~10 s)."""
+        self._tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Warning, 10_000)
+
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.open_panel_requested.emit()

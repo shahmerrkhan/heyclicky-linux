@@ -424,6 +424,7 @@ class Overlay(QObject):
     mode_changed = pyqtSignal(str)
     allow_shell_changed = pyqtSignal(bool)
     workspace_changed = pyqtSignal(str)
+    bubble_link_clicked = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -443,6 +444,7 @@ class Overlay(QObject):
         self._input_card.allow_shell_changed.connect(self.allow_shell_changed.emit)
         self._input_card.workspace_changed.connect(self.workspace_changed.emit)
         self._bubble.stop_requested.connect(self.dismiss)
+        self._bubble.link_clicked.connect(self.bubble_link_clicked.emit)
         self._area_selector.area_selected.connect(self._on_area_selected)
         self._area_selector.cancelled.connect(self._on_area_selection_cancelled)
 
@@ -464,6 +466,9 @@ class Overlay(QObject):
 
     def update_bubble_text(self, text: str) -> None:
         self._bubble.set_text(text)
+
+    def update_bubble_footer(self, html: str) -> None:
+        self._bubble.set_footer(html)
 
     def show_cursor_at(self, global_x: int, global_y: int) -> None:
         self._cursor.stop_tracking_mouse()
