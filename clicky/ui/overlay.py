@@ -114,8 +114,8 @@ class _InputCard(QWidget):
         self._line_edit.textChanged.connect(self._refresh_prefix_chip)
         row.addWidget(self._line_edit, stretch=1)
 
-        # Shows "strong" / "search" while a /p, /s (or /ps, /sp) prefix is typed
-        # in vision mode. Uses the router's own parser so it always matches.
+        # Shows "strong" / "search" while a /p, /s (or /ps, /sp) command is typed
+        # anywhere in the box, in vision mode. Uses the router's own parser so it always matches.
         self._prefix_chip = QLabel("", self._card)
         self._prefix_chip.setObjectName("prefixChip")
         self._prefix_chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)

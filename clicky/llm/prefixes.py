@@ -1,13 +1,20 @@
-"""Vision-mode question prefixes.
+"""Vision-mode question commands.
 
   /p   ask the strong model first
   /s   search the web (Tavily) first
   /ps  /sp   both
 
-Prefixes go at the start of the question, in any order and any case
-(`/p /s q`, `/S /P q`, `/Ps q`), each followed by a space. The input bar's
-chip and the router both use `parse_prefixes`, so the chip always matches
-what will happen.
+Commands can go anywhere in the question, in any order and any case
+(`who won /s the cup /P`, `/ps what changed`). A command is a separate token:
+it needs a space or the start/end of the text on each side, so punctuation
+touching it (`/p,` `(/s)`) and slashes inside paths, URLs or dates
+(`/usr/bin/python`, `x.com/p`, `10/27`) never count. Anything between a
+closed pair of double quotes or backticks is left alone; an unclosed quote
+protects nothing. `//s` (or `//p` …) types a literal `/s`.
+
+Each command is removed and the gap closes to one space. The input bar's chip
+and the router both use `parse_prefixes`, so the chip always matches what
+will happen.
 """
 
 from __future__ import annotations
@@ -15,7 +22,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-_PREFIX_TOKEN = re.compile(r"/(ps|sp|p|s)(?=\s|$)", re.IGNORECASE)
+_COMMAND_TOKEN = re.compile(r"(?<!\S)(/{1,2})(ps|sp|p|s)(?!\S)", re.IGNORECASE)
+
+# Opening quote → the characters that close it. Straight and curly double
+# quotes close each other, since editors and paste sources mix them.
+_QUOTE_CLOSERS = {'"': '"”', "“": '"”', "”": '"”', "`": "`"}
 
 
 @dataclass(frozen=True)
@@ -23,7 +34,7 @@ class ParsedPrompt:
     question: str
     strong: bool = False
     search: bool = False
-    prefix_text: str = ""  # the prefixes exactly as typed, e.g. "/p /s"
+    prefix_text: str = ""  # the commands as typed, in order, e.g. "/p /s"
 
     @property
     def has_prefix(self) -> bool:
@@ -31,18 +42,50 @@ class ParsedPrompt:
 
 
 def parse_prefixes(prompt: str) -> ParsedPrompt:
-    rest = prompt.lstrip()
-    tokens: list[str] = []
-    strong = search = False
-    while True:
-        match = _PREFIX_TOKEN.match(rest)
-        if match is None:
-            break
-        letters = match.group(1).lower()
-        strong = strong or "p" in letters
-        search = search or "s" in letters
-        tokens.append(match.group(0))
-        rest = rest[match.end() :].lstrip()
-    if not tokens:
-        return ParsedPrompt(question=prompt)
-    return ParsedPrompt(question=rest.strip(), strong=strong, search=search, prefix_text=" ".join(tokens))
+    quoted = _quoted_spans(prompt)
+    commands: list[re.Match[str]] = []
+    literals: list[re.Match[str]] = []
+    for match in _COMMAND_TOKEN.finditer(prompt):
+        if any(start < match.start() < end for start, end in quoted):
+            continue
+        (literals if match.group(1) == "//" else commands).append(match)
+
+    strong = any("p" in m.group(2).lower() for m in commands)
+    search = any("s" in m.group(2).lower() for m in commands)
+
+    text = prompt
+    # Work from the end so earlier match positions stay valid.
+    for match in sorted(commands + literals, key=lambda m: m.start(), reverse=True):
+        before, after = text[: match.start()], text[match.end() :]
+        if match.group(1) == "//":
+            text = before + match.group(0)[1:] + after
+        else:
+            before, after = before.rstrip(), after.lstrip()
+            text = f"{before} {after}" if before and after else before + after
+
+    if not commands:
+        return ParsedPrompt(question=text if literals else prompt)
+    return ParsedPrompt(
+        question=text.strip(),
+        strong=strong,
+        search=search,
+        prefix_text=" ".join(m.group(0) for m in commands),
+    )
+
+
+def _quoted_spans(text: str) -> list[tuple[int, int]]:
+    """(open, close) index pairs of closed double-quote and backtick spans."""
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(text):
+        closers = _QUOTE_CLOSERS.get(text[i])
+        if closers is None:
+            i += 1
+            continue
+        end = next((j for j in range(i + 1, len(text)) if text[j] in closers), None)
+        if end is None:
+            i += 1  # unclosed: protects nothing
+            continue
+        spans.append((i, end))
+        i = end + 1
+    return spans

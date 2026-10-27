@@ -212,7 +212,7 @@ class CompanionStateMachine(QObject):
             if parsed_prompt.has_prefix and not question:
                 prefix = parsed_prompt.prefix_text
                 self._overlay.update_bubble_text(
-                    f'type a question after {prefix}, e.g. "{prefix} latest python release".'
+                    f'type a question with {prefix}, e.g. "latest python release {prefix}".'
                 )
                 self._set_state(CompanionState.IDLE)
                 return

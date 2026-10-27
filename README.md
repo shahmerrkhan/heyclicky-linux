@@ -8,7 +8,7 @@ Clicky is the little AI buddy that lives next to your cursor. Hit a hotkey, ask 
 
 Clicky has two modes you can flip between in the input bar:
 
-- **Vision mode** (default): screenshot + question → Gemini (called directly; start a question with `/p` for the strong model or `/s` to add Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
+- **Vision mode** (default): screenshot + question → Gemini (called directly; add `/p` anywhere in a question for the strong model or `/s` to add Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
 - **Code mode**: prompt → spawns `claude -p` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) as a subprocess in a configured workspace → its progress (text + tool calls) streams into the same bubble. Lets you ask Clicky to *do* things in a directory, not just describe what it sees.
 
 ## Quick start
@@ -43,14 +43,14 @@ Every question goes to the **fast model** first (`GEMINI_FAST_MODEL`, default `g
 - Each try gets one retry after 2 seconds if the model says it's busy.
 - Busy, a used-up limit, too slow (no first word in time), and an empty answer all move on to the other model. A blocked answer (safety filter) is shown with its reason. A bad key, unknown model, or bad request stops right away.
 - A model that reports its **daily** limit used up is skipped until midnight Pacific, so later questions go straight to the other one. If both are at their daily limits you get the error immediately.
-- Start a question with **`/p`** to ask the strong model first, with a 90-second timer. If it fails, the footer says why and the fast model answers instead (no alternating after that).
-- Prefixes: `/p` (strong) and `/s` (search) work in any order and any case — `/p /s`, `/S /P`, `/ps`, `/Sp`. A small **strong** / **search** chip in the input bar shows what a typed prefix will do. Prefixes only apply in vision mode.
+- Add **`/p`** anywhere in a question to ask the strong model first, with a 90-second timer. If it fails, the footer says why and the fast model answers instead (no alternating after that).
+- Commands: `/p` (strong) and `/s` (search) work anywhere in the question, in any order and any case — `who won the cup /p /s`, `what is /s the latest python`, `/ps q`, `/Sp q`. Each is removed before the question goes to Gemini or Tavily. A command must stand alone: with a space or the start/end of the text on each side, so `/p,`, `(/s)`, `/usr/bin/python`, `x.com/p` and `10/27` don't count. Anything inside a closed pair of double quotes or backticks is left alone (`"xcopy /s"`), an unclosed quote protects nothing, and `//s` types a literal `/s`. A small **strong** / **search** chip in the input bar shows what the typed commands will do. Commands only apply in vision mode.
 - The footer always names the model that answered, e.g. `answered by the strong model (gemini-3.8-flash) after 3 tries — the fast model was busy`. While switching, the bubble shows `trying <model>…`.
 - Once an answer starts it is never cut off. Closing the bubble cancels everything in flight. Both models share one conversation history.
 
 ## Web search (`/s`)
 
-Start a question with `/s ` (for example `/s latest python release`) to search the web first. The text after `/s` goes to [Tavily](https://tavily.com) as typed (advanced depth, 10 results, 2 passages per site); the results go to Gemini as untrusted reference text, and a **sources:** line with one link per site appears under the answer. Links open in the browser set by `LINK_BROWSER_COMMAND` (default `opera-gx`).
+Add `/s` anywhere in a question (for example `latest python release /s`) to search the web first. The question, with the commands removed, goes to [Tavily](https://tavily.com) as typed (advanced depth, 10 results, 2 passages per site); the results go to Gemini as untrusted reference text, and a **sources:** line with one link per site appears under the answer. Links open in the browser set by `LINK_BROWSER_COMMAND` (default `opera-gx`).
 
 Without `TAVILY_API_KEY`, or when the month's credits are used up, `/s` questions are answered without search and the bubble footer says why.
 
