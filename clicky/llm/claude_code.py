@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -239,6 +240,17 @@ class _StreamParser:
         except json.JSONDecodeError:
             tool_input = {}
         return _format_tool_chip(state.get("name") or "tool", tool_input)
+
+
+_TOOL_LINE = re.compile(
+    r"^\s*(?:" + "|".join(re.escape(m) for m in sorted(set(_TOOL_MARKERS.values()) | {"›"})) + r") [A-Za-z]\w*(?::.*)?$",
+    re.MULTILINE,
+)
+
+
+def strip_tool_lines(text: str) -> str:
+    """Claude Code bubble text without the tool chips (for speaking it aloud)."""
+    return re.sub(r"\n{3,}", "\n\n", _TOOL_LINE.sub("", text)).strip()
 
 
 def _format_tool_chip(name: str, tool_input: dict) -> str:

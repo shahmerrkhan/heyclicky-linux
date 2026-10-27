@@ -319,6 +319,10 @@ class _InputCard(QWidget):
     def reset_prompt_text(self) -> None:
         self._line_edit.clear()
 
+    def set_prompt_text(self, text: str) -> None:
+        self._line_edit.setText(text)
+        self._line_edit.setCursorPosition(len(text))
+
     def set_selected_area(self, rect: QRect | None) -> None:
         if rect is None or rect.isEmpty():
             self._badge.hide()
@@ -488,6 +492,14 @@ class Overlay(QObject):
         self._input_card.reset_prompt_text()
         self._input_card.set_selected_area(self._selected_area)
         self._input_card.show_at_global(cursor_pos.x() + 28, cursor_pos.y() + 4)
+
+    def show_input_with_text(self, text: str) -> None:
+        """Open the input bar with `text` already typed (a voice transcript to edit)."""
+        self.show_input_near_cursor()
+        self._input_card.set_prompt_text(text)
+
+    def hide_bubble(self) -> None:
+        self._bubble.hide()
 
     def show_bubble_near_cursor(self) -> None:
         cursor_pos = QCursor.pos()

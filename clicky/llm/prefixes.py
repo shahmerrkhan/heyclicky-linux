@@ -15,6 +15,10 @@ protects nothing. `//s` (or `//p` …) types a literal `/s`.
 Each command is removed and the gap closes to one space. The input bar's chip
 and the router both use `parse_prefixes`, so the chip always matches what
 will happen.
+
+Voice questions use `parse_spoken_prefixes` instead: "power mode" (strong)
+and "web search" (search), only at the very start of the transcript, in
+either order. Whisper's spelling variants ("Power-mode,", "websearch.") count.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import re
 from dataclasses import dataclass
 
 _COMMAND_TOKEN = re.compile(r"(?<!\S)(/{1,2})(ps|sp|p|s)(?!\S)", re.IGNORECASE)
+_SPOKEN_KEYWORD = re.compile(r"\s*(power[\s-]*mode|web[\s-]*search)\b[\s,.:;!?-]*", re.IGNORECASE)
 
 # Opening quote → the characters that close it. Straight and curly double
 # quotes close each other, since editors and paste sources mix them.
@@ -71,6 +76,28 @@ def parse_prefixes(prompt: str) -> ParsedPrompt:
         search=search,
         prefix_text=" ".join(m.group(0) for m in commands),
     )
+
+
+def parse_spoken_prefixes(transcript: str) -> ParsedPrompt:
+    """Spoken keywords at the start of a voice question: "power mode" and/or "web search"."""
+    rest = transcript
+    keywords: list[str] = []
+    strong = search = False
+    while match := _SPOKEN_KEYWORD.match(rest):
+        word = match.group(1).lower()
+        if word.startswith("power"):
+            strong = True
+            keywords.append("power mode")
+        else:
+            search = True
+            keywords.append("web search")
+        rest = rest[match.end() :]
+    if not keywords:
+        return ParsedPrompt(question=transcript.strip())
+    question = rest.strip()
+    if question:
+        question = question[0].upper() + question[1:]
+    return ParsedPrompt(question=question, strong=strong, search=search, prefix_text=" · ".join(keywords))
 
 
 def _quoted_spans(text: str) -> list[tuple[int, int]]:

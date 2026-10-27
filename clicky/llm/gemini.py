@@ -202,3 +202,33 @@ class GeminiClient:
             await stream.aclose()
 
         yield reply
+
+    async def generate_text(
+        self,
+        request: GeminiRequest,
+        system_prompt: str,
+        model: str,
+        thinking_level: str,
+        max_output_tokens: int = 1024,
+    ) -> str:
+        """One short non-streaming answer (search queries, memory summaries).
+
+        Returns "" for an empty or blocked reply. API errors propagate.
+        """
+        config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            max_output_tokens=max_output_tokens,
+            thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel(thinking_level.upper())),
+        )
+        response = await self._client.aio.models.generate_content(
+            model=model,
+            contents=_build_contents(request),
+            config=config,
+        )
+        if not response.candidates:
+            return ""
+        candidate = response.candidates[0]
+        if candidate.finish_reason in _BLOCKED_FINISH_REASONS:
+            return ""
+        parts = candidate.content.parts if candidate.content and candidate.content.parts else []
+        return "".join(part.text for part in parts if part.text and not part.thought).strip()

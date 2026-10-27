@@ -1,7 +1,7 @@
 """Tiny JSON state store for cross-session preferences.
 
-Holds the last used agent mode, the active Claude Code workspace, and the
-"allow shell" toggle. Persisted to `$XDG_STATE_HOME/clicky/state.json`
+Holds the last used agent mode, the active Claude Code workspace, the
+"allow shell" toggle, and the tray's voice on/off switch. Persisted to `$XDG_STATE_HOME/clicky/state.json`
 (falls back to `~/.local/state/clicky/state.json`).
 
 Atomic-ish writes via `os.replace` after writing to a sibling temp file.
@@ -28,6 +28,7 @@ class PersistedState:
     agent_mode: AgentMode = "vision"
     claude_code_workspace: str | None = None
     claude_code_allow_shell: bool = False
+    voice_on: bool = True
 
 
 def _store_path() -> Path:
@@ -51,6 +52,7 @@ def load_state() -> PersistedState:
         agent_mode=mode,
         claude_code_workspace=data.get("claude_code_workspace"),
         claude_code_allow_shell=bool(data.get("claude_code_allow_shell", False)),
+        voice_on=bool(data.get("voice_on", True)),
     )
 
 

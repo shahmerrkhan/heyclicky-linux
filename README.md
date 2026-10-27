@@ -54,6 +54,43 @@ Add `/s` anywhere in a question (for example `latest python release /s`) to sear
 
 Without `TAVILY_API_KEY`, or when the month's credits are used up, `/s` questions are answered without search and the bubble footer says why.
 
+## Voice (hold to talk)
+
+Hold **Fn+F5** (Linux key code 63, i.e. F5), say your question, let go. Clicky transcribes it on your machine, shows **you said: …**, and answers. Answers to spoken questions are read aloud sentence by sentence; typed questions stay silent.
+
+- **Keywords** at the very start: **"power mode"** = strong model (like `/p`), **"web search"** = search (like `/s`), either order. For a voice web search the fast model first turns your transcript plus the screenshot into a short search query (the footer shows `searched for: …`); typed `/s` searches your text as typed.
+- **Code mode**: the transcript (keywords removed) lands in the input bar so you can fix misheard words; Enter runs it, and the answer is spoken without the tool lines.
+- **Stopping**: pressing the talk key again, Esc (from any app), closing the bubble, the input-bar hotkey, the tray's **Stop listening / speaking**, or quitting all stop the recorder, Whisper, Piper and playback.
+- **Silence**: nothing heard → "didn't catch that", no Gemini call; silent stretches skip Whisper.
+- **No length limit.** Safety nets instead: the key is re-checked once a second (a lost release stops listening), 2 minutes of pure silence stops it, less than 1 GB free disk stops it, a piece Whisper can't finish in 60 s becomes `[part missing]`, and phrases Whisper repeats more than 3 times in a row are collapsed. Each piece's audio is deleted right after it's transcribed; no recording is kept.
+- **Memory**: voice and typed questions share one chat memory — the last 5 exchanges in full and a ~150-word summary of older ones, written by the fast model in the background after an answer.
+- The tray has a **Voice** on/off switch (remembered); `VOICE_ENABLED=false` in `.env` turns voice off completely.
+
+How it works: `parec` records the default microphone (16 kHz mono). While you talk, the audio is cut into 20–30 s pieces at the quietest moment (so no word is split) and each piece goes through a fresh `whisper-cli` run (base.en, timestamps on, lower CPU priority) — Whisper only holds its ~285 MB while a piece is being transcribed. The screenshot is taken when you let go. Piper (lessac medium voice) starts once per answer and streams raw audio into `pacat`. Whisper and Piper share one slot so they never run at the same time; pressing the talk key stops Piper first.
+
+The talk key is read straight from the keyboard (`/dev/input`, your user must be in the `input` group — no sudo) and F5 is grabbed in X11 so apps don't receive it (Ctrl+F5 etc. still work; browsers' F5 refresh doesn't — use Ctrl+R).
+
+### Installing the voice programs (once, no sudo)
+
+Everything lives in `~/.local/share/clicky/voice/` (`VOICE_DIR`), outside the repo. Whisper (MIT) and Piper (GPL-3.0) run as separate programs.
+
+```bash
+V=~/.local/share/clicky/voice
+# whisper.cpp, built as one self-contained program, plus the English base model
+git clone https://github.com/ggml-org/whisper.cpp /tmp/whisper.cpp
+cmake -S /tmp/whisper.cpp -B /tmp/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF
+cmake --build /tmp/whisper.cpp/build -j4 --target whisper-cli
+install -Dm755 /tmp/whisper.cpp/build/bin/whisper-cli $V/whisper/bin/whisper-cli
+sh /tmp/whisper.cpp/models/download-ggml-model.sh base.en $V/whisper/models
+# Piper in its own Python environment, the lessac voice, and the error sound
+python3 -m venv $V/piper/venv
+$V/piper/venv/bin/pip install piper-tts==1.8.0
+$V/piper/venv/bin/python -m piper.download_voices --data-dir $V/piper/voices en_US-lessac-medium
+mkdir -p $V/sounds && echo "Error." | $V/piper/venv/bin/python -m piper -m $V/piper/voices/en_US-lessac-medium.onnx -f $V/sounds/error.wav
+```
+
+`parec` and `pacat` come with PipeWire's PulseAudio support (`pulseaudio-utils`). If anything is missing, Clicky says so in a tray notice at startup.
+
 ## Usage estimates
 
 Under every vision answer:
@@ -85,10 +122,10 @@ Requirements: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) inst
 ## Architecture (short version)
 
 ```
-Hotkey (pynput, X11)
-   ↓
-Overlay (transparent fullscreen PyQt6 window)
-   ↓ user types and presses Enter
+Hotkey (pynput, X11)                 Talk key (evdev, F5 grabbed in X11)
+   ↓                                    ↓ hold: parec → 20-30 s pieces → whisper-cli
+Overlay (transparent fullscreen PyQt6 window)   ↓ let go: transcript ("power mode" / "web search")
+   ↓ user types and presses Enter       ↓ (web search: fast model writes the query)
 Screenshot (mss, all monitors)
    ↓
 (/s only) Tavily web search → results as untrusted text
@@ -99,6 +136,7 @@ Gemini API (google-genai SDK): fast model first (10 s first-word timer),
 Bubble UI (text streaming, then sources + notes + usage footer)
    ↓ [POINT:x,y] if present (0-1000 scale, x across then y down)
 Convert to screen pixels (clamped) → blue cursor bezier animation
+   (voice questions only) Piper reads the answer aloud, sentence by sentence → pacat
 ```
 
 | Part | File | macOS counterpart |
@@ -106,7 +144,13 @@ Convert to screen pixels (clamped) → blue cursor bezier animation
 | State machine | `clicky/state.py` | `CompanionManager.swift` |
 | LLM streaming client | `clicky/llm/gemini.py` | `ClaudeAPI.swift` |
 | Fast/strong model order, retry, fallback | `clicky/llm/model_router.py` | (new) |
-| `/p` and `/s` prefixes | `clicky/llm/prefixes.py` | (new) |
+| `/p` and `/s` commands, spoken keywords | `clicky/llm/prefixes.py` | (new) |
+| Chat memory (last 5 + summary) | `clicky/llm/memory.py` | (new) |
+| Voice search query | `clicky/llm/search_query.py` | (new) |
+| Talk key | `clicky/input/push_to_talk.py` | (new) |
+| Recording, cutting at quiet moments | `clicky/audio/recorder.py` | (new) |
+| Speech → text (whisper.cpp) | `clicky/transcription/whisper.py`, `listener.py` | (new) |
+| Text → speech (Piper) | `clicky/tts/piper.py` | (new) |
 | Web search (Tavily) | `clicky/llm/web_search.py` | (new) |
 | POINT parser | `clicky/llm/point_parser.py` | `CompanionManager.parsePointingCoordinates` |
 | Screenshot | `clicky/screen/capture.py` | `CompanionScreenCaptureUtility.swift` |

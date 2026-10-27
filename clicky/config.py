@@ -88,6 +88,34 @@ class Settings(BaseSettings):
         description="Output token cap per answer. Includes Gemini's thinking tokens.",
     )
 
+    # --- Voice (push-to-talk) ---------------------------------------------------
+    voice_enabled: bool = Field(
+        default=True,
+        description="Master switch for voice. False = no talk key, nothing spoken (tray toggle hidden).",
+    )
+    voice_dir: str = Field(
+        default=str(Path.home() / ".local" / "share" / "clicky" / "voice"),
+        description=(
+            "Where whisper.cpp, the Whisper model, Piper's environment, its voice and "
+            "error.wav live (see README for the layout)."
+        ),
+    )
+    talk_key_code: int = Field(
+        default=63,
+        description=(
+            "Linux key code of the hold-to-talk key, read straight from the keyboard. "
+            "63 = F5 (Fn+F5 on keyboards whose top row sends media keys by default)."
+        ),
+    )
+    voice_silence_level: int = Field(
+        default=300,
+        description=(
+            "Loudness (RMS of 16-bit samples) below which a stretch of recording counts "
+            "as silence. Raise it if room noise keeps being transcribed; lower it if "
+            "quiet speech is skipped."
+        ),
+    )
+
     # --- Claude Code (Code mode) -----------------------------------------------
     claude_code_path: str = Field(
         default="claude",

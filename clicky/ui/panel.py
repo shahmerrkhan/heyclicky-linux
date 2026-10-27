@@ -25,7 +25,7 @@ class ControlPanel(QWidget):
 
     quit_requested = pyqtSignal()
 
-    def __init__(self, hotkey_label: str) -> None:
+    def __init__(self, hotkey_label: str, talk_hint: str = "") -> None:
         super().__init__(
             None,
             Qt.WindowType.FramelessWindowHint
@@ -79,7 +79,7 @@ class ControlPanel(QWidget):
         section.setObjectName("section")
         layout.addWidget(section)
 
-        body = QLabel(f"Hit <b>{hotkey_label}</b> anywhere to ask Clicky about your screen.")
+        body = QLabel(f"Hit <b>{hotkey_label}</b> anywhere to ask Clicky about your screen.{talk_hint}")
         body.setWordWrap(True)
         body.setObjectName("body")
         layout.addWidget(body)

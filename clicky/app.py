@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 
 from .config import ENV_FILE, settings
 from .input.hotkey import GlobalHotkeyMonitor
+from .input.push_to_talk import PushToTalkMonitor
 from .state import CompanionStateMachine
 from .ui.overlay import Overlay
 from .ui.panel import ControlPanel
@@ -45,7 +46,8 @@ def main() -> int:
     overlay = Overlay()
     state_machine = CompanionStateMachine(overlay)
 
-    panel = ControlPanel(hotkey_label=_friendly_hotkey_label(settings.hotkey))
+    talk_hint = " Or hold <b>Fn+F5</b> to ask by voice." if settings.voice_enabled and settings.talk_key_code == 63 else ""
+    panel = ControlPanel(hotkey_label=_friendly_hotkey_label(settings.hotkey), talk_hint=talk_hint)
     panel.quit_requested.connect(app.quit)
 
     tray = TrayController()
@@ -59,21 +61,68 @@ def main() -> int:
     hotkey_monitor.triggered.connect(state_machine.trigger_open_input)
     hotkey_monitor.start()
 
+    talk_monitor = _setup_voice(state_machine, tray)
+
     # Ctrl+C in the terminal should kill the app cleanly.
     signal.signal(signal.SIGINT, lambda *_: app.quit())
 
     async def _shutdown() -> None:
         hotkey_monitor.stop()
+        if talk_monitor is not None:
+            talk_monitor.stop()
         await state_machine.aclose()
 
     exit_code = 0
-    try:
-        with loop:
+    with loop:
+        try:
             loop.run_forever()
-    finally:
-        loop.run_until_complete(_shutdown())
+        finally:
+            # Inside `with loop`: the loop must still be open for the shutdown
+            # (stops the recorder, Whisper, Piper and closes Gemini / Tavily).
+            loop.run_until_complete(_shutdown())
 
     return exit_code
+
+
+def _setup_voice(state_machine: CompanionStateMachine, tray: TrayController) -> PushToTalkMonitor | None:
+    """Hold-to-talk: key monitor, tray switch, and a note if the voice programs are missing."""
+    files = state_machine.voice_files
+    missing_listen = files.missing_for_listening()
+    missing_speak = files.missing_for_speaking()
+    available = settings.voice_enabled and not missing_listen
+    tray.set_voice_state(available, state_machine.voice_on)
+    if not settings.voice_enabled:
+        return None
+    if missing_listen:
+        _voice_notice(tray, "voice is off: missing " + ", ".join(missing_listen) + ". see README (Voice).")
+        return None
+    if missing_speak:
+        _voice_notice(
+            tray,
+            "voice questions work, but answers won't be spoken: missing " + ", ".join(missing_speak) + ".",
+        )
+
+    monitor = PushToTalkMonitor(settings.talk_key_code)
+    monitor.pressed.connect(state_machine.talk_pressed)
+    monitor.released.connect(state_machine.talk_released)
+    monitor.escape_pressed.connect(state_machine.escape_pressed)
+    monitor.problem.connect(lambda message: _voice_notice(tray, message))
+    tray.stop_voice_requested.connect(state_machine.stop_voice)
+
+    def on_voice_toggled(on: bool) -> None:
+        state_machine.set_voice_on(on)
+        # Off also releases the talk key, so apps get it back.
+        monitor.start() if on else monitor.stop()
+
+    tray.voice_toggled.connect(on_voice_toggled)
+    if state_machine.voice_on:
+        monitor.start()
+    return monitor
+
+
+def _voice_notice(tray: TrayController, message: str) -> None:
+    logger.warning(message)
+    tray.show_notice("Clicky: voice", message)
 
 
 def _show_missing_key_notice(tray: TrayController) -> None:

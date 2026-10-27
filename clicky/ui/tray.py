@@ -32,6 +32,8 @@ class TrayController(QObject):
 
     open_panel_requested = pyqtSignal()
     quit_requested = pyqtSignal()
+    voice_toggled = pyqtSignal(bool)
+    stop_voice_requested = pyqtSignal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -43,6 +45,15 @@ class TrayController(QObject):
         open_action = QAction("Open Clicky", self)
         open_action.triggered.connect(self.open_panel_requested.emit)
         menu.addAction(open_action)
+
+        self._voice_action = QAction("Voice (hold the talk key)", self)
+        self._voice_action.setCheckable(True)
+        self._voice_action.toggled.connect(self.voice_toggled.emit)
+        menu.addAction(self._voice_action)
+
+        self._stop_voice_action = QAction("Stop listening / speaking", self)
+        self._stop_voice_action.triggered.connect(self.stop_voice_requested.emit)
+        menu.addAction(self._stop_voice_action)
 
         menu.addSeparator()
 
@@ -57,6 +68,14 @@ class TrayController(QObject):
 
     def hide(self) -> None:
         self._tray.hide()
+
+    def set_voice_state(self, available: bool, on: bool) -> None:
+        """Reflect the voice switch without re-emitting `voice_toggled`."""
+        self._voice_action.blockSignals(True)
+        self._voice_action.setChecked(available and on)
+        self._voice_action.blockSignals(False)
+        self._voice_action.setVisible(available)
+        self._stop_voice_action.setVisible(available)
 
     def show_notice(self, title: str, message: str) -> None:
         """Desktop notification from the tray icon (stays ~10 s)."""
