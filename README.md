@@ -193,9 +193,9 @@ make dev             # Run the app with DEBUG logging
 
 ## Credits
 
-- Original idea, design, and macOS implementation: [**clicky.so**](https://clicky.so) by [@farzaa](https://github.com/farzaa/clicky). Go look at the original — it's the real deal.
+- Original idea, design, and macOS implementation: [**clicky.so**](https://clicky.so) by [@farzaa](https://github.com/farzaa/clicky). Go look at the original — it's the real deal.;
 - This repo: a from-scratch Linux re-implementation in Python/PyQt6, written as a tribute so Linux users can run something close to the same experience.
-
+- This fork builds on [msari06/clicky-linux](https://github.com/msari06/clicky-linux) by Mehmet Sari, which was itself built from Farza's Clicky.
 ## License
 
 MIT (matches the original Clicky).
