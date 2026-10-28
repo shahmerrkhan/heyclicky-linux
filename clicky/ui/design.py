@@ -1,74 +1,74 @@
-"""Design tokens — colors, radii and sizing used across the UI.
+"""Design tokens — colors, fonts, radii and sizing used across the UI.
 
-Tuned to feel like a single designed system: dark frosted-glass panels with a
-soft drop shadow, a bright cyan accent for active affordances, and a metallic
-gray buddy dot. Anything UI-facing should pull values from here so we don't
-end up with five subtly different "blacks" scattered across files.
+The "command palette" look: dark glass cards with a thin light border and a
+soft drop shadow, big readable type (Noto Sans), and one colour per mode
+(Vision blue, Code green, Write amber) used everywhere the mode shows.
+Anything UI-facing should pull values from here so we don't end up with five
+subtly different "blacks" scattered across files.
 """
 
 from __future__ import annotations
 
 
 class Colors:
-    # Frosted glass panel surface. The two _TOP/_BOTTOM stops are used as a
-    # subtle vertical gradient inside cards — top a touch lighter, bottom a
-    # touch deeper — to imply "lit from above".
-    BACKGROUND_PANEL = "rgba(18, 19, 23, 232)"
-    BACKGROUND_PANEL_TOP = "rgba(28, 30, 36, 232)"
-    BACKGROUND_PANEL_BOTTOM = "rgba(14, 15, 18, 232)"
-    BACKGROUND_INPUT = "rgba(36, 38, 44, 220)"
+    # Dark glass cards: input bar, bubble, listening pill, tray panel.
+    GLASS = "rgba(23, 24, 28, 238)"
+    GLASS_BORDER = "rgba(255, 255, 255, 51)"
+    GLASS_INSET = "rgba(255, 255, 255, 34)"  # mode-switch track, small buttons
+    GLASS_HOVER = "rgba(255, 255, 255, 22)"
+    DIVIDER = "rgba(255, 255, 255, 42)"
 
-    BORDER_SUBTLE = "rgba(255, 255, 255, 28)"
-    BORDER_HAIRLINE = "rgba(255, 255, 255, 18)"
-    INNER_HIGHLIGHT = "rgba(255, 255, 255, 26)"  # 1px top inner stroke
+    TEXT = "#f2f3f5"
+    TEXT_DIM = "#8b9099"
+    TEXT_FAINT = "#6b7079"  # placeholders, hints, disabled
+    TEXT_ON_ACCENT_DARK = "#1b1b1b"  # on amber
 
-    TEXT_PRIMARY = "#f5f5f7"
-    TEXT_SECONDARY = "#9a9a9e"
-    TEXT_MUTED = "#6b6b70"
-    TEXT_PLACEHOLDER = "#5a5d63"
+    # One colour per mode, used everywhere the mode shows (switch, bubble tag).
+    MODE_VISION = "#3a7bff"
+    MODE_CODE = "#22a06b"
+    MODE_WRITE = "#e0a33a"
 
-    ACCENT_BLUE = "#4d9cff"
-    ACCENT_BLUE_BRIGHT = "#7eb6ff"
-    ACCENT_BLUE_DEEP = "#1f6fd0"
+    # One chip per command.
+    CHIP_STRONG = "#3a7bff"
+    CHIP_SEARCH = "#1fa37a"
+    CHIP_WRITE = "#e0a33a"
 
-    CURSOR_BLUE = "#1f9fff"
-    CURSOR_GLOW = "#1f9fff"
+    LINK = "#8ab4ff"  # footer links (search sources)
+    DANGER = "#ff4d5e"  # listening dot, shell-on toggle, close hover
+    EXPLAIN_BG = "rgba(224, 163, 58, 42)"  # draft explanation strip
+    EXPLAIN_TEXT = "#f0c77a"
 
-    METAL_HIGHLIGHT = "#f4f6f8"
-    METAL_LIGHT = "#c4c9ce"
-    METAL_MID = "#7c8186"
-    METAL_DEEP = "#2e3236"
-    METAL_RIM = "#15171a"
-    METAL_GLOW = "#aab0b6"
+    # The cursor buddy: the same sphere as before, recoloured blue.
+    CURSOR_HIGHLIGHT = "#eef4ff"
+    CURSOR_LIGHT = "#9fc0ff"
+    CURSOR_MID = "#3a7bff"
+    CURSOR_DEEP = "#163a86"
+    CURSOR_RIM = "#0a1736"
+    CURSOR_HALO = "#3a7bff"
 
-    # Soft metallic surfaces used by the input bar and response bubble so they
-    # read as cut from the same material as the buddy dot. Vertical gradient
-    # top→bottom: a touch lighter on top to imply "lit from above".
-    SURFACE_METAL_TOP = "#dde1e5"
-    SURFACE_METAL_BOTTOM = "#aab0b6"
-    SURFACE_METAL_BORDER = "rgba(15, 17, 20, 80)"
-    SURFACE_METAL_INNER_HIGHLIGHT = "rgba(255, 255, 255, 130)"
 
-    TEXT_ON_METAL = "#1a1c1f"
-    TEXT_ON_METAL_SECONDARY = "#4a4d52"
-    TEXT_ON_METAL_PLACEHOLDER = "#7c8186"
+MODE_COLORS = {"vision": Colors.MODE_VISION, "code": Colors.MODE_CODE, "writing": Colors.MODE_WRITE}
 
-    BUBBLE_BACKGROUND = "rgba(18, 19, 23, 232)"
-    BUBBLE_BORDER = "rgba(255, 255, 255, 28)"
+
+class Fonts:
+    FAMILY = "Noto Sans"
+    INPUT_PX = 16
+    BODY_PX = 15
+    FOOTER_PX = 12
+    SMALL_PX = 11
 
 
 class Radius:
-    PANEL = 14
-    INPUT = 12
+    CARD = 14  # input bar, tray panel
     BUBBLE = 16
     BUTTON = 8
-    PILL = 999  # for fully rounded "pill" shapes; Qt clamps to height/2 anyway
+    SEGMENT = 9  # mode switch track
+    SEGMENT_CELL = 7
 
 
 class Sizes:
     PANEL_WIDTH = 340
-    INPUT_HEIGHT = 44
-    BUBBLE_MAX_WIDTH = 460
+    BUBBLE_MAX_WIDTH = 560  # drafts and long answers need room
     BUBBLE_MAX_HEIGHT = 360
+    PROMPT_MAX_LINES = 8  # input box grows to this many lines, then scrolls
     CURSOR_SIZE = 48
-    ACCENT_STRIPE_WIDTH = 3  # vertical accent on the leading edge of cards

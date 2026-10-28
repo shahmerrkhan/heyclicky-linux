@@ -3,28 +3,30 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QRect, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QCursor, QGuiApplication, QKeyEvent, QPalette
+from PyQt6.QtGui import QColor, QCursor, QFontMetricsF, QGuiApplication, QKeySequence, QKeyEvent, QPalette, QShortcut
 from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
+from ..config import settings
 from ..llm.prefixes import parse_prefixes
 from .area_selector import AreaSelectorOverlay
 from .cursor import BlueCursor
-from .design import Colors, Radius
+from .design import MODE_COLORS, Colors, Fonts, Radius, Sizes
 from .effects import DEFAULT_SHADOW_MARGIN, apply_drop_shadow, fade_in
+from .listening import ListeningPill
 from .response_bubble import ResponseBubble
 
 
-CARD_INNER_WIDTH = 520
+CARD_INNER_WIDTH = 640
 
 
 def _friendly_path(s: str) -> str:
@@ -36,19 +38,183 @@ def _friendly_path(s: str) -> str:
     return s
 
 
+class _PromptEdit(QPlainTextEdit):
+    """The input box: grows with the text up to PROMPT_MAX_LINES lines, then scrolls.
+
+    Enter sends (`returnPressed`), Shift+Enter adds a line, Esc is left for the
+    card to close the bar, Tab moves focus instead of typing a tab. It keeps
+    the small part of QLineEdit's API the rest of Clicky uses (`text`,
+    `setText`, `setCursorPosition`, `returnPressed`), so callers didn't change
+    when the one-line box was replaced.
+    """
+
+    returnPressed = pyqtSignal()
+    heightChanged = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("prompt")
+        self.setTabChangesFocus(True)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.viewport().setAutoFillBackground(False)
+        self.document().setDocumentMargin(2)
+        self._lines = 0
+        self.textChanged.connect(self._fit_height)
+        self._fit_height()
+
+    # --- QLineEdit-compatible bits -------------------------------------------
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def setText(self, text: str) -> None:
+        self.setPlainText(text)
+
+    def setCursorPosition(self, position: int) -> None:
+        cursor = self.textCursor()
+        cursor.setPosition(max(0, min(position, len(self.toPlainText()))))
+        self.setTextCursor(cursor)
+
+    def cursorPosition(self) -> int:
+        return self.textCursor().position()
+
+    # --- keys and sizing -------------------------------------------------------
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.textCursor().insertText("\n")
+                self.ensureCursorVisible()
+            else:
+                self.returnPressed.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            event.ignore()  # the card closes the bar
+            return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_height()
+
+    def visible_lines(self) -> int:
+        return self._lines
+
+    def _fit_height(self) -> None:
+        # QPlainTextEdit's document height is measured in (wrapped) lines.
+        lines = max(1, round(self.document().size().height()))
+        shown = min(lines, Sizes.PROMPT_MAX_LINES)
+        line_px = QFontMetricsF(self.font()).lineSpacing()
+        margins = self.contentsMargins()
+        doc_margin = 2 * self.document().documentMargin()
+        height = int(shown * line_px + doc_margin + margins.top() + margins.bottom()) + 4
+        # The scrollbar only appears once the box has stopped growing.
+        policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if lines > shown else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        if self.verticalScrollBarPolicy() != policy:
+            self.setVerticalScrollBarPolicy(policy)
+        if height != self.height() or shown != self._lines:
+            self._lines = shown
+            self.setFixedHeight(height)
+            if lines > shown:
+                self.ensureCursorVisible()
+            self.heightChanged.emit()
+
+
+class _ModeSwitch(QFrame):
+    """Segmented Vision / Code / Write switch. Write stays disabled until writing mode exists.
+
+    Every button has NoFocus so clicking a mode never pulls focus out of the box.
+    """
+
+    mode_clicked = pyqtSignal(str)
+
+    MODES = (("vision", "Vision"), ("code", "Code"), ("writing", "Write"))
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("modeSwitch")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(3, 3, 3, 3)
+        layout.setSpacing(2)
+        self._buttons: dict[str, QPushButton] = {}
+        for mode, label in self.MODES:
+            button = QPushButton(label, self)
+            button.setObjectName(f"mode_{mode}")
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _checked, m=mode: self.mode_clicked.emit(m))
+            layout.addWidget(button)
+            self._buttons[mode] = button
+        write = self._buttons["writing"]
+        write.setEnabled(False)
+        write.setToolTip("writing mode — coming soon")
+        for mode, button in self._buttons.items():
+            if mode != "writing":
+                button.setToolTip(f"{mode} mode (Alt+{1 if mode == 'vision' else 2})")
+
+    def set_mode(self, mode: str) -> None:
+        for name, button in self._buttons.items():
+            button.blockSignals(True)
+            button.setChecked(name == mode)
+            button.blockSignals(False)
+
+    def button(self, mode: str) -> QPushButton:
+        return self._buttons[mode]
+
+
+class _ChipRow(QWidget):
+    """One chip per command (strong, search, write), shown while it's typed.
+
+    `text()` reads like the old single chip ("strong · search") so existing
+    checks and callers keep working.
+    """
+
+    CHIPS = (("strong", "chipStrong"), ("search", "chipSearch"), ("write", "chipWrite"))
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self._chips: dict[str, QLabel] = {}
+        for name, object_name in self.CHIPS:
+            chip = QLabel(name, self)
+            chip.setObjectName(object_name)
+            chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            chip.hide()
+            layout.addWidget(chip)
+            self._chips[name] = chip
+        self.hide()
+
+    def set_chips(self, names: list[str]) -> None:
+        for name, chip in self._chips.items():
+            chip.setVisible(name in names)
+        self.setVisible(bool(names))
+
+    def text(self) -> str:
+        return " · ".join(name for name, chip in self._chips.items() if not chip.isHidden())
+
+
 class _InputCard(QWidget):
-    """Floating input box anchored near the cursor.
+    """Floating input bar anchored near the cursor ("command palette" look).
 
-    Top-level frameless top-most window with a frosted-glass card inside.
-    A soft drop shadow renders in the surrounding transparent margin, and a
-    thin accent stripe on the left edge gives the panel an identity (mirrors
-    the bubble's accent so the two read as the same "channel").
+    Top-level frameless top-most window holding a dark glass card:
+      - top row: Vision / Code / Write switch, the growing input box, one chip
+        per typed command, the area button (+ badge when an area is picked);
+      - code row (Code mode only): workspace and "allow shell";
+      - hint line: Enter / Shift+Enter / Esc / area / talk key.
 
-    Two operating modes:
-      - 'vision': original behaviour — screenshot the screen and ask about it.
-      - 'code': hand the prompt off to a `claude -p` subprocess in a configured
-        workspace. The second row of the card becomes visible to show/edit the
-        workspace and toggle shell access.
+    Modes:
+      - 'vision': screenshot the screen and ask about it.
+      - 'code': hand the prompt to a `claude -p` subprocess in a workspace.
+      - 'writing': shown but disabled until writing mode exists; never selectable.
+    Alt+1 / Alt+2 switch to vision / code (Alt+3 is kept for writing).
     """
 
     submitted = pyqtSignal(str)
@@ -58,6 +224,8 @@ class _InputCard(QWidget):
     mode_changed = pyqtSignal(str)
     allow_shell_changed = pyqtSignal(bool)
     workspace_changed = pyqtSignal(str)
+
+    SELECTABLE_MODES = ("vision", "code")
 
     def __init__(self) -> None:
         super().__init__(
@@ -80,47 +248,39 @@ class _InputCard(QWidget):
         self._card = QFrame(self)
         self._card.setObjectName("inputCard")
         self._card.setFixedWidth(CARD_INNER_WIDTH)
-        self._card.setStyleSheet(self._stylesheet())
         outer.addWidget(self._card)
         self.setFixedWidth(CARD_INNER_WIDTH + 2 * DEFAULT_SHADOW_MARGIN)
 
-        apply_drop_shadow(self._card, blur=24, dy=6, alpha=110)
+        apply_drop_shadow(self._card, blur=28, dy=8, alpha=140)
 
         card_layout = QVBoxLayout(self._card)
-        card_layout.setContentsMargins(12, 10, 10, 10)
-        card_layout.setSpacing(6)
+        card_layout.setContentsMargins(12, 12, 12, 8)
+        card_layout.setSpacing(8)
 
         # --- top row ---------------------------------------------------------
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
+        row.setSpacing(10)
 
-        self._mode_btn = QPushButton("vision", self._card)
-        self._mode_btn.setObjectName("modeBtn")
-        self._mode_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._mode_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._mode_btn.setCheckable(True)
-        self._mode_btn.setToolTip("toggle vision / code mode")
-        self._mode_btn.clicked.connect(self._on_mode_button_clicked)
-        row.addWidget(self._mode_btn)
+        self._mode_switch = _ModeSwitch(self._card)
+        self._mode_switch.mode_clicked.connect(self._select_mode)
+        row.addWidget(self._mode_switch, alignment=Qt.AlignmentFlag.AlignTop)
 
-        self._line_edit = QLineEdit(self._card)
+        self._line_edit = _PromptEdit(self._card)
         self._line_edit.setPlaceholderText("ask clicky anything…")
         self._line_edit.returnPressed.connect(self._on_return)
-        self._line_edit.setMinimumHeight(28)
+        self._line_edit.heightChanged.connect(self.adjustSize)
         _palette = self._line_edit.palette()
-        _palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(Colors.TEXT_ON_METAL_PLACEHOLDER))
+        _palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(Colors.TEXT_FAINT))
+        _palette.setColor(QPalette.ColorRole.Text, QColor(Colors.TEXT))
         self._line_edit.setPalette(_palette)
         self._line_edit.textChanged.connect(self._refresh_prefix_chip)
         row.addWidget(self._line_edit, stretch=1)
 
-        # Shows "strong" / "search" while a /p, /s (or /ps, /sp) command is typed
-        # anywhere in the box, in vision mode. Uses the router's own parser so it always matches.
-        self._prefix_chip = QLabel("", self._card)
-        self._prefix_chip.setObjectName("prefixChip")
-        self._prefix_chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._prefix_chip.hide()
-        row.addWidget(self._prefix_chip)
+        # Shows a chip per /p, /s (or /ps, /sp) command typed anywhere in the
+        # box, in vision mode. Uses the router's own parser so it always matches.
+        self._prefix_chip = _ChipRow(self._card)
+        row.addWidget(self._prefix_chip, alignment=Qt.AlignmentFlag.AlignTop)
 
         self._badge = QFrame(self._card)
         self._badge.setObjectName("badge")
@@ -139,7 +299,7 @@ class _InputCard(QWidget):
         self._badge_clear.clicked.connect(self._on_clear_area)
         badge_layout.addWidget(self._badge_clear)
         self._badge.hide()
-        row.addWidget(self._badge)
+        row.addWidget(self._badge, alignment=Qt.AlignmentFlag.AlignTop)
 
         self._area_btn = QPushButton("◫ area", self._card)
         self._area_btn.setObjectName("areaBtn")
@@ -147,7 +307,7 @@ class _InputCard(QWidget):
         self._area_btn.setToolTip("select a region of the screen (then type, Enter)")
         self._area_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._area_btn.clicked.connect(self.area_select_requested.emit)
-        row.addWidget(self._area_btn)
+        row.addWidget(self._area_btn, alignment=Qt.AlignmentFlag.AlignTop)
 
         card_layout.addLayout(row)
 
@@ -181,110 +341,153 @@ class _InputCard(QWidget):
         card_layout.addWidget(self._code_row)
         self._code_row.hide()
 
+        # --- hint line ---------------------------------------------------------
+        hint = "↵ send   ⇧↵ new line   esc close   ◫ area"
+        if settings.voice_enabled:
+            hint += "   hold Fn+F5 to talk"
+        self._hint = QLabel(hint, self._card)
+        self._hint.setObjectName("hint")
+        card_layout.addWidget(self._hint)
+
+        for sequence, mode in (("Alt+1", "vision"), ("Alt+2", "code"), ("Alt+3", "writing")):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(lambda m=mode: self._select_mode(m))
+
+        self._card.setStyleSheet(self._stylesheet())
+
     def _stylesheet(self) -> str:
+        mode_color = MODE_COLORS.get(self._mode, Colors.MODE_VISION)
+        on_mode = Colors.TEXT_ON_ACCENT_DARK if self._mode == "writing" else "white"
         return f"""
             QFrame#inputCard {{
-                background: qlineargradient(
-                    x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {Colors.SURFACE_METAL_TOP},
-                    stop:1 {Colors.SURFACE_METAL_BOTTOM}
-                );
-                border: 1px solid {Colors.SURFACE_METAL_BORDER};
-                border-top: 1px solid {Colors.SURFACE_METAL_INNER_HIGHLIGHT};
-                border-radius: {Radius.INPUT}px;
+                background-color: {Colors.GLASS};
+                border: 1px solid {Colors.GLASS_BORDER};
+                border-radius: {Radius.CARD}px;
             }}
-            QLineEdit {{
+            QPlainTextEdit#prompt {{
                 background-color: transparent;
                 border: none;
-                color: {Colors.TEXT_ON_METAL};
-                font-size: 15px;
+                color: {Colors.TEXT};
+                font-family: "{Fonts.FAMILY}";
+                font-size: {Fonts.INPUT_PX}px;
                 padding: 0;
-                selection-background-color: rgba(31, 111, 208, 120);
-                selection-color: {Colors.TEXT_PRIMARY};
+                selection-background-color: rgba(58, 123, 255, 120);
+                selection-color: {Colors.TEXT};
             }}
-            QPushButton#modeBtn {{
-                background-color: rgba(255, 255, 255, 100);
-                border: 1px solid rgba(15, 17, 20, 60);
-                border-radius: 10px;
-                color: {Colors.TEXT_ON_METAL};
-                padding: 4px 10px;
-                font-size: 11px;
+            QPlainTextEdit#prompt QScrollBar:vertical {{
+                background: transparent;
+                width: 8px;
+                margin: 2px 0 2px 0;
+            }}
+            QPlainTextEdit#prompt QScrollBar::handle:vertical {{
+                background: rgba(255, 255, 255, 60);
+                min-height: 24px;
+                border-radius: 3px;
+            }}
+            QPlainTextEdit#prompt QScrollBar::add-line:vertical,
+            QPlainTextEdit#prompt QScrollBar::sub-line:vertical {{
+                height: 0;
+                border: none;
+                background: none;
+            }}
+            QPlainTextEdit#prompt QScrollBar::add-page:vertical,
+            QPlainTextEdit#prompt QScrollBar::sub-page:vertical {{
+                background: none;
+            }}
+            QFrame#modeSwitch {{
+                background-color: {Colors.GLASS_INSET};
+                border: none;
+                border-radius: {Radius.SEGMENT}px;
+            }}
+            QFrame#modeSwitch QPushButton {{
+                background: transparent;
+                border: none;
+                border-radius: {Radius.SEGMENT_CELL}px;
+                color: {Colors.TEXT_DIM};
+                font-family: "{Fonts.FAMILY}";
+                font-size: 13px;
                 font-weight: 600;
-                letter-spacing: 0.4px;
-                min-width: 52px;
+                padding: 4px 12px;
+                min-width: 42px;
             }}
-            QPushButton#modeBtn:hover {{
-                background-color: rgba(255, 255, 255, 160);
+            QFrame#modeSwitch QPushButton:hover:!checked:enabled {{
+                background-color: {Colors.GLASS_HOVER};
+                color: {Colors.TEXT};
             }}
-            QPushButton#modeBtn:checked {{
-                background-color: {Colors.ACCENT_BLUE_DEEP};
-                border-color: {Colors.ACCENT_BLUE_DEEP};
+            QFrame#modeSwitch QPushButton:checked {{
+                background-color: {mode_color};
+                color: {on_mode};
+            }}
+            QFrame#modeSwitch QPushButton:disabled {{
+                color: {Colors.TEXT_FAINT};
+            }}
+            QLabel#chipStrong, QLabel#chipSearch, QLabel#chipWrite {{
+                border: 1px solid transparent;
+                border-radius: 11px;
+                padding: 3px 9px;
+                font-family: "{Fonts.FAMILY}";
+                font-size: {Fonts.SMALL_PX}px;
+                font-weight: 600;
                 color: white;
             }}
+            QLabel#chipStrong {{ background-color: {Colors.CHIP_STRONG}; }}
+            QLabel#chipSearch {{ background-color: {Colors.CHIP_SEARCH}; }}
+            QLabel#chipWrite {{ background-color: {Colors.CHIP_WRITE}; color: {Colors.TEXT_ON_ACCENT_DARK}; }}
             QPushButton#areaBtn {{
-                background-color: rgba(255, 255, 255, 80);
-                border: 1px solid rgba(15, 17, 20, 50);
+                background-color: {Colors.GLASS_INSET};
+                border: none;
                 border-radius: 8px;
-                color: {Colors.TEXT_ON_METAL_SECONDARY};
-                padding: 6px 12px;
+                color: {Colors.TEXT_DIM};
+                padding: 5px 11px;
+                font-family: "{Fonts.FAMILY}";
                 font-size: 12px;
                 font-weight: 500;
             }}
             QPushButton#areaBtn:hover {{
-                color: {Colors.TEXT_ON_METAL};
-                background-color: rgba(255, 255, 255, 140);
-                border-color: rgba(15, 17, 20, 100);
-            }}
-            QPushButton#areaBtn:pressed {{
-                background-color: rgba(15, 17, 20, 18);
+                color: {Colors.TEXT};
+                background-color: rgba(255, 255, 255, 52);
             }}
             QPushButton#workspaceBtn {{
-                background-color: rgba(15, 17, 20, 18);
-                border: 1px solid rgba(15, 17, 20, 50);
+                background-color: {Colors.GLASS_INSET};
+                border: none;
                 border-radius: 7px;
-                color: {Colors.TEXT_ON_METAL_SECONDARY};
+                color: {Colors.TEXT_DIM};
                 padding: 4px 10px;
                 font-size: 11px;
                 font-family: "JetBrains Mono", "Fira Mono", monospace;
                 text-align: left;
             }}
             QPushButton#workspaceBtn:hover {{
-                color: {Colors.TEXT_ON_METAL};
-                background-color: rgba(255, 255, 255, 160);
+                color: {Colors.TEXT};
+                background-color: rgba(255, 255, 255, 52);
             }}
             QPushButton#shellBtn {{
-                background-color: rgba(255, 255, 255, 80);
-                border: 1px solid rgba(15, 17, 20, 50);
+                background-color: {Colors.GLASS_INSET};
+                border: none;
                 border-radius: 7px;
-                color: {Colors.TEXT_ON_METAL_SECONDARY};
+                color: {Colors.TEXT_DIM};
                 padding: 4px 10px;
+                font-family: "{Fonts.FAMILY}";
                 font-size: 11px;
                 font-weight: 500;
             }}
             QPushButton#shellBtn:hover {{
-                background-color: rgba(255, 255, 255, 140);
-                color: {Colors.TEXT_ON_METAL};
+                color: {Colors.TEXT};
+                background-color: rgba(255, 255, 255, 52);
             }}
             QPushButton#shellBtn:checked {{
-                background-color: #b3261e;
-                border-color: #b3261e;
+                background-color: {Colors.DANGER};
                 color: white;
-            }}
-            QLabel#prefixChip {{
-                background-color: {Colors.ACCENT_BLUE_DEEP};
-                border-radius: 8px;
-                color: white;
-                padding: 3px 8px;
-                font-size: 11px;
-                font-weight: 600;
             }}
             QFrame#badge {{
-                background-color: rgba(31, 111, 208, 60);
-                border: 1px solid rgba(31, 111, 208, 140);
+                background-color: rgba(58, 123, 255, 60);
+                border: 1px solid rgba(58, 123, 255, 150);
                 border-radius: 8px;
             }}
             QLabel#badgeLabel {{
-                color: #0e3b78;
+                color: {Colors.LINK};
+                font-family: "{Fonts.FAMILY}";
                 font-size: 11px;
                 font-weight: 600;
                 background: transparent;
@@ -292,13 +495,19 @@ class _InputCard(QWidget):
             QPushButton#badgeClear {{
                 background: transparent;
                 border: none;
-                color: #0e3b78;
+                color: {Colors.LINK};
                 font-size: 14px;
                 font-weight: bold;
                 padding: 0;
             }}
             QPushButton#badgeClear:hover {{
-                color: {Colors.TEXT_ON_METAL};
+                color: {Colors.TEXT};
+            }}
+            QLabel#hint {{
+                color: {Colors.TEXT_FAINT};
+                font-family: "{Fonts.FAMILY}";
+                font-size: {Fonts.SMALL_PX}px;
+                padding: 0 2px;
             }}
         """
 
@@ -333,14 +542,11 @@ class _InputCard(QWidget):
 
     def apply_mode(self, mode: str, workspace: str, allow_shell: bool) -> None:
         """Reflect persisted state in the UI without re-emitting signals."""
-        self._mode = mode if mode in ("vision", "code") else "vision"
+        self._mode = mode if mode in self.SELECTABLE_MODES else "vision"
         self._workspace = workspace
         self._allow_shell = allow_shell
 
-        self._mode_btn.blockSignals(True)
-        self._mode_btn.setChecked(self._mode == "code")
-        self._mode_btn.setText("code" if self._mode == "code" else "vision")
-        self._mode_btn.blockSignals(False)
+        self._mode_switch.set_mode(self._mode)
 
         self._shell_btn.blockSignals(True)
         self._shell_btn.setChecked(self._allow_shell)
@@ -352,6 +558,7 @@ class _InputCard(QWidget):
         self._line_edit.setPlaceholderText(
             "ask claude code…" if self._mode == "code" else "ask clicky anything…"
         )
+        self._card.setStyleSheet(self._stylesheet())
         self._refresh_prefix_chip()
         self.adjustSize()
 
@@ -365,14 +572,17 @@ class _InputCard(QWidget):
                 labels.append("strong")
             if parsed.search:
                 labels.append("search")
-        self._prefix_chip.setText(" · ".join(labels))
-        self._prefix_chip.setVisible(bool(labels))
+        self._prefix_chip.set_chips(labels)
 
-    def _on_mode_button_clicked(self) -> None:
-        new_mode = "code" if self._mode_btn.isChecked() else "vision"
-        if new_mode == self._mode:
+    def _select_mode(self, mode: str) -> None:
+        # Writing mode isn't built yet: its button is disabled and Alt+3 does nothing.
+        if mode not in self.SELECTABLE_MODES:
+            self._mode_switch.set_mode(self._mode)
             return
-        self._mode = new_mode
+        if mode == self._mode:
+            self._mode_switch.set_mode(self._mode)
+            return
+        self._mode = mode
         self.apply_mode(self._mode, self._workspace, self._allow_shell)
         self.mode_changed.emit(self._mode)
 
@@ -466,6 +676,7 @@ class Overlay(QObject):
         self._cursor = BlueCursor()
         self._input_card = _InputCard()
         self._bubble = ResponseBubble()
+        self._listening = ListeningPill()
         self._area_selector = AreaSelectorOverlay()
 
         self._selected_area: QRect | None = None
@@ -512,6 +723,29 @@ class Overlay(QObject):
     def update_bubble_footer(self, html: str) -> None:
         self._bubble.set_footer(html)
 
+    def show_listening(self, seconds: int) -> None:
+        """The listening pill near the cursor (talk key held); hides the input bar and bubble."""
+        cursor_pos = QCursor.pos()
+        self._input_card.hide()
+        self._bubble.hide()
+        self._listening.set_seconds(seconds)
+        self._listening.show_near(cursor_pos.x() + 32, cursor_pos.y() + 28)
+
+    def update_listening(self, seconds: int) -> None:
+        self._listening.set_seconds(seconds)
+
+    def hide_listening(self) -> None:
+        self._listening.hide()
+
+    def set_bubble_mode(self, mode: str | None) -> None:
+        self._bubble.set_mode(mode)
+
+    def set_bubble_said(self, text: str) -> None:
+        self._bubble.set_said(text)
+
+    def set_bubble_explanation(self, text: str) -> None:
+        self._bubble.set_explanation(text)
+
     def show_cursor_at(self, global_x: int, global_y: int) -> None:
         self._cursor.stop_tracking_mouse()
         self._cursor.show_at(global_x, global_y)
@@ -529,6 +763,7 @@ class Overlay(QObject):
     def dismiss(self) -> None:
         self._input_card.hide()
         self._bubble.hide()
+        self._listening.hide()
         self._area_selector.hide()
         self._cursor.start_tracking_mouse()
         self.overlay_dismissed.emit()

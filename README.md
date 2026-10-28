@@ -6,7 +6,7 @@
 
 Clicky is the little AI buddy that lives next to your cursor. Hit a hotkey, ask a question about whatever is on your screen, and a streaming bubble answers right there — and if the model points to something, a blue cursor flies over and taps it.
 
-Clicky has two modes you can flip between in the input bar:
+Clicky has two modes you can flip between in the input bar (a third, **Write**, is shown but not built yet):
 
 - **Vision mode** (default): screenshot + question → Gemini (called directly; add `/p` anywhere in a question for the strong model or `/s` to add Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
 - **Code mode**: prompt → spawns `claude -p` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) as a subprocess in a configured workspace → its progress (text + tool calls) streams into the same bubble. Lets you ask Clicky to *do* things in a directory, not just describe what it sees.
@@ -93,23 +93,33 @@ mkdir -p $V/sounds && echo "Error." | $V/piper/venv/bin/python -m piper -m $V/pi
 
 ## Usage estimates
 
-Under every vision answer:
+One quiet line under every vision answer:
 
-- `today (estimate): 12 questions, 3 with search · resets at midnight pacific` — successful answers only (failed, blocked, and cut-off ones don't count; a retry or model switch never counts twice). Google only shows the real numbers in [AI Studio](https://aistudio.google.com).
-- `search credits this month (estimate): 46 / 1000 · resets on nov 1` — Tavily credits used by successful searches (2 per search), reset on the 1st.
+`today (estimate): 12 questions, 3 with search, resets 09:00 · search credits: 46 / 1000, back on nov 1`
+
+- Questions count successful answers only (failed, blocked, and cut-off ones don't count; a retry or model switch never counts twice) and reset at midnight Pacific (shown in your local time). Google only shows the real numbers in [AI Studio](https://aistudio.google.com).
+- Search credits are the Tavily credits used by successful searches (2 per search), reset on the 1st.
 
 Both are saved to `~/.local/state/clicky/usage.json`.
+
+## The look
+
+Dark glass cards with Noto Sans type, one colour per mode — **Vision** blue, **Code** green, **Write** amber — used on the mode switch and the bubble's tag.
+
+- **Input bar**: a Vision / Code / Write switch (click, or **Alt+1** / **Alt+2**; Write is disabled until writing mode exists), a box that grows with your text up to 8 lines and then scrolls (**Enter** sends, **Shift+Enter** adds a line, **Esc** closes), one chip per typed command (**strong**, **search**), and the ◫ area button.
+- **Listening pill**: while you hold the talk key, a small pill near the cursor shows a red dot and the time.
+- **Bubble**: up to 560 px wide, with the mode tag and × at the top, a quiet *you said: …* line for voice questions, the answer, and the footer. It never takes focus, so the window you were in stays focused.
 
 ## The response bubble
 
 - Long answers scroll inside the bubble (auto-follows the streaming bottom, stays put when you scroll up to re-read).
 - Text is selectable — drag across it to copy.
-- **Drag** the bubble by clicking anywhere on its padding (any spot that isn't the text, scrollbar, or × button). The cursor turns into a move handle when you can grab.
+- **Drag** the bubble by its header or padding (any spot that isn't the answer text, scrollbar, footer links, or × button). The cursor turns into a move handle when you can grab.
 - **Resize** from the bottom-right corner (the cursor becomes a diagonal arrow there). Once you've resized, the bubble keeps its size for that response. Sending a new prompt resets it back to auto-fit.
 
 ## Code mode (Claude Code agent)
 
-Click the small `vision` / `code` pill on the left of the input bar to switch. In Code mode:
+Click **Code** on the input bar's mode switch (or press **Alt+2**) to switch. In Code mode:
 
 - Your prompt is handed to a `claude -p` subprocess in the workspace shown under the input. Click the workspace chip to pick a different directory.
 - For one-off overrides, start your prompt with `@/path/to/dir ` (or `@"/path with spaces" `) — that directory is used as the cwd for that single call.
@@ -158,6 +168,8 @@ Convert to screen pixels (clamped) → blue cursor bezier animation
 | Tray | `clicky/ui/tray.py` | `MenuBarPanelManager.swift` |
 | Panel | `clicky/ui/panel.py` | `CompanionPanelView.swift` |
 | Overlay + cursor | `clicky/ui/overlay.py`, `cursor.py` | `OverlayWindow.swift` |
+| Listening pill | `clicky/ui/listening.py` | (new) |
+| Colours, fonts, sizes | `clicky/ui/design.py` | (new) |
 | Response bubble | `clicky/ui/response_bubble.py` | `CompanionResponseOverlay.swift` |
 | Model → screen coordinate conversion | `CapturedScreen.global_point_from_normalized` in `clicky/screen/capture.py` | — |
 | Usage estimates (daily Gemini, monthly Tavily) | `clicky/usage_store.py` | (new) |

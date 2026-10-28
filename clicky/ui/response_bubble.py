@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import QPoint, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QKeyEvent, QMouseEvent
+from PyQt6.QtGui import QFontMetrics, QKeyEvent, QMouseEvent
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .design import Colors, Radius, Sizes
+from .design import MODE_COLORS, Colors, Fonts, Radius, Sizes
 from .effects import DEFAULT_SHADOW_MARGIN, ThinkingDots, apply_drop_shadow, fade_in
 
 
@@ -38,6 +38,11 @@ DRAG_EDGE_PX = 14
 
 # Minimum size the user is allowed to shrink the bubble to.
 MIN_BUBBLE_WIDTH = 280
+
+# Text column width in auto-size mode: as wide as the longest line needs,
+# between these bounds (the footer reads badly any narrower than the minimum).
+MIN_TEXT_WIDTH = 360
+SCROLLBAR_ALLOWANCE = 14
 MIN_BUBBLE_HEIGHT = 80
 
 # QT's sentinel for "no maximum" — used to lift the auto-mode size caps when
@@ -46,7 +51,7 @@ _QWIDGETSIZE_MAX = 16777215
 
 
 class _Card(QFrame):
-    """The visible frosted card inside the bubble.
+    """The visible glass card inside the bubble.
 
     Owns the move/resize gesture state. The bubble's outer QWidget is moved
     and resized in response to drags landing on the card's padding (anywhere
@@ -70,12 +75,14 @@ class _Card(QFrame):
         )
 
     def _is_in_drag_zone(self, local: QPoint) -> bool:
-        """True if the click landed on card padding (not on an interactive child)."""
+        """True if the click landed on card padding or a non-selectable label (header, "you said")."""
         child = self.childAt(local)
         if child is None:
             return True
         node: QWidget | None = child
         while node is not None and node is not self:
+            if isinstance(node, QLabel) and node.textInteractionFlags() == Qt.TextInteractionFlag.NoTextInteraction:
+                return True
             if isinstance(node, (QLabel, QScrollBar, QPushButton)):
                 return False
             node = node.parentWidget()
@@ -153,10 +160,19 @@ class _Card(QFrame):
 
 
 class ResponseBubble(QWidget):
-    """Streaming text bubble shown next to the cursor.
+    """Streaming answer bubble shown next to the cursor ("command palette" look).
 
-    Top-level frameless top-most window. Renders as a frosted-glass card with
-    a soft drop shadow and a small × stop button.
+    Top-level frameless top-most window with a dark glass card, top to bottom:
+      - header: a mode tag (Vision / Code / Write, in the mode's colour) and ×,
+      - a quiet "you said: …" line for voice questions (hidden otherwise),
+      - the answer (or thinking dots), scrolling past BUBBLE_MAX_HEIGHT,
+      - an explanation strip (writing mode will say what it typed where;
+        hidden while empty),
+      - the footer: sources, model notes, usage.
+
+    It never takes focus when shown or updated (WA_ShowWithoutActivating, and
+    every button has NoFocus), so voice and later writing mode keep the
+    user's own window focused.
 
     Sizing modes:
       - **auto** (default): for each new chunk the bubble re-fits to its
@@ -166,9 +182,9 @@ class ResponseBubble(QWidget):
         outer dimensions alone (scrollbar absorbs overflow). The next
         thinking-dots state resets back to auto.
 
-    The card itself is draggable from any non-interactive area (the padding
-    around the label, scrollbar, and stop button). Hovering the bottom-right
-    14 px exposes a diagonal-resize cursor.
+    The card is draggable from any non-interactive area (padding, header,
+    "you said" line). Hovering the bottom-right 14 px exposes a
+    diagonal-resize cursor.
 
     Auto-follow streaming: when text grows we snap the scrollbar to bottom,
     unless the user has scrolled up to re-read — then we leave them put.
@@ -176,6 +192,8 @@ class ResponseBubble(QWidget):
 
     stop_requested = pyqtSignal()
     link_clicked = pyqtSignal(str)
+
+    MODE_LABELS = {"vision": "Vision", "code": "Code", "writing": "Write"}
 
     def __init__(self) -> None:
         super().__init__(
@@ -193,6 +211,8 @@ class ResponseBubble(QWidget):
         )
 
         self._user_sized = False
+        self._mode: str | None = None
+        max_w = Sizes.BUBBLE_MAX_WIDTH
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(
@@ -205,12 +225,43 @@ class ResponseBubble(QWidget):
         self._card.user_resized.connect(self._on_user_resize)
         outer.addWidget(self._card)
 
-        apply_drop_shadow(self._card, blur=24, dy=6, alpha=110)
+        apply_drop_shadow(self._card, blur=28, dy=8, alpha=140)
 
-        inner = QHBoxLayout(self._card)
-        inner.setContentsMargins(16, 12, 6, 12)
-        inner.setSpacing(8)
+        column = QVBoxLayout(self._card)
+        column.setContentsMargins(16, 12, 10, 12)
+        column.setSpacing(8)
 
+        # --- header: mode tag + × -------------------------------------------
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        self._mode_tag = QLabel("", self._card)
+        self._mode_tag.setObjectName("modeTag")
+        self._mode_tag.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self._mode_tag.hide()
+        header.addWidget(self._mode_tag, alignment=Qt.AlignmentFlag.AlignVCenter)
+        header.addStretch(1)
+        self._stop = QPushButton("×", self._card)
+        self._stop.setObjectName("stopBtn")
+        self._stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._stop.setFixedSize(22, 22)
+        self._stop.setToolTip("stop (Esc)")
+        self._stop.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._stop.clicked.connect(self.stop_requested.emit)
+        header.addWidget(self._stop, alignment=Qt.AlignmentFlag.AlignVCenter)
+        column.addLayout(header)
+
+        # --- "you said: …" (voice) --------------------------------------------
+        self._said = QLabel("", self._card)
+        self._said.setObjectName("saidLine")
+        self._said.setTextFormat(Qt.TextFormat.PlainText)
+        self._said.setWordWrap(True)
+        self._said.setMaximumWidth(max_w)
+        self._said.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self._said.hide()
+        column.addWidget(self._said)
+
+        # --- answer (or thinking dots) -----------------------------------------
         self._text_stack = QWidget(self._card)
         stack = QStackedLayout(self._text_stack)
         stack.setContentsMargins(0, 0, 0, 0)
@@ -220,22 +271,26 @@ class ResponseBubble(QWidget):
         self._label.setObjectName("bubbleText")
         self._label.setTextFormat(Qt.TextFormat.PlainText)
         self._label.setWordWrap(True)
-        self._label.setMaximumWidth(Sizes.BUBBLE_MAX_WIDTH)
+        self._label.setMaximumWidth(max_w)
         self._label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
+        # Focus only when the user clicks into the text to select/copy it —
+        # never on show or update.
+        self._label.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self._label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding)
 
         self._scroll = QScrollArea(self._text_stack)
         self._scroll.setObjectName("bubbleScroll")
         self._scroll.setWidget(self._label)
-        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidgetResizable(False)  # auto size; switched on after a manual resize
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._scroll.setMaximumHeight(Sizes.BUBBLE_MAX_HEIGHT)
-        self._scroll.setMaximumWidth(Sizes.BUBBLE_MAX_WIDTH + 14)
+        self._scroll.setMaximumWidth(max_w + 14)
         self._scroll.viewport().setAutoFillBackground(False)
         self._scroll.setStyleSheet("QScrollArea { background: transparent; }")
         # Forward mouse-tracking from the scroll viewport so cursor hint updates
@@ -247,13 +302,23 @@ class ResponseBubble(QWidget):
         thinking_wrap = QWidget()
         thinking_layout = QHBoxLayout(thinking_wrap)
         thinking_layout.setContentsMargins(0, 6, 0, 6)
-        self._thinking = ThinkingDots(color=Colors.TEXT_ON_METAL_SECONDARY)
+        self._thinking = ThinkingDots(color=Colors.TEXT_DIM)
         thinking_layout.addWidget(self._thinking, alignment=Qt.AlignmentFlag.AlignLeft)
         thinking_layout.addStretch(1)
         stack.addWidget(thinking_wrap)
         self._thinking_index = stack.indexOf(thinking_wrap)
         self._scroll_index = stack.indexOf(self._scroll)
         stack.setCurrentIndex(self._scroll_index)
+        column.addWidget(self._text_stack, stretch=1)
+
+        # --- explanation strip (writing mode: what was typed where) ------------
+        self._explain = QLabel("", self._card)
+        self._explain.setObjectName("explainStrip")
+        self._explain.setTextFormat(Qt.TextFormat.PlainText)
+        self._explain.setWordWrap(True)
+        self._explain.setMaximumWidth(max_w)
+        self._explain.hide()
+        column.addWidget(self._explain)
 
         # Footer under the answer: search sources, search/model notes,
         # and the usage estimates. Rich text so links are clickable;
@@ -262,54 +327,64 @@ class ResponseBubble(QWidget):
         self._footer.setObjectName("bubbleFooter")
         self._footer.setTextFormat(Qt.TextFormat.RichText)
         self._footer.setWordWrap(True)
-        self._footer.setMaximumWidth(Sizes.BUBBLE_MAX_WIDTH)
+        self._footer.setMaximumWidth(max_w)
         self._footer.setOpenExternalLinks(False)
         self._footer.linkActivated.connect(self.link_clicked.emit)
         self._footer.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self._footer.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # links still open on click
         self._footer.hide()
-
-        text_column = QVBoxLayout()
-        text_column.setContentsMargins(0, 0, 0, 0)
-        text_column.setSpacing(8)
-        text_column.addWidget(self._text_stack, stretch=1)
-        text_column.addWidget(self._footer)
-        inner.addLayout(text_column, stretch=1)
-
-        self._stop = QPushButton("×", self._card)
-        self._stop.setObjectName("stopBtn")
-        self._stop.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._stop.setFixedSize(22, 22)
-        self._stop.setToolTip("stop (Esc)")
-        self._stop.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._stop.clicked.connect(self.stop_requested.emit)
-        inner.addWidget(self._stop, alignment=Qt.AlignmentFlag.AlignTop)
+        column.addWidget(self._footer)
 
         self.hide()
 
     def _stylesheet(self) -> str:
+        tag_color = MODE_COLORS.get(self._mode or "", Colors.MODE_VISION)
+        tag_text = Colors.TEXT_ON_ACCENT_DARK if self._mode == "writing" else "white"
         return f"""
             QFrame#bubble {{
-                background: qlineargradient(
-                    x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {Colors.SURFACE_METAL_TOP},
-                    stop:1 {Colors.SURFACE_METAL_BOTTOM}
-                );
-                border: 1px solid {Colors.SURFACE_METAL_BORDER};
-                border-top: 1px solid {Colors.SURFACE_METAL_INNER_HIGHLIGHT};
+                background-color: {Colors.GLASS};
+                border: 1px solid {Colors.GLASS_BORDER};
                 border-radius: {Radius.BUBBLE}px;
             }}
-            QLabel#bubbleText {{
-                color: {Colors.TEXT_ON_METAL};
-                font-size: 14px;
+            QLabel#modeTag {{
+                background-color: {tag_color};
+                color: {tag_text};
+                border: 1px solid transparent;
+                border-radius: 10px;
+                padding: 2px 9px;
+                font-family: "{Fonts.FAMILY}";
+                font-size: {Fonts.SMALL_PX}px;
+                font-weight: 600;
+            }}
+            QLabel#saidLine {{
+                color: {Colors.TEXT_DIM};
+                font-family: "{Fonts.FAMILY}";
+                font-size: 13px;
+                font-style: italic;
                 background: transparent;
-                line-height: 1.4;
+            }}
+            QLabel#bubbleText {{
+                color: {Colors.TEXT};
+                font-family: "{Fonts.FAMILY}";
+                font-size: {Fonts.BODY_PX}px;
+                background: transparent;
+            }}
+            QLabel#explainStrip {{
+                color: {Colors.EXPLAIN_TEXT};
+                background-color: {Colors.EXPLAIN_BG};
+                border: 1px solid transparent;
+                border-radius: 10px;
+                padding: 9px 12px;
+                font-family: "{Fonts.FAMILY}";
+                font-size: {Fonts.FOOTER_PX}px;
             }}
             QLabel#bubbleFooter {{
-                color: {Colors.TEXT_ON_METAL_SECONDARY};
-                font-size: 11px;
+                color: {Colors.TEXT_DIM};
+                font-family: "{Fonts.FAMILY}";
+                font-size: {Fonts.FOOTER_PX}px;
                 background: transparent;
-                border-top: 1px solid rgba(15, 17, 20, 40);
-                padding-top: 6px;
+                border-top: 1px solid {Colors.DIVIDER};
+                padding-top: 8px;
             }}
             QScrollArea#bubbleScroll {{
                 background: transparent;
@@ -324,12 +399,12 @@ class ResponseBubble(QWidget):
                 margin: 4px 2px 4px 0;
             }}
             QScrollBar::handle:vertical {{
-                background: rgba(15, 17, 20, 70);
+                background: rgba(255, 255, 255, 60);
                 min-height: 24px;
                 border-radius: 3px;
             }}
             QScrollBar::handle:vertical:hover {{
-                background: rgba(15, 17, 20, 130);
+                background: rgba(255, 255, 255, 110);
             }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 background: none;
@@ -340,21 +415,19 @@ class ResponseBubble(QWidget):
                 background: none;
             }}
             QPushButton#stopBtn {{
-                color: {Colors.TEXT_ON_METAL_SECONDARY};
-                background: rgba(15, 17, 20, 24);
-                border: 1px solid rgba(15, 17, 20, 50);
+                color: {Colors.TEXT_DIM};
+                background: transparent;
+                border: none;
                 border-radius: 11px;
-                font-size: 14px;
-                font-weight: bold;
+                font-size: 16px;
                 padding: 0;
             }}
             QPushButton#stopBtn:hover {{
-                color: #b3261e;
-                background: rgba(179, 38, 30, 36);
-                border-color: rgba(179, 38, 30, 130);
+                color: white;
+                background: rgba(255, 77, 94, 90);
             }}
             QPushButton#stopBtn:pressed {{
-                background: rgba(179, 38, 30, 80);
+                background: rgba(255, 77, 94, 150);
             }}
         """
 
@@ -365,10 +438,10 @@ class ResponseBubble(QWidget):
             self._reset_to_auto_sizing()
             self._label.clear()
             self.set_footer("")
-            self._scroll.setFixedHeight(28)
+            self._set_text_area(MIN_TEXT_WIDTH // 2, 28)
             self._stack.setCurrentIndex(self._thinking_index)
             self._thinking.start()
-            self.adjustSize()
+            self._refit()
             return
         self._thinking.stop()
         self._stack.setCurrentIndex(self._scroll_index)
@@ -379,11 +452,17 @@ class ResponseBubble(QWidget):
         self._label.setText(text)
 
         if not self._user_sized:
-            wrap_w = Sizes.BUBBLE_MAX_WIDTH
-            content_h = max(self._label.heightForWidth(wrap_w), self._label.sizeHint().height())
-            target_h = min(content_h + 4, Sizes.BUBBLE_MAX_HEIGHT)
-            self._scroll.setFixedHeight(target_h)
-            self.adjustSize()
+            # Auto size: the text gets an exact width (from its longest line)
+            # and the exact height that width needs; the visible area is
+            # capped at BUBBLE_MAX_HEIGHT and scrolls past it.
+            wrap_w = self._auto_text_width(text)
+            # Unlock the previous answer's size first: Qt measures within it.
+            self._label.setMinimumSize(0, 0)
+            self._label.setMaximumSize(_QWIDGETSIZE_MAX, _QWIDGETSIZE_MAX)
+            content_h = max(self._label.heightForWidth(wrap_w), 1)
+            self._label.setFixedSize(wrap_w, content_h)
+            self._set_text_area(wrap_w + SCROLLBAR_ALLOWANCE, min(content_h + 4, Sizes.BUBBLE_MAX_HEIGHT))
+            self._refit()
 
         if was_following:
             sb.setValue(sb.maximum())
@@ -396,8 +475,26 @@ class ResponseBubble(QWidget):
         """
         self._footer.setText(html)
         self._footer.setVisible(bool(html))
-        if not self._user_sized:
-            self.adjustSize()
+        self._refit()
+
+    def set_mode(self, mode: str | None) -> None:
+        """Mode tag in the header (vision / code / writing); None hides it."""
+        self._mode = mode if mode in self.MODE_LABELS else None
+        self._mode_tag.setText(self.MODE_LABELS.get(self._mode or "", ""))
+        self._mode_tag.setVisible(self._mode is not None)
+        self._card.setStyleSheet(self._stylesheet())
+
+    def set_said(self, text: str) -> None:
+        """The quiet "you said: …" line for voice questions; empty hides it."""
+        self._said.setText(f"you said: {text}" if text else "")
+        self._said.setVisible(bool(text))
+        self._refit()
+
+    def set_explanation(self, text: str) -> None:
+        """The highlighted strip under the answer (writing mode); empty hides it."""
+        self._explain.setText(text)
+        self._explain.setVisible(bool(text))
+        self._refit()
 
     def show_at_global(self, global_x: int, global_y: int) -> None:
         x = global_x - DEFAULT_SHADOW_MARGIN
@@ -420,6 +517,28 @@ class ResponseBubble(QWidget):
 
     # --- sizing-mode internals --------------------------------------------
 
+    def _auto_text_width(self, text: str) -> int:
+        """Wrap width for `text`: its longest line (or the "you said" line), within bounds."""
+        self._label.ensurePolished()
+        metrics = QFontMetrics(self._label.font())
+        longest = max((metrics.horizontalAdvance(line) for line in text.splitlines()), default=0)
+        if self._said.isVisibleTo(self):
+            self._said.ensurePolished()
+            longest = max(longest, QFontMetrics(self._said.font()).horizontalAdvance(self._said.text()))
+        return max(MIN_TEXT_WIDTH, min(Sizes.BUBBLE_MAX_WIDTH, longest + 8))
+
+    def _set_text_area(self, width: int, height: int) -> None:
+        """Size the answer area (and the stack holding it) together, so neither clips the other."""
+        self._scroll.setFixedSize(width, height)
+        self._text_stack.setFixedSize(width, height)
+
+    def _refit(self) -> None:
+        if self._user_sized:
+            return
+        self._card.layout().activate()
+        self.layout().activate()
+        self.adjustSize()
+
     def _on_user_resize(self) -> None:
         """First time the user drags the corner, switch to manual sizing.
 
@@ -430,15 +549,16 @@ class ResponseBubble(QWidget):
         if self._user_sized:
             return
         self._user_sized = True
-        self._scroll.setMinimumHeight(0)
-        self._scroll.setMaximumHeight(_QWIDGETSIZE_MAX)
-        self._scroll.setMaximumWidth(_QWIDGETSIZE_MAX)
-        self._label.setMaximumWidth(_QWIDGETSIZE_MAX)
+        for widget in (self._scroll, self._text_stack, self._label):
+            widget.setMinimumSize(0, 0)
+            widget.setMaximumSize(_QWIDGETSIZE_MAX, _QWIDGETSIZE_MAX)
+        self._scroll.setWidgetResizable(True)  # the text now rewraps to the size the user drags
         self._scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._text_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def _reset_to_auto_sizing(self) -> None:
         self._user_sized = False
-        self._scroll.setMaximumHeight(Sizes.BUBBLE_MAX_HEIGHT)
-        self._scroll.setMaximumWidth(Sizes.BUBBLE_MAX_WIDTH + 14)
+        self._scroll.setWidgetResizable(False)  # auto size: the label gets an exact size in set_text
         self._label.setMaximumWidth(Sizes.BUBBLE_MAX_WIDTH)
         self._scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self._text_stack.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)

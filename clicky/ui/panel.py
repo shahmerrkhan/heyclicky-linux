@@ -11,16 +11,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .design import Colors, Radius, Sizes
+from .design import Colors, Fonts, Radius, Sizes
 from .effects import DEFAULT_SHADOW_MARGIN, apply_drop_shadow, fade_in
 
 
 class ControlPanel(QWidget):
     """Small popup shown when the tray icon is clicked.
 
-    Same frosted-glass surface, drop shadow and accent stripe as the input
-    card and bubble — keeps the tray menu visually consistent with the in-
-    flow UI so it doesn't feel like a separate app.
+    Same dark glass card and drop shadow as the input bar and bubble — keeps
+    the tray popup visually consistent with the in-flow UI so it doesn't feel
+    like a separate app.
     """
 
     quit_requested = pyqtSignal()
@@ -46,16 +46,11 @@ class ControlPanel(QWidget):
         self._card.setStyleSheet(self._stylesheet())
         outer.addWidget(self._card)
 
-        apply_drop_shadow(self._card)
+        apply_drop_shadow(self._card, blur=28, dy=8, alpha=140)
 
         card_root = QHBoxLayout(self._card)
         card_root.setContentsMargins(0, 0, 0, 0)
         card_root.setSpacing(0)
-
-        stripe = QFrame(self._card)
-        stripe.setObjectName("stripe")
-        stripe.setFixedWidth(Sizes.ACCENT_STRIPE_WIDTH)
-        card_root.addWidget(stripe)
 
         content = QWidget(self._card)
         card_root.addWidget(content, stretch=1)
@@ -84,8 +79,9 @@ class ControlPanel(QWidget):
         body.setObjectName("body")
         layout.addWidget(body)
 
-        hint = QLabel("Enter sends · Esc closes · ◫ selects an area")
+        hint = QLabel("Enter sends · Shift+Enter new line · Esc closes · ◫ selects an area")
         hint.setObjectName("hint")
+        hint.setWordWrap(True)
         layout.addWidget(hint)
 
         footer = QHBoxLayout()
@@ -100,59 +96,50 @@ class ControlPanel(QWidget):
     def _stylesheet(self) -> str:
         return f"""
             QFrame#card {{
-                background: qlineargradient(
-                    x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {Colors.BACKGROUND_PANEL_TOP},
-                    stop:1 {Colors.BACKGROUND_PANEL_BOTTOM}
-                );
-                border: 1px solid {Colors.BORDER_SUBTLE};
-                border-top: 1px solid {Colors.INNER_HIGHLIGHT};
-                border-radius: {Radius.PANEL}px;
-            }}
-            QFrame#stripe {{
-                background-color: {Colors.ACCENT_BLUE};
-                border-top-left-radius: {Radius.PANEL}px;
-                border-bottom-left-radius: {Radius.PANEL}px;
+                background-color: {Colors.GLASS};
+                border: 1px solid {Colors.GLASS_BORDER};
+                border-radius: {Radius.CARD}px;
             }}
             QLabel {{
                 background: transparent;
+                font-family: "{Fonts.FAMILY}";
             }}
             QLabel#statusDot {{
-                color: #4ade80;
+                color: {Colors.MODE_CODE};
                 font-size: 12px;
             }}
             QLabel#title {{
-                color: {Colors.TEXT_PRIMARY};
+                color: {Colors.TEXT};
                 font-size: 15px;
                 font-weight: 700;
             }}
             QLabel#section {{
-                color: {Colors.TEXT_SECONDARY};
+                color: {Colors.TEXT_DIM};
                 font-size: 10px;
                 font-weight: 700;
                 letter-spacing: 1.4px;
             }}
             QLabel#body {{
-                color: {Colors.TEXT_PRIMARY};
+                color: {Colors.TEXT};
                 font-size: 13px;
             }}
             QLabel#hint {{
-                color: {Colors.TEXT_MUTED};
-                font-size: 11px;
+                color: {Colors.TEXT_FAINT};
+                font-size: {Fonts.SMALL_PX}px;
             }}
             QPushButton#quit {{
-                background-color: transparent;
-                color: {Colors.TEXT_SECONDARY};
-                border: 1px solid {Colors.BORDER_SUBTLE};
+                background-color: {Colors.GLASS_INSET};
+                color: {Colors.TEXT_DIM};
+                border: none;
                 border-radius: {Radius.BUTTON}px;
                 padding: 6px 12px;
+                font-family: "{Fonts.FAMILY}";
                 font-size: 12px;
                 font-weight: 500;
             }}
             QPushButton#quit:hover {{
-                color: {Colors.TEXT_PRIMARY};
-                border-color: rgba(255, 80, 80, 160);
-                background: rgba(255, 80, 80, 32);
+                color: white;
+                background: rgba(255, 77, 94, 90);
             }}
         """
 

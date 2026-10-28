@@ -198,10 +198,7 @@ class CompanionStateMachine(QObject):
         self._listener = listener
         self._listen_start = asyncio.ensure_future(listener.start())
         self._set_state(CompanionState.LISTENING)
-        self._overlay.hide_input()
-        self._overlay.update_bubble_footer("")
-        self._show_listening()
-        self._overlay.show_bubble_near_cursor()
+        self._overlay.show_listening(0)
         self._listen_timer.start()
 
     def talk_released(self, why: str = "key") -> None:
@@ -211,6 +208,7 @@ class CompanionStateMachine(QObject):
             return
         self._listener = self._listen_start = None
         self._listen_timer.stop()
+        self._overlay.hide_listening()
         note = {
             AutoStop.SILENCE: "stopped listening after 2 minutes of silence.",
             AutoStop.DISK: "stopped listening: less than 1 GB of disk space left.",
@@ -256,6 +254,9 @@ class CompanionStateMachine(QObject):
         self._set_state(CompanionState.PROCESSING)
         self._overlay.update_bubble_text("…")
         self._overlay.update_bubble_footer("")
+        self._overlay.set_bubble_mode(self._persisted.agent_mode)
+        self._overlay.set_bubble_said("")
+        self._overlay.set_bubble_explanation("")
         self._overlay.show_bubble_near_cursor()
 
         if self._persisted.agent_mode == "code":
@@ -311,8 +312,7 @@ class CompanionStateMachine(QObject):
 
     def _show_listening(self) -> None:
         listener = self._listener
-        seconds = int(listener.seconds_recorded) if listener is not None else 0
-        self._overlay.update_bubble_text(f"listening… {seconds // 60}:{seconds % 60:02d} — let go to send")
+        self._overlay.update_listening(int(listener.seconds_recorded) if listener is not None else 0)
 
     async def _finish_voice(
         self, listener: VoiceListener, start: asyncio.Task | None, note: str | None
@@ -328,6 +328,10 @@ class CompanionStateMachine(QObject):
                 self._overlay.hide_bubble()
                 screens = await asyncio.to_thread(capture_all_screens, primary_index)
             self._set_state(CompanionState.PROCESSING)
+            self._overlay.update_bubble_footer("")
+            self._overlay.set_bubble_mode(self._persisted.agent_mode)
+            self._overlay.set_bubble_said("")
+            self._overlay.set_bubble_explanation("")
             self._overlay.update_bubble_text("transcribing…")
             self._overlay.show_bubble_near_cursor()
 
@@ -408,6 +412,7 @@ class CompanionStateMachine(QObject):
     def _stop_voice_processes(self) -> None:
         """Stop the recorder, Whisper, Piper and playback. Cleanup finishes in the background."""
         self._listen_timer.stop()
+        self._overlay.hide_listening()
         listener, self._listener = self._listener, None
         start, self._listen_start = self._listen_start, None
         speech, self._speech = self._speech, None
@@ -442,11 +447,13 @@ class CompanionStateMachine(QObject):
     ) -> None:
         search: SearchOutcome | None = None
         search_note: str | None = None
-        header = f"you said: {voice.transcript}\n\n" if voice is not None else ""
         speech = self._new_spoken_answer() if voice is not None else None
-        show = lambda text: self._overlay.update_bubble_text(header + text)
+        show = self._overlay.update_bubble_text
         if voice is not None:
-            show("thinking…")
+            self._overlay.set_bubble_mode("vision")
+            self._overlay.set_bubble_said(voice.transcript)
+            self._overlay.set_bubble_explanation("")
+            show("…")
         try:
             setup_problem = _gemini_setup_problem()
             if setup_problem is not None:
@@ -490,7 +497,7 @@ class CompanionStateMachine(QObject):
                         self._gemini, settings.gemini_fast_model, question, _labeled_images(screens)
                     )
                 search, search_note = await self._run_search(query, show)
-                show("…" if not header else "thinking…")
+                show("…")
             request = self._build_vision_request(question, screens, search)
 
             self._set_state(CompanionState.RESPONDING)
@@ -648,7 +655,7 @@ class CompanionStateMachine(QObject):
         `searched_for` is shown for voice searches, whose query was written by the fast model.
         """
         sections: list[str] = []
-        link_style = f"color: {Colors.ACCENT_BLUE_DEEP};"
+        link_style = f"color: {Colors.LINK};"
 
         if search is not None:
             links = " · ".join(
@@ -669,12 +676,10 @@ class CompanionStateMachine(QObject):
         usage = self._usage.usage
         reset_local = next_reset().astimezone().strftime("%H:%M")
         sections.append(
-            f"today (estimate): {_plural(usage.questions, 'question')}, {usage.searches} with search"
-            f" · resets at midnight pacific ({reset_local} your time)"
-        )
-        sections.append(
-            f"search credits this month (estimate): {usage.search_credits} / {TAVILY_MONTHLY_CREDITS}"
-            f" · resets on {_friendly_date(next_credits_reset())}"
+            f'<span style="color: {Colors.TEXT_FAINT};">'
+            f"today (estimate): {_plural(usage.questions, 'question')}, {usage.searches} with search,"
+            f" resets {reset_local} · search credits: {usage.search_credits} / {TAVILY_MONTHLY_CREDITS},"
+            f" back on {_friendly_date(next_credits_reset())}</span>"
         )
         return "<br>".join(sections)
 

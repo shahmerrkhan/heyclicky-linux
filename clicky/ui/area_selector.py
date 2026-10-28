@@ -168,7 +168,7 @@ class AreaSelectorOverlay(QWidget):
         # to help line up the first corner. Once a rectangle exists they'd be
         # noise so we drop them.
         if rect_local is None and self._hover_local is not None:
-            guide_color = QColor(Colors.ACCENT_BLUE)
+            guide_color = QColor(Colors.MODE_VISION)
             guide_color.setAlpha(self.GUIDE_ALPHA)
             painter.setPen(QPen(guide_color, 1.0, Qt.PenStyle.DashLine))
             hx, hy = self._hover_local.x(), self._hover_local.y()
@@ -181,7 +181,7 @@ class AreaSelectorOverlay(QWidget):
 
             # Faint inner accent glow inside the selection — implies "this is
             # the picked area" without obscuring the captured pixels.
-            inner_glow = QColor(Colors.ACCENT_BLUE)
+            inner_glow = QColor(Colors.MODE_VISION)
             inner_glow.setAlpha(28)
             painter.setPen(QPen(inner_glow, 1.0))
             inset = rect_local.adjusted(1, 1, -2, -2)
@@ -195,7 +195,7 @@ class AreaSelectorOverlay(QWidget):
             painter.drawRect(rect_local.adjusted(0, 0, -1, -1))
 
             # Animated dashed accent line on top.
-            ants_pen = QPen(QColor(Colors.ACCENT_BLUE_BRIGHT), self.BORDER_WIDTH)
+            ants_pen = QPen(QColor(Colors.LINK), self.BORDER_WIDTH)
             ants_pen.setStyle(Qt.PenStyle.CustomDashLine)
             ants_pen.setDashPattern(self.DASH_PATTERN)
             ants_pen.setDashOffset(self._ants.offset)
@@ -228,11 +228,11 @@ class AreaSelectorOverlay(QWidget):
 
         path = QPainterPath()
         path.addRoundedRect(pill_rect, pill_h / 2, pill_h / 2)
-        painter.fillPath(path, QBrush(QColor(18, 19, 23, 220)))
-        painter.setPen(QPen(QColor(Colors.ACCENT_BLUE), 1.0))
+        painter.fillPath(path, QBrush(QColor(Colors.GLASS)))
+        painter.setPen(QPen(QColor(Colors.GLASS_BORDER), 1.0))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
 
-        painter.setPen(QPen(QColor(Colors.TEXT_PRIMARY)))
+        painter.setPen(QPen(QColor(Colors.TEXT)))
         baseline = pill_y + pill_h / 2 + metrics.ascent() / 2 - metrics.descent() / 2
         painter.drawText(QPointF(pill_x + pad_x, baseline), label)

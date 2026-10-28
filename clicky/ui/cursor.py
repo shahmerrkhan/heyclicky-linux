@@ -25,7 +25,7 @@ from .design import Colors, Sizes
 
 
 class BlueCursor(QWidget):
-    """The little metallic "buddy" dot that lives next to the user's cursor.
+    """The little blue "buddy" dot that lives next to the user's cursor.
 
     Top-level frameless click-through window that:
       • continuously follows the system mouse cursor while tracking is on
@@ -33,10 +33,7 @@ class BlueCursor(QWidget):
         screen coordinates),
       • can fly along a bezier arc to a target point when the LLM asks it to,
       • automatically returns to tracking the mouse a short delay after a fly,
-      • renders as a metallic gradient sphere with an animated breathing glow.
-
-    The class name is preserved for backwards compatibility — the rendering
-    is gray metal, not blue, despite the historical name.
+      • renders as a lit blue sphere with an animated breathing glow.
     """
 
     arrived = pyqtSignal()
@@ -299,7 +296,7 @@ class BlueCursor(QWidget):
         # when the body stretches hard) -------------------------------------
         outer_radius = w * 0.26
         outer = QRadialGradient(cx, cy, outer_radius)
-        glow_color = QColor(Colors.METAL_GLOW)
+        glow_color = QColor(Colors.CURSOR_HALO)
         glow_color.setAlpha(int(60 + 50 * pulse))
         outer.setColorAt(0.0, glow_color)
         mid_color = QColor(glow_color)
@@ -323,15 +320,15 @@ class BlueCursor(QWidget):
         # --- sphere body ---------------------------------------------------
         # Off-center radial gradient so the highlight sits at the upper-left
         # and the body deepens toward the lower-right — that's what reads as
-        # "lit metal sphere".
+        # "lit sphere".
         body_radius = w * 0.15
         hl_x = cx - body_radius * 0.35
         hl_y = cy - body_radius * 0.35
         body = QRadialGradient(hl_x, hl_y, body_radius * 1.7)
-        body.setColorAt(0.0, QColor(Colors.METAL_HIGHLIGHT))
-        body.setColorAt(0.18, QColor(Colors.METAL_LIGHT))
-        body.setColorAt(0.55, QColor(Colors.METAL_MID))
-        body.setColorAt(1.0, QColor(Colors.METAL_DEEP))
+        body.setColorAt(0.0, QColor(Colors.CURSOR_HIGHLIGHT))
+        body.setColorAt(0.18, QColor(Colors.CURSOR_LIGHT))
+        body.setColorAt(0.55, QColor(Colors.CURSOR_MID))
+        body.setColorAt(1.0, QColor(Colors.CURSOR_DEEP))
         painter.setBrush(body)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QPointF(cx, cy), body_radius, body_radius)
@@ -350,7 +347,7 @@ class BlueCursor(QWidget):
         painter.drawEllipse(QPointF(spec_cx, spec_cy), spec_rx, spec_ry)
 
         # --- subtle dark rim for definition --------------------------------
-        rim = QColor(Colors.METAL_RIM)
+        rim = QColor(Colors.CURSOR_RIM)
         rim.setAlpha(170)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(rim, 0.9))
