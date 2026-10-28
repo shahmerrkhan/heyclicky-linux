@@ -61,6 +61,10 @@ class Settings(BaseSettings):
         description="Rounds of fast-then-strong tries before giving up (default flow only).",
     )
     round_pause_s: float = Field(default=3.0, description="Pause between fallback rounds.")
+    writing_strong_timeout_s: float = Field(
+        default=30.0,
+        description="Seconds the strong model gets to start a draft (writing) before the fast model takes over.",
+    )
     retry_wait_s: float = Field(default=2.0, description="Wait before retrying a busy model.")
 
     tavily_api_key: str = Field(

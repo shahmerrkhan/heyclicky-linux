@@ -129,10 +129,13 @@ class ModelRouter:
         self._round_pause_s = round_pause_s
         self._retry_wait_s = retry_wait_s
 
-    def _plan(self, prefer_strong: bool) -> list[tuple[int, ModelChoice]]:
+    def _plan(self, prefer_strong: bool, strong_timeout_s: float | None = None) -> list[tuple[int, ModelChoice]]:
         """(round number, model) pairs in the order they're tried."""
         if prefer_strong:
-            return [(0, self._strong_on_request), (0, self._fast)]
+            strong = self._strong_on_request
+            if strong_timeout_s is not None:
+                strong = dataclasses.replace(self._strong, first_word_timeout_s=strong_timeout_s)
+            return [(0, strong), (0, self._fast)]
         plan: list[tuple[int, ModelChoice]] = []
         for round_number in range(self._rounds):
             plan += [(round_number, self._fast), (round_number, self._strong)]
@@ -145,11 +148,13 @@ class ModelRouter:
         on_text: Callable[[str], None],
         on_status: Callable[[str], None],
         prefer_strong: bool = False,
+        strong_timeout_s: float | None = None,
     ) -> RoutedAnswer:
         """Stream an answer into `on_text` (cumulative text) and return it.
 
         `on_status` gets short progress notes ("trying <model>…") while no
-        answer has started yet.
+        answer has started yet. `strong_timeout_s` replaces the strong
+        model's first-word timer when it goes first (writing uses 30 s; /p 90 s).
         """
         if self._limits.is_daily_limited(self._fast.model) and self._limits.is_daily_limited(
             self._strong.model
@@ -159,7 +164,7 @@ class ModelRouter:
         failures: list[tuple[ModelChoice, _AttemptFailure]] = []
         tries = 0
         last_round: int | None = None
-        for round_number, choice in self._plan(prefer_strong):
+        for round_number, choice in self._plan(prefer_strong, strong_timeout_s):
             if self._limits.is_daily_limited(choice.model):
                 if not any(failed.role == choice.role for failed, _ in failures):
                     failures.append(
@@ -167,7 +172,7 @@ class ModelRouter:
                     )
                 continue
 
-            if tries == 0 and choice is self._strong_on_request:
+            if tries == 0 and prefer_strong and choice.role == self._strong.role:
                 on_status(f"asking {choice.model} — this can take a minute…")
             elif tries > 0 or choice.role != self._fast.role:
                 on_status(f"trying {choice.model}…")

@@ -28,6 +28,12 @@ from .response_bubble import ResponseBubble
 
 CARD_INNER_WIDTH = 640
 
+_PLACEHOLDERS = {
+    "vision": "ask clicky anything…",
+    "code": "ask claude code…",
+    "writing": "dump your thoughts — clicky writes the message and types it where you were…",
+}
+
 
 def _friendly_path(s: str) -> str:
     if not s:
@@ -125,7 +131,7 @@ class _PromptEdit(QPlainTextEdit):
 
 
 class _ModeSwitch(QFrame):
-    """Segmented Vision / Code / Write switch. Write stays disabled until writing mode exists.
+    """Segmented Vision / Code / Write switch.
 
     Every button has NoFocus so clicking a mode never pulls focus out of the box.
     """
@@ -150,12 +156,8 @@ class _ModeSwitch(QFrame):
             button.clicked.connect(lambda _checked, m=mode: self.mode_clicked.emit(m))
             layout.addWidget(button)
             self._buttons[mode] = button
-        write = self._buttons["writing"]
-        write.setEnabled(False)
-        write.setToolTip("writing mode — coming soon")
-        for mode, button in self._buttons.items():
-            if mode != "writing":
-                button.setToolTip(f"{mode} mode (Alt+{1 if mode == 'vision' else 2})")
+        for number, (mode, button) in enumerate(self._buttons.items(), start=1):
+            button.setToolTip(f"{mode} mode (Alt+{number})")
 
     def set_mode(self, mode: str) -> None:
         for name, button in self._buttons.items():
@@ -213,8 +215,10 @@ class _InputCard(QWidget):
     Modes:
       - 'vision': screenshot the screen and ask about it.
       - 'code': hand the prompt to a `claude -p` subprocess in a workspace.
-      - 'writing': shown but disabled until writing mode exists; never selectable.
-    Alt+1 / Alt+2 switch to vision / code (Alt+3 is kept for writing).
+      - 'writing': turn messy thoughts into a message, typed into the window
+        the user was in.
+    Alt+1 / Alt+2 / Alt+3 switch to vision / code / writing. The mode is never
+    saved: Clicky always starts in vision.
     """
 
     submitted = pyqtSignal(str)
@@ -225,7 +229,7 @@ class _InputCard(QWidget):
     allow_shell_changed = pyqtSignal(bool)
     workspace_changed = pyqtSignal(str)
 
-    SELECTABLE_MODES = ("vision", "code")
+    SELECTABLE_MODES = ("vision", "code", "writing")
 
     def __init__(self) -> None:
         super().__init__(
@@ -277,8 +281,9 @@ class _InputCard(QWidget):
         self._line_edit.textChanged.connect(self._refresh_prefix_chip)
         row.addWidget(self._line_edit, stretch=1)
 
-        # Shows a chip per /p, /s (or /ps, /sp) command typed anywhere in the
-        # box, in vision mode. Uses the router's own parser so it always matches.
+        # Shows a chip per /p, /s (or /ps, /sp) and /w command typed anywhere in
+        # the box, in vision and writing mode. Uses the router's own parser so it
+        # always matches.
         self._prefix_chip = _ChipRow(self._card)
         row.addWidget(self._prefix_chip, alignment=Qt.AlignmentFlag.AlignTop)
 
@@ -555,9 +560,7 @@ class _InputCard(QWidget):
 
         self._workspace_btn.setText(f"in: {_friendly_path(self._workspace)}")
         self._code_row.setVisible(self._mode == "code")
-        self._line_edit.setPlaceholderText(
-            "ask claude code…" if self._mode == "code" else "ask clicky anything…"
-        )
+        self._line_edit.setPlaceholderText(_PLACEHOLDERS[self._mode])
         self._card.setStyleSheet(self._stylesheet())
         self._refresh_prefix_chip()
         self.adjustSize()
@@ -566,16 +569,17 @@ class _InputCard(QWidget):
 
     def _refresh_prefix_chip(self) -> None:
         labels: list[str] = []
-        if self._mode == "vision":
+        if self._mode in ("vision", "writing"):
             parsed = parse_prefixes(self._line_edit.text())
             if parsed.strong:
                 labels.append("strong")
             if parsed.search:
                 labels.append("search")
+            if parsed.write and self._mode == "vision":  # in Write mode it's already on
+                labels.append("write")
         self._prefix_chip.set_chips(labels)
 
     def _select_mode(self, mode: str) -> None:
-        # Writing mode isn't built yet: its button is disabled and Alt+3 does nothing.
         if mode not in self.SELECTABLE_MODES:
             self._mode_switch.set_mode(self._mode)
             return

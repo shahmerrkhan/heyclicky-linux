@@ -6,9 +6,10 @@
 
 Clicky is the little AI buddy that lives next to your cursor. Hit a hotkey, ask a question about whatever is on your screen, and a streaming bubble answers right there — and if the model points to something, a blue cursor flies over and taps it.
 
-Clicky has two modes you can flip between in the input bar (a third, **Write**, is shown but not built yet):
+Clicky has three modes you can flip between in the input bar (it always starts in Vision):
 
 - **Vision mode** (default): screenshot + question → Gemini (called directly; add `/p` anywhere in a question for the strong model or `/s` to add Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
+- **Write mode**: messy thoughts → a ready-to-send message, shown in the bubble and typed into the box you were in (see [Writing mode](#writing-mode-w)).
 - **Code mode**: prompt → spawns `claude -p` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) as a subprocess in a configured workspace → its progress (text + tool calls) streams into the same bubble. Lets you ask Clicky to *do* things in a directory, not just describe what it sees.
 
 ## Quick start
@@ -44,7 +45,7 @@ Every question goes to the **fast model** first (`GEMINI_FAST_MODEL`, default `g
 - Busy, a used-up limit, too slow (no first word in time), and an empty answer all move on to the other model. A blocked answer (safety filter) is shown with its reason. A bad key, unknown model, or bad request stops right away.
 - A model that reports its **daily** limit used up is skipped until midnight Pacific, so later questions go straight to the other one. If both are at their daily limits you get the error immediately.
 - Add **`/p`** anywhere in a question to ask the strong model first, with a 90-second timer. If it fails, the footer says why and the fast model answers instead (no alternating after that).
-- Commands: `/p` (strong) and `/s` (search) work anywhere in the question, in any order and any case — `who won the cup /p /s`, `what is /s the latest python`, `/ps q`, `/Sp q`. Each is removed before the question goes to Gemini or Tavily. A command must stand alone: with a space or the start/end of the text on each side, so `/p,`, `(/s)`, `/usr/bin/python`, `x.com/p` and `10/27` don't count. Anything inside a closed pair of double quotes or backticks is left alone (`"xcopy /s"`), an unclosed quote protects nothing, and `//s` types a literal `/s`. A small **strong** / **search** chip in the input bar shows what the typed commands will do. Commands only apply in vision mode.
+- Commands: `/p` (strong) and `/s` (search) work anywhere in the question, in any order and any case — `who won the cup /p /s`, `what is /s the latest python`, `/ps q`, `/Sp q`. Each is removed before the question goes to Gemini or Tavily. A command must stand alone: with a space or the start/end of the text on each side, so `/p,`, `(/s)`, `/usr/bin/python`, `x.com/p` and `10/27` don't count. Anything inside a closed pair of double quotes or backticks is left alone (`"xcopy /s"`), an unclosed quote protects nothing, and `//s` types a literal `/s`. A small **strong** / **search** / **write** chip in the input bar shows what the typed commands will do. Commands apply in vision and writing mode, not in Code mode.
 - The footer always names the model that answered, e.g. `answered by the strong model (gemini-3.8-flash) after 3 tries — the fast model was busy`. While switching, the bubble shows `trying <model>…`.
 - Once an answer starts it is never cut off. Closing the bubble cancels everything in flight. Both models share one conversation history.
 
@@ -54,11 +55,30 @@ Add `/s` anywhere in a question (for example `latest python release /s`) to sear
 
 Without `TAVILY_API_KEY`, or when the month's credits are used up, `/s` questions are answered without search and the bubble footer says why.
 
+## Writing mode (`/w`)
+
+Dump messy thoughts — typed or spoken — and get a ready-to-send message, shown in the bubble **and typed straight into the box you were in**, with no confirm step.
+
+- **Starting it**: the **Write** mode (click it or **Alt+3**), `/w` anywhere in a typed question, or **"write mode"** at the start of a voice request (a one-off draft: you stay in Vision or Code). In Write mode, voice goes straight to drafting. `/s` still searches first; `/p` has no extra effect (writing already starts with the strong model). `/w` is ignored in Code mode.
+- **Tone**: professional by default, short (about 2–5 sentences), plain text, no sign-off unless you ask. Say a different tone in the request ("make it casual") to override it.
+- **Model**: the strong model first with `WRITING_STRONG_TIMEOUT_S` (default 30 s) to start, then the fast model.
+- **The screen is read only when needed**: typed requests go to the model as words only; if it can't write without seeing the screen ("reply to this"), it asks, and only then is a screenshot taken — of the window you were in only, with Clicky's own windows hidden. Voice requests that say "reply to this", "answer this email" and similar grab that window right away.
+- **Where it types**: the window that was active when you pressed Ctrl+Alt+Space or Fn+F5. If you've switched windows since, Clicky switches back first; if that window was closed, nothing is typed. Never into Clicky's own windows.
+- **How it types**, first that works: direct insert through accessibility (AT-SPI) → paste (your clipboard text is put back about a second later; if the clipboard holds an image or file, paste is skipped) → key by key (line breaks as Shift+Enter, so chat apps don't send early). If focus moves away while typing key by key, typing stops (at most one 24-character chunk may still land in the new window).
+- **Terminals**: line breaks become spaces and Enter is **never** pressed; the bubble explains that pressing Enter would run the text as a command.
+- **Esc while typing** stops it; the app you're typing into never sees that Esc (Clicky holds Esc only while typing; the X server releases it even if Clicky crashes). If Esc can't be held, nothing is typed. The bubble stays open: "Stopped after N characters", with the full draft above.
+- **Follow-ups** ("make it shorter"): the previous draft is replaced only when Clicky can read the box and the draft is still there exactly as typed — in Chrome and Opera (which need the launcher flag below to be readable) only when the box holds nothing but the draft. Otherwise nothing is touched and the new version is copied to your clipboard. Clicky never deletes anything of yours.
+- Whenever a draft isn't typed (or only partly), the full draft is copied to your clipboard and the bubble says why.
+
+Chrome and Opera don't let accessibility insert text, so drafts are pasted there. To let Clicky *read* their text boxes (for follow-ups), start them with `--force-renderer-accessibility=form-controls`.
+
+Clicky always starts in **Vision** mode; the mode you pick isn't saved.
+
 ## Voice (hold to talk)
 
 Hold **Fn+F5** (Linux key code 63, i.e. F5), say your question, let go. Clicky transcribes it on your machine, shows **you said: …**, and answers. Answers to spoken questions are read aloud sentence by sentence; typed questions stay silent.
 
-- **Keywords** at the very start: **"power mode"** = strong model (like `/p`), **"web search"** = search (like `/s`), either order. For a voice web search the fast model first turns your transcript plus the screenshot into a short search query (the footer shows `searched for: …`); typed `/s` searches your text as typed.
+- **Keywords** at the very start: **"power mode"** = strong model (like `/p`), **"web search"** = search (like `/s`), **"write mode"** = a one-off draft (like `/w`), in any order. For a voice web search the fast model first turns your transcript plus the screenshot into a short search query (the footer shows `searched for: …`); typed `/s` searches your text as typed.
 - **Code mode**: the transcript (keywords removed) lands in the input bar so you can fix misheard words; Enter runs it, and the answer is spoken without the tool lines.
 - **Stopping**: pressing the talk key again, Esc (from any app), closing the bubble, the input-bar hotkey, the tray's **Stop listening / speaking**, or quitting all stop the recorder, Whisper, Piper and playback.
 - **Silence**: nothing heard → "didn't catch that", no Gemini call; silent stretches skip Whisper.
@@ -106,7 +126,7 @@ Both are saved to `~/.local/state/clicky/usage.json`.
 
 Dark glass cards with Noto Sans type, one colour per mode — **Vision** blue, **Code** green, **Write** amber — used on the mode switch and the bubble's tag.
 
-- **Input bar**: a Vision / Code / Write switch (click, or **Alt+1** / **Alt+2**; Write is disabled until writing mode exists), a box that grows with your text up to 8 lines and then scrolls (**Enter** sends, **Shift+Enter** adds a line, **Esc** closes), one chip per typed command (**strong**, **search**), and the ◫ area button.
+- **Input bar**: a Vision / Code / Write switch (click, or **Alt+1** / **Alt+2** / **Alt+3**), a box that grows with your text up to 8 lines and then scrolls (**Enter** sends, **Shift+Enter** adds a line, **Esc** closes), one chip per typed command (**strong**, **search**, **write**), and the ◫ area button.
 - **Listening pill**: while you hold the talk key, a small pill near the cursor shows a red dot and the time.
 - **Bubble**: up to 560 px wide, with the mode tag and × at the top, a quiet *you said: …* line for voice questions, the answer, and the footer. It never takes focus, so the window you were in stays focused.
 

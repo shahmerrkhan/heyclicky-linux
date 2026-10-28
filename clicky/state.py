@@ -22,7 +22,7 @@ from .llm.memory import ChatMemory, summary_for_system_prompt
 from .llm.model_router import ModelChoice, ModelRouter, RoutedAnswer, RouterError
 from .llm.point_parser import PointingResult, parse_point_tag
 from .llm.prefixes import ParsedPrompt, parse_prefixes, parse_spoken_prefixes
-from .llm.prompts import COMPANION_TEXT_RESPONSE_SYSTEM_PROMPT
+from .llm.prompts import COMPANION_TEXT_RESPONSE_SYSTEM_PROMPT, WRITING_SYSTEM_PROMPT
 from .llm.search_query import write_search_query
 from .screen.capture import CapturedScreen, capture_all_screens, capture_region
 from .screen.monitors import find_monitor_at_global_point
@@ -38,6 +38,18 @@ from .state_store import AgentMode, PersistedState, load_state, save_state
 from .transcription.listener import PART_MISSING, AutoStop, VoiceListener
 from .transcription.whisper import WhisperTranscriber
 from .tts.piper import PiperSpeaker, SpokenAnswer, play_error_sound
+from .writing.target import WritingTarget, active_window_target, refresh_target
+from .writing.esc_guard import EscGrab, typing_deadline_s
+from .writing.typer import DraftTyper, TypedDraft, TypeResult, explanation, set_clipboard_text
+from .writing.screen_request import (
+    REVISION_INSTRUCTIONS,
+    SCREEN_INSTRUCTIONS,
+    SCREENSHOT_LABEL,
+    WITH_SCREEN_INSTRUCTIONS,
+    is_revision,
+    model_asks_for_screen,
+    voice_asks_for_screen,
+)
 from .ui.design import Colors
 from .ui.overlay import Overlay
 from .usage_store import TAVILY_MONTHLY_CREDITS, UsageTracker, next_credits_reset, next_reset
@@ -86,7 +98,8 @@ class CompanionStateMachine(QObject):
     answers to spoken questions are read aloud. A spoken Code-mode question
     lands in the input bar first so it can be checked and edited.
 
-    The current mode is remembered across runs via the state store.
+    Clicky always starts in vision mode; the mode chosen while it runs is
+    not saved (the Code workspace, shell switch and Voice switch are).
     """
 
     state_changed = pyqtSignal(CompanionState)
@@ -119,6 +132,12 @@ class CompanionStateMachine(QObject):
         self._speech_tail: asyncio.Task | None = None  # error sound after the spoken part
         self._voice_cleanups: set[asyncio.Task] = set()
         self._voice_busy = False  # a voice question is being recorded, transcribed or answered
+        # The window the user was in when they last pressed the hotkey or talk key:
+        # where a draft gets typed.
+        self._writing_target: WritingTarget | None = None
+        self._typer = DraftTyper()
+        self._typing_cancel: asyncio.Event | None = None
+        self._last_draft: TypedDraft | None = None  # typed in full; a follow-up may replace it
         self._voice_code_pending = False  # the input bar holds a voice transcript (Code mode)
         self._listen_timer = QTimer(self)
         self._listen_timer.setInterval(1000)
@@ -168,6 +187,7 @@ class CompanionStateMachine(QObject):
 
     def trigger_open_input(self) -> None:
         """Called when the hotkey fires or the tray icon is clicked."""
+        self._note_writing_target()  # before the input bar takes focus
         self._stop_voice_processes()
         if self._state in (CompanionState.PROCESSING, CompanionState.RESPONDING, CompanionState.LISTENING):
             self._cancel_current_task()
@@ -179,6 +199,7 @@ class CompanionStateMachine(QObject):
         """The talk key went down: stop whatever is running or speaking, and listen."""
         if not self._persisted.voice_on or self._voice_files.missing_for_listening():
             return
+        self._note_writing_target()
         self._stop_voice_processes()  # kills Piper before Whisper can be needed
         self._cancel_current_task()
         self._voice_code_pending = False
@@ -217,12 +238,20 @@ class CompanionStateMachine(QObject):
         self._current_task = asyncio.ensure_future(self._finish_voice(listener, start, note))
 
     def escape_pressed(self) -> None:
-        """Esc from any app: stops a voice question or a spoken answer (typed ones use their own Esc)."""
+        """Esc from any app: stops a voice question or a spoken answer (typed ones use their own Esc).
+
+        While a draft is being typed, Esc only stops the typing; the bubble stays
+        open with what was typed and the full draft.
+        """
+        if self._stop_typing():
+            return
         if self._voice_busy or self._listener is not None or self._is_speaking():
             self._overlay.dismiss()
 
     def stop_voice(self) -> None:
-        """Tray "stop listening / speaking"."""
+        """Tray "stop listening / speaking" (also stops a draft being typed)."""
+        if self._stop_typing():
+            return
         if self._voice_busy or self._listener is not None or self._is_speaking():
             self._overlay.dismiss()
         else:
@@ -239,6 +268,7 @@ class CompanionStateMachine(QObject):
         if self._voice_cleanups:
             await asyncio.gather(*self._voice_cleanups, return_exceptions=True)
         await self._memory.aclose()
+        await self._typer.aclose()
         if self._gemini is not None:
             await self._gemini.aclose()
         if self._web_search is not None:
@@ -266,6 +296,11 @@ class CompanionStateMachine(QObject):
             )
             return
 
+        parsed = parse_prefixes(prompt)
+        if self._persisted.agent_mode == "writing" or parsed.write:
+            self._current_task = asyncio.ensure_future(self._run_writing(parsed))
+            return
+
         primary_index = _monitor_index_at_cursor()
         self._current_task = asyncio.ensure_future(
             self._run_vision(prompt, primary_index, region)
@@ -279,12 +314,12 @@ class CompanionStateMachine(QObject):
         self._set_state(CompanionState.IDLE)
 
     def _on_mode_changed(self, mode: str) -> None:
-        if mode not in ("vision", "code"):
+        if mode not in ("vision", "code", "writing"):
             return
         if mode == self._persisted.agent_mode:
             return
+        # Per run only: Clicky always starts in vision, so nothing is saved.
         self._persisted.agent_mode = cast(AgentMode, mode)
-        save_state(self._persisted)
         logger.info("agent mode → %s", mode)
 
     def _on_allow_shell_changed(self, allow: bool) -> None:
@@ -321,9 +356,10 @@ class CompanionStateMachine(QObject):
             if start is not None:
                 await asyncio.gather(start, return_exceptions=True)
             code_mode = self._persisted.agent_mode == "code"
+            writing_mode = self._persisted.agent_mode == "writing"
             screens: list[CapturedScreen] = []
             primary_index = _monitor_index_at_cursor()
-            if not code_mode:
+            if not code_mode and not writing_mode:
                 # The screenshot is taken when the key is let go, without the bubble in it.
                 self._overlay.hide_bubble()
                 screens = await asyncio.to_thread(capture_all_screens, primary_index)
@@ -345,6 +381,12 @@ class CompanionStateMachine(QObject):
                 return
             if parsed.has_prefix and not parsed.question:
                 self._finish_without_question(f'didn\'t catch a question after "{parsed.prefix_text}".')
+                return
+
+            if writing_mode or parsed.write:
+                # Straight to drafting. A release screenshot taken for vision mode
+                # is dropped unused: writing reads the screen only when asked.
+                await self._run_writing(parsed, said=transcript, note=note)
                 return
 
             if code_mode:
@@ -558,6 +600,205 @@ class CompanionStateMachine(QObject):
             show(f"error: {exc}")
             self._end_speech(speech, None, error=voice is not None)
             self._finish_question()
+
+    # --- writing pipeline -----------------------------------------------------
+
+    async def _run_writing(self, parsed: ParsedPrompt, said: str | None = None, note: str | None = None) -> None:
+        """Turn messy thoughts into a ready-to-send message (shown in the bubble).
+
+        Strong model first (WRITING_STRONG_TIMEOUT_S to start), the fast model
+        as backup. `said` is the voice transcript (None for typed requests).
+        Drafts are never read aloud; a failed voice request plays the error sound.
+        """
+        voice = said is not None
+        search: SearchOutcome | None = None
+        search_note: str | None = None
+        show = self._overlay.update_bubble_text
+        self._overlay.set_bubble_mode("writing")
+        self._overlay.set_bubble_said(said or "")
+        self._overlay.set_bubble_explanation("")
+        show("…")
+        question = parsed.question
+        try:
+            setup_problem = _gemini_setup_problem()
+            if setup_problem is not None:
+                show(setup_problem)
+                self._end_speech(None, None, error=voice)
+                self._finish_question()
+                return
+            if not question:
+                show('type what to write, e.g. "tell sarah the deploy slipped to thursday /w".')
+                self._finish_question()
+                return
+            router = self._ensure_clients()
+
+            if parsed.search:
+                query = question
+                if voice and self._search_unavailable_reason() is None:
+                    show("writing a search query…")
+                    query, _ = await write_search_query(self._gemini, settings.gemini_fast_model, question, [])
+                search, search_note = await self._run_search(query, show)
+                show("…")
+            request = GeminiRequest(
+                user_prompt=question,
+                history=list(self._memory.recent),
+                search_context=format_for_model(search) if search is not None else None,
+            )
+            # Voice: a phrase like "reply to this" grabs the screen right away.
+            # Otherwise the model sees the words only and asks if it needs more.
+            if voice and voice_asks_for_screen(question):
+                request.images = await self._capture_for_writing()
+
+            self._set_state(CompanionState.RESPONDING)
+
+            def show_streaming(text: str) -> None:
+                draft = _clean_draft(text)
+                if draft:
+                    show(draft)
+
+            async def draft_once() -> RoutedAnswer:
+                instructions = WITH_SCREEN_INSTRUCTIONS if request.images else SCREEN_INSTRUCTIONS
+                return await router.answer(
+                    request=request,
+                    system_prompt=WRITING_SYSTEM_PROMPT
+                    + instructions
+                    + REVISION_INSTRUCTIONS
+                    + summary_for_system_prompt(self._memory.summary),
+                    on_text=show_streaming,
+                    on_status=show,
+                    prefer_strong=True,
+                    strong_timeout_s=settings.writing_strong_timeout_s,
+                )
+
+            answer = await draft_once()
+            if not request.images and model_asks_for_screen(answer.reply.text):
+                show("looking at the window you were in…")
+                request.images = await self._capture_for_writing()
+                show("…")
+                answer = await draft_once()
+            reply = answer.reply
+            draft = _clean_draft(reply.text)
+            succeeded = (
+                bool(draft) and not reply.was_blocked and not reply.was_cut_off and answer.interrupted_error is None
+            )
+            if succeeded:
+                self._usage.record_question(used_search=search is not None)
+                self._memory.add(question, draft)
+
+            show(_final_draft_text(answer, draft))
+            notes = " ".join(n for n in (note, search_note) if n) or None
+            self._overlay.update_bubble_footer(self._vision_footer_html(search, notes, answer))
+            if succeeded:
+                if is_revision(reply.text) and self._last_draft is not None:
+                    await self._replace_draft(draft)
+                else:
+                    await self._type_draft(draft)
+            self._end_speech(None, None, error=voice and not succeeded)
+            self._finish_question()
+
+        except RouterError as exc:
+            logger.warning("no gemini draft: %s", exc)
+            show(str(exc))
+            notes = " ".join(n for n in (note, search_note) if n) or None
+            self._overlay.update_bubble_footer(self._vision_footer_html(search, notes, None))
+            self._end_speech(None, None, error=voice)
+            self._finish_question()
+        except asyncio.CancelledError:
+            logger.info("writing task cancelled")
+            raise
+        except Exception as exc:
+            logger.exception("writing pipeline failed")
+            show(f"error: {exc}")
+            self._end_speech(None, None, error=voice)
+            self._finish_question()
+
+    async def _capture_for_writing(self) -> list[LabeledImage]:
+        """Screenshot for a writing request, with Clicky's own windows hidden.
+
+        Only the window the user was in (falls back to the screen under the
+        cursor if that window is gone).
+        """
+        self._overlay.hide_input()
+        self._overlay.hide_bubble()
+        try:
+            await asyncio.sleep(0.15)  # let the compositor drop Clicky's windows
+            target = refresh_target(self._writing_target) if self._writing_target else None
+            if target is not None and target.width > 0 and target.height > 0:
+                shot = await asyncio.to_thread(capture_region, target.x, target.y, target.width, target.height)
+                return [LabeledImage(data=shot.image_data, label=SCREENSHOT_LABEL)]
+            primary_index = _monitor_index_at_cursor()
+            screens = await asyncio.to_thread(capture_all_screens, primary_index)
+            screens = [s for s in screens if s.monitor.index == primary_index] or screens[:1]
+            return [LabeledImage(data=s.image_data, label=SCREENSHOT_LABEL) for s in screens]
+        finally:
+            self._overlay.show_bubble_near_cursor()
+
+    async def _type_draft(self, draft: str) -> TypeResult:
+        """Type the draft into the remembered window; explain the outcome in the bubble."""
+        target = self._writing_target
+        if target is None:
+            result = TypeResult(False, why_not="there was no window to type into")
+        else:
+            result = await self._with_esc_grab(draft, lambda cancel: self._typer.type_draft(target, draft, cancel))
+        copied = False
+        if not result.typed or result.why_not:
+            copied = await set_clipboard_text(draft)
+            self._last_draft = None
+        else:
+            self._last_draft = TypedDraft(target, result.text)
+        self._overlay.set_bubble_explanation(explanation(result, target, copied))
+        return result
+
+    async def _replace_draft(self, draft: str) -> TypeResult:
+        """A follow-up ("make it shorter"): swap the previous draft only if it's provably untouched."""
+        previous = self._last_draft
+        assert previous is not None
+        result = await self._with_esc_grab(
+            draft, lambda cancel: self._typer.replace_previous(previous, draft, cancel)
+        )
+        if result.typed and not result.why_not:
+            self._last_draft = TypedDraft(previous.target, result.text)
+            self._overlay.set_bubble_explanation(explanation(result, previous.target, False))
+            return result
+        copied = await set_clipboard_text(draft)
+        note = " The new version is copied to your clipboard." if copied else ""
+        self._overlay.set_bubble_explanation(f"Not replaced: {result.why_not}.{note}")
+        return result
+
+    async def _with_esc_grab(self, draft: str, run) -> TypeResult:
+        """Run a typing job while Esc is grabbed; Esc (or the watchdog) stops it.
+
+        If Esc can't be grabbed, nothing is typed.
+        """
+        cancel = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        # Esc is held while typing: it stops the typing and never reaches the app.
+        esc = EscGrab(lambda: loop.call_soon_threadsafe(cancel.set), typing_deadline_s(draft))
+        if not esc.acquire():
+            return TypeResult(
+                False, why_not="Clicky couldn't hold the Esc key (another program has it), so nothing was typed"
+            )
+        self._typing_cancel = cancel
+        try:
+            result = await run(cancel)
+        finally:
+            self._typing_cancel = None
+            esc.release()
+        if esc.expired and not result.why_not:
+            result.why_not = "typing took too long"
+        return result
+
+    def _stop_typing(self) -> bool:
+        """Stop a draft being typed (the bubble stays open). True if one was."""
+        if self._typing_cancel is None:
+            return False
+        self._typing_cancel.set()
+        return True
+
+    def _note_writing_target(self) -> None:
+        target = active_window_target()
+        if target is not None:  # None also means "one of Clicky's own windows": keep the last one
+            self._writing_target = target
 
     def _finish_question(self) -> None:
         self._voice_busy = False
@@ -846,6 +1087,31 @@ def _final_bubble_text(answer: RoutedAnswer, parsed: PointingResult) -> str:
     if not text:
         return "gemini sent back an empty answer. try asking again."
     return text
+
+
+_DRAFT_JUNK = re.compile(r"\[POINT[^\]]*\]?|\[NEED_SCREEN\]|\[REVISION\]", re.IGNORECASE)
+
+
+def _clean_draft(text: str) -> str:
+    """The draft as it should be shown and typed: no stray tags, no surrounding blank lines."""
+    return _DRAFT_JUNK.sub("", text).strip()
+
+
+def _final_draft_text(answer: RoutedAnswer, draft: str) -> str:
+    """What the bubble shows once the draft stream ends."""
+    reply: GeminiReply = answer.reply
+    if answer.interrupted_error is not None:
+        notice = "(the connection dropped before the draft finished.)"
+        return f"{draft}\n\n{notice}" if draft else notice
+    if reply.was_blocked:
+        notice = f"gemini blocked this draft (reason: {reply.blocked_reason_label()}). try rephrasing."
+        return f"{draft}\n\n{notice}" if draft else notice
+    if reply.was_cut_off:
+        notice = f"(draft cut off — it hit the {settings.max_tokens}-token output limit.)"
+        return f"{draft}\n\n{notice}" if draft else notice
+    if not draft:
+        return "gemini sent back an empty draft. try asking again."
+    return draft
 
 
 def _trim_partial_point_tag(text: str) -> str:

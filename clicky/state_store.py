@@ -1,7 +1,9 @@
 """Tiny JSON state store for cross-session preferences.
 
-Holds the last used agent mode, the active Claude Code workspace, the
-"allow shell" toggle, and the tray's voice on/off switch. Persisted to `$XDG_STATE_HOME/clicky/state.json`
+Holds the active Claude Code workspace, the "allow shell" toggle, and the
+tray's voice on/off switch. The current mode (vision / code / writing) lives
+here too while Clicky runs, but it is never saved: Clicky always starts in
+vision mode. Persisted to `$XDG_STATE_HOME/clicky/state.json`
 (falls back to `~/.local/state/clicky/state.json`).
 
 Atomic-ish writes via `os.replace` after writing to a sibling temp file.
@@ -20,7 +22,7 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 
-AgentMode = Literal["vision", "code"]
+AgentMode = Literal["vision", "code", "writing"]
 
 
 @dataclass
@@ -46,10 +48,9 @@ def load_state() -> PersistedState:
         logger.warning("state file unreadable; starting fresh", exc_info=True)
         return PersistedState()
 
-    raw_mode = data.get("agent_mode")
-    mode: AgentMode = raw_mode if raw_mode in ("vision", "code") else "vision"
+    # A mode saved by an older version is ignored: Clicky always starts in vision.
     return PersistedState(
-        agent_mode=mode,
+        agent_mode="vision",
         claude_code_workspace=data.get("claude_code_workspace"),
         claude_code_allow_shell=bool(data.get("claude_code_allow_shell", False)),
         voice_on=bool(data.get("voice_on", True)),
@@ -68,7 +69,9 @@ def save_state(state: PersistedState) -> None:
             suffix=".tmp",
             delete=False,
         ) as tmp:
-            json.dump(asdict(state), tmp, indent=2)
+            data = asdict(state)
+            data.pop("agent_mode", None)  # the mode is per run, never saved
+            json.dump(data, tmp, indent=2)
             tmp_name = tmp.name
         os.replace(tmp_name, path)
     except OSError:

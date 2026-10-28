@@ -88,7 +88,10 @@ def parse_key_events(data: bytes) -> Iterable[tuple[int, int]]:
 
 
 class _X11KeyGrab:
-    """Grabs one bare key on the X11 root window so apps don't receive it."""
+    """Grabs one bare key on the X11 root window so apps don't receive it.
+
+    Used for the talk key here, and for Esc while writing mode types a draft.
+    """
 
     def __init__(self, key_code: int) -> None:
         from Xlib import X, display, error
@@ -112,6 +115,13 @@ class _X11KeyGrab:
         while self._display.pending_events():
             self._display.next_event()
 
+    def events(self) -> list:
+        """The pending events (key presses/releases of the grabbed key)."""
+        events = []
+        while self._display.pending_events():
+            events.append(self._display.next_event())
+        return events
+
     def close(self) -> None:
         try:
             for mods in self._mods:
@@ -119,6 +129,9 @@ class _X11KeyGrab:
             self._display.sync()
         finally:
             self._display.close()
+
+
+X11KeyGrab = _X11KeyGrab
 
 
 class PushToTalkMonitor(QObject):
