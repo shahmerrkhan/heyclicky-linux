@@ -23,6 +23,7 @@ from ..input.push_to_talk import KEY_ESC, X11KeyGrab
 logger = logging.getLogger(__name__)
 
 DEADLINE_MARGIN_S = 5.0
+ESC_KEYCODE = KEY_ESC + 8  # X11 keycode = Linux key code + 8
 
 
 def typing_deadline_s(draft: str) -> float:
@@ -76,7 +77,8 @@ class EscGrab:
                 if not ready:
                     continue
                 for event in grab.events():
-                    if event.type == X.KeyPress:
+                    # Only Esc itself: other keys can arrive here while Esc is held.
+                    if event.type == X.KeyPress and getattr(event, "detail", None) == ESC_KEYCODE:
                         self._on_escape()
         finally:
             self._close()

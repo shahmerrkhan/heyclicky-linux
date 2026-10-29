@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 SYSTEM_PYTHON = "/usr/bin/python3"
 HELPER = Path(__file__).with_name("atspi_helper.py")
 KEY_DELAY_MS = 8
+ESC_KEYCODE = 9  # X11 keycode of Esc
+X11_KEYCODE_OFFSET = 8  # X11 keycode = Linux key code + 8
 KEY_CHUNK_CHARS = 24
 CLIPBOARD_RESTORE_DELAY_S = 1.0
 _TEXT_TARGETS = {"UTF8_STRING", "STRING", "TEXT", "text/plain", "text/plain;charset=utf-8"}
@@ -135,6 +137,120 @@ async def set_clipboard_text(text: str) -> bool:
         return False
 
 
+def _squash(text: str) -> str:
+    """Text with all whitespace removed (for the browser comparison only)."""
+    return re.sub(r"\s+", "", text)
+
+
+async def _type_chunk(chunk: str, cancel: asyncio.Event) -> bool:
+    """Type one chunk with xdotool. False if a stop request killed it partway.
+
+    The stop is immediate (Esc is grabbed while this runs, so keys typed while
+    Esc is held would be swallowed — killing xdotool at once keeps that to at
+    most one character, at the very end). Killing xdotool between a key's press
+    and its release would leave that key held down, so any held keys are
+    released right after; a borrowed keycode it leaves bound is unbound by the
+    caller (`_keys`).
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "xdotool", "type", "--delay", str(KEY_DELAY_MS), "--clearmodifiers", chunk,
+        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    finished = asyncio.ensure_future(proc.wait())
+    stopped = asyncio.ensure_future(cancel.wait())
+    try:
+        await asyncio.wait({finished, stopped}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:  # the whole task was cancelled (bubble closed, quit, …)
+        await _kill_typing(proc)
+        raise
+    finally:
+        stopped.cancel()
+        finished.cancel()
+    if proc.returncode is None:  # a stop request (Esc, tray) or the 10 s limit
+        await _kill_typing(proc)
+        return False
+    return True
+
+
+async def _kill_typing(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is None:
+        proc.kill()
+        await proc.wait()
+    release_held_keys()
+
+
+def empty_keycodes() -> list[int]:
+    """Keycodes with no symbols at all: the spare ones xdotool borrows.
+
+    To type a character the layout doesn't have (é, —, ✓) xdotool binds it to
+    the first empty keycode, types it, then unbinds it. If xdotool is killed in
+    between, that binding stays behind, so these are restored after any stop.
+    """
+    from Xlib import display
+
+    disp = display.Display()
+    try:
+        low, high = disp.display.info.min_keycode, disp.display.info.max_keycode
+        mapping = disp.get_keyboard_mapping(low, high - low + 1)
+        return [low + i for i, syms in enumerate(mapping) if not any(syms)]
+    finally:
+        disp.close()
+
+
+def restore_borrowed_keycodes(empty: list[int]) -> list[int]:
+    """Unbind any of the previously empty keycodes that xdotool left bound. Returns them."""
+    if not empty:
+        return []
+    from Xlib import display
+
+    restored: list[int] = []
+    disp = display.Display()
+    try:
+        low, high = disp.display.info.min_keycode, disp.display.info.max_keycode
+        mapping = disp.get_keyboard_mapping(low, high - low + 1)
+        width = len(mapping[0]) if mapping else 0
+        for keycode in empty:
+            if low <= keycode <= high and any(mapping[keycode - low]):
+                disp.change_keyboard_mapping(keycode, [(0,) * width])
+                restored.append(keycode)
+        disp.sync()
+    finally:
+        disp.close()
+    if restored:
+        logger.info("unbound keycodes xdotool left borrowed after stopping: %s", restored)
+    return restored
+
+
+def release_held_keys() -> list[int]:
+    """Send a key release for every key the X server thinks is down, except Esc and the talk key.
+
+    Used after killing xdotool mid-chunk, which can leave the key it was typing
+    (or Shift) pressed. Esc and the talk key are left alone: the user may still
+    be holding them. Returns the keycodes released.
+    """
+    from ..config import settings
+
+    keep = (ESC_KEYCODE, settings.talk_key_code + X11_KEYCODE_OFFSET)
+    from Xlib import X, display
+    from Xlib.ext import xtest
+
+    released: list[int] = []
+    disp = display.Display()
+    try:
+        keymap = disp.query_keymap()
+        for keycode in range(8, 256):
+            if keycode in keep or not (keymap[keycode // 8] >> (keycode % 8)) & 1:
+                continue
+            xtest.fake_input(disp, X.KeyRelease, keycode)
+            released.append(keycode)
+        disp.sync()
+    finally:
+        disp.close()
+    if released:
+        logger.info("released keys left held after stopping: %s", released)
+    return released
+
+
 def _is_active(target: WritingTarget) -> bool:
     active = active_window_target()
     return active is not None and active.window_id == target.window_id
@@ -207,6 +323,15 @@ class DraftTyper:
         await set_clipboard_text(previous)
 
     async def _keys(self, target: WritingTarget, text: str, cancel: asyncio.Event) -> TypeResult:
+        # Spare keycodes xdotool may borrow; any it leaves bound (a stop, kill
+        # or crash mid-character) are unbound again when typing ends.
+        empty = empty_keycodes()
+        try:
+            return await self._keys_inner(target, text, cancel)
+        finally:
+            restore_borrowed_keycodes(empty)
+
+    async def _keys_inner(self, target: WritingTarget, text: str, cancel: asyncio.Event) -> TypeResult:
         typed = 0
         lines = text.split("\n")
         for line_number, line in enumerate(lines):
@@ -216,7 +341,10 @@ class DraftTyper:
                 if not _is_active(target):
                     return TypeResult(typed > 0, Method.KEYS, text[:typed], typed, "focus moved away while typing")
                 chunk = line[start : start + KEY_CHUNK_CHARS]
-                await _run("xdotool", "type", "--delay", str(KEY_DELAY_MS), "--clearmodifiers", chunk, timeout=10)
+                if not await _type_chunk(chunk, cancel):
+                    # Stopped mid-chunk: only the finished chunks are counted, so the
+                    # number never claims more than was typed.
+                    return TypeResult(typed > 0, Method.KEYS, text[:typed], typed, "stopped", stopped=True)
                 typed += len(chunk)
             if line_number < len(lines) - 1:
                 if cancel.is_set():
@@ -250,30 +378,53 @@ class DraftTyper:
         if not read.get("ok"):
             return TypeResult(False, why_not="Clicky can't read that text box, so it can't be sure the old draft is untouched")
         box = read.get("text", "")
-        if box.count(previous.text) != 1:
-            return TypeResult(False, why_not="the old draft was edited or isn't in that box any more")
         if cancel.is_set():
             return TypeResult(False, why_not="stopped before replacing", stopped=True)
+        if read.get("editable"):
+            return await self._replace_in_place(target, previous, new_text, box)
+        return await self._replace_by_select_all(target, previous, new_text, box)
+
+    async def _replace_in_place(
+        self, target: WritingTarget, previous: TypedDraft, new_text: str, box: str
+    ) -> TypeResult:
+        """Native apps: the old draft must be there exactly once, character for character."""
+        if box.count(previous.text) != 1:
+            return TypeResult(False, why_not="the old draft was edited or isn't in that box any more")
         offset = box.index(previous.text)
-        method = Method.REPLACE
         done = await atspi("replace", target.pid, str(offset), str(len(previous.text)), text=new_text)
         if not done.get("ok"):
-            # Readable but not directly editable (browsers): only when the box holds
-            # nothing but the old draft, select all and paste the new version.
-            if box.strip() != previous.text.strip():
-                return TypeResult(False, why_not="the box has other text besides the old draft, so it was left alone")
-            try:
-                await _run("xdotool", "key", "--clearmodifiers", "ctrl+a", timeout=3)
-            except (TimeoutError, OSError):
-                return TypeResult(False, why_not="couldn't select the old draft, so it was left alone")
-            if not await self._paste(target, new_text):
-                return TypeResult(False, why_not="couldn't paste over the old draft, so it was left alone")
-            method = Method.REPLACE_PASTE
+            return TypeResult(False, why_not="couldn't replace the old draft, so it was left alone")
         await asyncio.sleep(0.3)
         after = await atspi("read", target.pid)
         if not after.get("ok") or new_text not in after.get("text", ""):
             return TypeResult(False, why_not="couldn't confirm the new version is in the box")
-        return TypeResult(True, method, new_text, len(new_text), insert_offset=after["text"].index(new_text))
+        return TypeResult(True, Method.REPLACE, new_text, len(new_text), insert_offset=after["text"].index(new_text))
+
+    async def _replace_by_select_all(
+        self, target: WritingTarget, previous: TypedDraft, new_text: str, box: str
+    ) -> TypeResult:
+        """Readable but not directly editable (Chrome, Opera): select all and paste —
+        only when the box holds nothing but the old draft.
+
+        Compared ignoring all whitespace: these browsers read line breaks back
+        differently (a pasted line break comes back missing).
+        """
+        old, current = _squash(previous.text), _squash(box)
+        if current != old:
+            if old and old in current:
+                return TypeResult(False, why_not="the box has other text besides the old draft, so it was left alone")
+            return TypeResult(False, why_not="the old draft was edited or isn't in that box any more")
+        try:
+            await _run("xdotool", "key", "--clearmodifiers", "ctrl+a", timeout=3)
+        except (TimeoutError, OSError):
+            return TypeResult(False, why_not="couldn't select the old draft, so it was left alone")
+        if not await self._paste(target, new_text):
+            return TypeResult(False, why_not="couldn't paste over the old draft, so it was left alone")
+        await asyncio.sleep(0.3)
+        after = await atspi("read", target.pid)
+        if not after.get("ok") or _squash(after.get("text", "")) != _squash(new_text):
+            return TypeResult(False, why_not="couldn't confirm the new version is in the box")
+        return TypeResult(True, Method.REPLACE_PASTE, new_text, len(new_text))
 
     async def aclose(self) -> None:
         if self._restore_task is not None and not self._restore_task.done():

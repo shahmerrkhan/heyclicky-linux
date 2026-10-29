@@ -5,8 +5,11 @@ have): `/usr/bin/python3 -I atspi_helper.py <command> <pid>`, text on stdin.
 Commands (each prints one JSON line):
   insert <pid>   insert stdin text at the caret of the focused editable field
                  → {"ok": true, "offset": <caret>, "length": <chars>}
-  read <pid>     the focused field's whole text (for safe draft replacement)
-                 → {"ok": true, "text": "..."}
+  read <pid>     the focused field's whole text (for safe draft replacement),
+                 and whether it can be edited directly (native apps) or only
+                 read (Chrome, Opera) → {"ok": true, "text": "...", "editable": bool}.
+                 Text that comes back with object placeholders (U+FFFC) can't
+                 be read as plain text, so it counts as unreadable.
   replace <pid> <offset> <length>
                  delete <length> chars at <offset>, then insert stdin text there
                  → {"ok": true}
@@ -19,7 +22,28 @@ import json
 import sys
 import time
 
-TIME_LIMIT_S = 1.5
+WALK_LIMIT_S = 5.0  # the fallback walk only; the built-in search is much faster
+PLACEHOLDER = "\ufffc"  # stands in for a child object (e.g. one line of a rich-text box)
+
+
+def _search(root, Atspi):
+    """The focused editable field under `root` via the app's built-in search, or None.
+
+    Chrome, Opera and GTK apps answer this without Clicky walking every object.
+    """
+    try:
+        states = Atspi.StateSet.new([Atspi.StateType.FOCUSED, Atspi.StateType.EDITABLE])
+        rule = Atspi.MatchRule.new(
+            states, Atspi.CollectionMatchType.ALL,
+            {}, Atspi.CollectionMatchType.ALL,
+            [], Atspi.CollectionMatchType.ALL,
+            [], Atspi.CollectionMatchType.ALL,
+            False,
+        )
+        matches = Atspi.Collection.get_matches(root, rule, Atspi.CollectionSortOrder.CANONICAL, 1, True)
+    except Exception:  # noqa: BLE001 - not supported here: fall back to walking
+        return None
+    return matches[0] if matches else None
 
 
 def _focused_field(pid):
@@ -28,15 +52,25 @@ def _focused_field(pid):
     gi.require_version("Atspi", "2.0")
     from gi.repository import Atspi
 
-    started = time.monotonic()
     desktop = Atspi.get_desktop(0)
     apps = [desktop.get_child_at_index(i) for i in range(desktop.get_child_count())]
     app = next((a for a in apps if a is not None and a.get_process_id() == pid), None)
     if app is None:
         return None, "the app isn't visible to accessibility"
 
+    # The window the user is typing in first, then the app's other windows.
+    windows = [app.get_child_at_index(i) for i in range(app.get_child_count())]
+    windows = [w for w in windows if w is not None]
+    active = [w for w in windows if w.get_state_set().contains(Atspi.StateType.ACTIVE)]
+    for window in active + [w for w in windows if w not in active]:
+        hit = _search(window, Atspi)
+        if hit is not None:
+            return hit, ""
+
+    started = time.monotonic()
+
     def walk(node, depth):
-        if node is None or depth > 40 or time.monotonic() - started > TIME_LIMIT_S:
+        if node is None or depth > 40 or time.monotonic() - started > WALK_LIMIT_S:
             return None
         states = node.get_state_set()
         if states.contains(Atspi.StateType.FOCUSED) and states.contains(Atspi.StateType.EDITABLE):
@@ -68,7 +102,12 @@ def main():
         if not readable:
             print(json.dumps({"ok": False, "why": "the field can't be read"}))
             return
-        print(json.dumps({"ok": True, "text": Atspi.Text.get_text(field, 0, -1)}))
+        text = Atspi.Text.get_text(field, 0, -1)
+        if PLACEHOLDER in text:
+            print(json.dumps({"ok": False, "why": "the field's text can't be read as plain text"}))
+            return
+        editable = field.get_editable_text_iface() is not None
+        print(json.dumps({"ok": True, "text": text, "editable": editable}))
         return
     editable = field.get_editable_text_iface()
     if editable is None:
