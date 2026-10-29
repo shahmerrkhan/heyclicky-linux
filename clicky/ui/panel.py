@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QCursor
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
+from PyQt6.QtGui import QCursor, QKeyEvent
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -21,6 +21,10 @@ class ControlPanel(QWidget):
     Same dark glass card and drop shadow as the input bar and bubble — keeps
     the tray popup visually consistent with the in-flow UI so it doesn't feel
     like a separate app.
+
+    It takes focus when shown. Esc, the × and losing focus (a click elsewhere)
+    only hide it; "Quit Clicky" is the only way to stop the app, and it's
+    mouse-only so a stray Space or Enter can't quit.
     """
 
     quit_requested = pyqtSignal()
@@ -34,6 +38,9 @@ class ControlPanel(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedWidth(Sizes.PANEL_WIDTH + 2 * DEFAULT_SHADOW_MARGIN)
+        # Set once the panel has really had focus since it was shown, so a focus
+        # flicker while it opens can't hide it straight away.
+        self._had_focus = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(
@@ -68,6 +75,14 @@ class ControlPanel(QWidget):
         title.setObjectName("title")
         title_row.addWidget(title)
         title_row.addStretch(1)
+        close_button = QPushButton("×")
+        close_button.setObjectName("closeBtn")
+        close_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        close_button.setFixedSize(22, 22)
+        close_button.setToolTip("close (Esc)")
+        close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_button.clicked.connect(self.hide)
+        title_row.addWidget(close_button, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(title_row)
 
         section = QLabel("PUSH-TO-TEXT")
@@ -79,7 +94,7 @@ class ControlPanel(QWidget):
         body.setObjectName("body")
         layout.addWidget(body)
 
-        hint = QLabel("Enter sends · Shift+Enter new line · Esc closes · ◫ selects an area")
+        hint = QLabel("In the input bar: Enter sends · Shift+Enter new line · Esc closes · ◫ selects an area")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -89,6 +104,7 @@ class ControlPanel(QWidget):
         quit_button = QPushButton("Quit Clicky")
         quit_button.setObjectName("quit")
         quit_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        quit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # mouse only: Space/Enter/Tab never reach it
         quit_button.clicked.connect(self.quit_requested.emit)
         footer.addWidget(quit_button)
         layout.addLayout(footer)
@@ -141,7 +157,41 @@ class ControlPanel(QWidget):
                 color: white;
                 background: rgba(255, 77, 94, 90);
             }}
+            QPushButton#closeBtn {{
+                color: {Colors.TEXT_DIM};
+                background: transparent;
+                border: none;
+                border-radius: 11px;
+                font-size: 16px;
+                padding: 0;
+            }}
+            QPushButton#closeBtn:hover {{
+                color: white;
+                background: rgba(255, 77, 94, 90);
+            }}
+            QPushButton#closeBtn:pressed {{
+                background: rgba(255, 77, 94, 150);
+            }}
         """
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.hide()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def changeEvent(self, event: QEvent) -> None:
+        if event.type() == QEvent.Type.ActivationChange:
+            if self.isActiveWindow():
+                self._had_focus = True
+            elif self._had_focus and self.isVisible():
+                self.hide()  # focus went elsewhere: a click outside, the input bar, the tray menu
+        super().changeEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._had_focus = False
+        super().hideEvent(event)
 
     def show_near_cursor(self) -> None:
         cursor_pos = QCursor.pos()
