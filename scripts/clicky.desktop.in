@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Clicky
+GenericName=AI helper
+Comment=AI helper next to your cursor
+Exec="@REPO@/scripts/clicky-launch"@ARGS@
+TryExec=@REPO@/scripts/clicky-launch
+Icon=@REPO@/clicky/assets/clicky-256.png
+Terminal=false
+StartupNotify=false
+Categories=Utility;
+X-Clicky-Installed-By=make

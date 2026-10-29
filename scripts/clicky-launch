@@ -1,0 +1,152 @@
+#!/bin/sh
+# Starts Clicky with no terminal (app menu, login autostart) and restarts it after a crash.
+#
+#   clicky-launch [--delay SECONDS]
+#
+# - Exit code 0 (tray Quit, or "already running") stops the launcher: never a restart.
+# - SIGTERM/SIGHUP/SIGINT to the launcher (logout, pkill) are passed on to Clicky; no restart.
+# - If the X display is gone (logging out), no restart.
+# - Any other exit is a crash: restart after 2 s, at most 3 times in 60 s, then give up
+#   with one desktop notice. Before a restart, keycode 8 is cleared if a crash left it bound.
+#
+# Logs to $XDG_STATE_HOME/clicky/launcher.log (default ~/.local/state); Clicky's own log is
+# clicky.log next to it. CLICKY_PYTHON overrides the interpreter (for tests only).
+
+REPO=$(cd "$(dirname "$0")/.." && pwd -P) || exit 1
+PY=${CLICKY_PYTHON:-$REPO/.venv/bin/python}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/clicky
+LOG=$STATE_DIR/launcher.log
+ICON=$REPO/clicky/assets/clicky-256.png
+MAX_RESTARTS=3
+WINDOW_S=60
+RESTART_WAIT_S=2
+LOG_MAX_BYTES=1000000
+
+mkdir -p "$STATE_DIR" || exit 1
+if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$LOG_MAX_BYTES" ]; then
+    mv -f "$LOG" "$LOG.1"
+fi
+
+log() {
+    printf '%s [launcher %s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$*" >> "$LOG"
+}
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 && notify-send -i "$ICON" "$1" "$2"
+}
+
+stopping=0
+child=
+sleeper=
+on_signal() {
+    stopping=1
+    [ -n "$child" ] && kill -TERM "$child" 2>/dev/null
+    [ -n "$sleeper" ] && kill "$sleeper" 2>/dev/null
+}
+trap on_signal TERM HUP INT
+
+# sleep that a signal can cut short
+pause() {
+    sleep "$1" &
+    sleeper=$!
+    wait "$sleeper"
+    sleeper=
+}
+
+display_alive() {
+    "$PY" -c "from Xlib import display; display.Display().close()" >/dev/null 2>&1
+}
+
+clear_stuck_keycode_8() {
+    if ! command -v xmodmap >/dev/null 2>&1; then
+        log "keycode 8: xmodmap not found, not checked"
+        return
+    fi
+    bound=$(xmodmap -pke 2>/dev/null | sed -n 's/^keycode *8 = *//p' | sed 's/ *$//')
+    if [ -n "$bound" ]; then
+        if xmodmap -e "keycode 8 =" 2>/dev/null; then
+            log "keycode 8 was bound ($bound); cleared it"
+        else
+            log "keycode 8 was bound ($bound); clearing it failed"
+        fi
+    else
+        log "keycode 8 not bound; left alone"
+    fi
+}
+
+delay=0
+if [ "$1" = "--delay" ] && [ -n "$2" ]; then
+    delay=$2
+fi
+
+if [ ! -x "$PY" ]; then
+    log "no Python at $PY (run 'make install' first); not starting"
+    notify "Clicky didn't start" "No Python found in the project's .venv. Run 'make install'."
+    exit 1
+fi
+
+cd "$REPO" || exit 1
+if [ "$delay" != 0 ]; then
+    log "waiting ${delay} s before starting"
+    pause "$delay"
+    [ "$stopping" = 1 ] && { log "stopped during the wait; not starting"; exit 0; }
+fi
+
+restarts=""   # epoch seconds of recent restarts
+while :; do
+    started=$(date +%s)
+    "$PY" -m clicky < /dev/null > /dev/null 2>> "$LOG" &
+    child=$!
+    log "started Clicky (pid $child)"
+    # wait returns early when a signal arrives; keep waiting until Clicky has really exited.
+    while :; do
+        wait "$child"
+        code=$?
+        kill -0 "$child" 2>/dev/null || break
+    done
+    child=
+    ran=$(( $(date +%s) - started ))
+    if [ "$code" -gt 128 ]; then
+        how="killed by signal $((code - 128))"
+    else
+        how="exit code $code"
+    fi
+    log "Clicky exited: $how after ${ran} s"
+
+    if [ "$stopping" = 1 ]; then
+        log "launcher was asked to stop; not restarting"
+        exit 0
+    fi
+    if [ "$code" = 0 ]; then
+        log "clean exit (Quit or already running); not restarting"
+        exit 0
+    fi
+    if ! display_alive; then
+        log "display is gone (logging out); not restarting"
+        exit 0
+    fi
+
+    now=$(date +%s)
+    recent=""
+    count=0
+    for t in $restarts; do
+        if [ $((now - t)) -lt "$WINDOW_S" ]; then
+            recent="$recent $t"
+            count=$((count + 1))
+        fi
+    done
+    if [ "$count" -ge "$MAX_RESTARTS" ]; then
+        log "crashed again after $MAX_RESTARTS restarts within ${WINDOW_S} s; giving up"
+        notify "Clicky stopped" "Clicky crashed $((MAX_RESTARTS + 1)) times within a minute. See $LOG"
+        exit 1
+    fi
+    restarts="$recent $now"
+    count=$((count + 1))
+    log "crash; restarting in ${RESTART_WAIT_S} s ($count/$MAX_RESTARTS this minute)"
+    clear_stuck_keycode_8
+    pause "$RESTART_WAIT_S"
+    if [ "$stopping" = 1 ]; then
+        log "launcher was asked to stop; not restarting"
+        exit 0
+    fi
+done

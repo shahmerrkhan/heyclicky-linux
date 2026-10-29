@@ -35,7 +35,22 @@ make run
 
 No proxy or server is needed: the app calls the Gemini API directly. (The `worker/` folder is from the old OpenAI setup and isn't used by vision mode anymore.)
 
-A blue triangle icon shows up in the system tray. Without a `GEMINI_API_KEY` or `TAVILY_API_KEY` Clicky still starts (Code mode works); a tray notification tells you what's off until the key is set. Press **Ctrl+Alt+Space** to open the input.
+Clicky's icon shows up in the system tray. Without a `GEMINI_API_KEY` or `TAVILY_API_KEY` Clicky still starts (Code mode works); a tray notification tells you what's off until the key is set. Press **Ctrl+Alt+Space** to open the input.
+
+## Run it as a desktop app
+
+```bash
+make desktop-install     # app-menu entry "Clicky" + start at login (5 s after the desktop is up)
+make desktop-uninstall   # removes both again
+```
+
+This writes two small files, with the repo's path filled in at install time: `~/.local/share/applications/clicky.desktop` (the app menu) and `~/.config/autostart/clicky.desktop` (login). Both run `scripts/clicky-launch`, which starts `.venv/bin/python -m clicky` from the repo with no terminal. It still reads `.env` and uses the project's `.venv`. Neither file is overwritten or removed if it wasn't written by `make desktop-install`.
+
+- **Only one copy runs.** A second start (menu, login, or `make run`) sees the lock in `$XDG_RUNTIME_DIR/clicky.lock`, logs "already running" and exits before touching the talk key or the hotkey.
+- **Tray menu:** **Restart** shuts down cleanly and starts a fresh copy (after 5 s it restarts even if the shutdown hangs). **Quit** stops it; it does not come back until you open it again or log in.
+- **Crashes:** the launcher restarts Clicky after 2 s, at most 3 times within a minute; after that it gives up and shows one notification. Before a restart it clears keycode 8 if a crash left it bound (writing mode briefly borrows keycode 8 to type some symbols, so a crash mid-symbol can leave it set).
+- **Logs** (no terminal): `~/.local/state/clicky/clicky.log` (Clicky, 1 MB x 3 files) and `launcher.log` next to it (starts, exits, restarts, crash traces). From a terminal, `make run` logs to the terminal as before.
+- **Stop it:** tray > Quit, or `pkill -TERM -f "python -m clicky"` (a clean stop, no restart). **Don't start it at login:** untick Clicky in Settings > Session and Startup > Application Autostart, or run `make desktop-uninstall`.
 
 ## Fast model, strong model, and `/p`
 

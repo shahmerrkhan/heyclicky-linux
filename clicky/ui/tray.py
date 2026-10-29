@@ -1,8 +1,24 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QPainter, QPixmap, QColor
 from PyQt6.QtWidgets import QMenu, QSystemTrayIcon
+
+
+ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+ICON_SIZES = (22, 32, 48, 256)
+
+
+def load_app_icon(assets_dir: Path = ASSETS_DIR) -> QIcon:
+    """The logo at every shipped size (Qt picks the closest); the drawn triangle if none exist."""
+    icon = QIcon()
+    for size in ICON_SIZES:
+        path = assets_dir / f"clicky-{size}.png"
+        if path.is_file():
+            icon.addFile(str(path))
+    return icon if not icon.isNull() else _build_default_icon()
 
 
 def _build_default_icon(size: int = 22) -> QIcon:
@@ -31,13 +47,14 @@ class TrayController(QObject):
     """Wraps QSystemTrayIcon. Emits high-level signals the app can wire to actions."""
 
     open_panel_requested = pyqtSignal()
+    restart_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     voice_toggled = pyqtSignal(bool)
     stop_voice_requested = pyqtSignal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._tray = QSystemTrayIcon(_build_default_icon(), parent=self)
+        self._tray = QSystemTrayIcon(load_app_icon(), parent=self)
         self._tray.setToolTip("Clicky")
         self._tray.activated.connect(self._on_activated)
 
@@ -56,6 +73,10 @@ class TrayController(QObject):
         menu.addAction(self._stop_voice_action)
 
         menu.addSeparator()
+
+        restart_action = QAction("Restart", self)
+        restart_action.triggered.connect(self.restart_requested.emit)
+        menu.addAction(restart_action)
 
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.quit_requested.emit)
