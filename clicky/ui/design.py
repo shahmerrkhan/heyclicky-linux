@@ -32,6 +32,7 @@ class Colors:
     CHIP_STRONG = "#3a7bff"
     CHIP_SEARCH = "#1fa37a"
     CHIP_WRITE = "#e0a33a"
+    CHIP_SPEAK = "#9b7ede"  # soft purple
 
     LINK = "#8ab4ff"  # footer links (search sources)
     DANGER = "#ff4d5e"  # listening dot, shell-on toggle, close hover

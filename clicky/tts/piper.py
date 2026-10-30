@@ -91,6 +91,7 @@ class PiperSpeaker:
         self._piper_command = piper_command or [str(python), "-m", "piper", "-m", str(voice), "--output-raw"]
         self._piper: asyncio.subprocess.Process | None = None
         self._player: asyncio.subprocess.Process | None = None
+        self.failed = False  # Piper or the player couldn't start or stopped early
 
     async def run(self, sentences: asyncio.Queue[str | None]) -> None:
         """Speak sentences from the queue until None; kills both processes if cancelled."""
@@ -100,6 +101,9 @@ class PiperSpeaker:
                 while (sentence := await sentences.get()) is not None:
                     await self._say(sentence)
                 await self._finish()
+            except OSError as exc:
+                logger.warning("piper or the audio player couldn't start: %s", exc)
+                self.failed = True
             finally:
                 await self._kill()
 
@@ -129,15 +133,18 @@ class PiperSpeaker:
             self._piper.stdin.write(line.encode())
             await self._piper.stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
-            logger.warning("piper stopped early; the rest of this answer won't be spoken")
+            if not self.failed:
+                logger.warning("piper stopped early; the rest of this answer won't be spoken")
+            self.failed = True
 
     async def _finish(self) -> None:
         """No more sentences: let Piper and the player finish what's queued."""
         assert self._piper is not None and self._piper.stdin is not None
         self._piper.stdin.close()
-        await self._piper.wait()
-        if self._player is not None:
-            await self._player.wait()
+        if await self._piper.wait() != 0:
+            self.failed = True
+        if self._player is not None and await self._player.wait() != 0:
+            self.failed = True
 
     async def _kill(self) -> None:
         for proc in (self._piper, self._player):
@@ -156,23 +163,32 @@ class SpokenAnswer:
     rest; `stop()` kills Piper and the player straight away.
     """
 
-    def __init__(self, make_speaker: Callable[[], PiperSpeaker]) -> None:
+    def __init__(
+        self, make_speaker: Callable[[], PiperSpeaker], on_sentence: Callable[[str], None] | None = None
+    ) -> None:
         self._make_speaker = make_speaker
+        self._on_sentence = on_sentence  # told about each sentence queued (moves the Esc grab's deadline)
         self._splitter = SentenceSplitter()
         self._queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._task: asyncio.Task | None = None
+        self._speaker: PiperSpeaker | None = None
         self._ended = False
 
     @property
     def started(self) -> bool:
         return self._task is not None
 
+    @property
+    def failed(self) -> bool:
+        """Piper or the player didn't work (checked once `wait()` has returned)."""
+        return self._speaker is not None and self._speaker.failed
+
     def feed(self, cumulative: str) -> None:
         if self._ended or not cumulative.strip():
             return
         self._ensure_started()
         for sentence in self._splitter.feed(cumulative):
-            self._queue.put_nowait(sentence)
+            self._put(sentence)
 
     def end(self, final: str | None = None) -> None:
         if self._ended:
@@ -184,7 +200,7 @@ class SpokenAnswer:
         if self._task is None:
             return
         for sentence in rest:
-            self._queue.put_nowait(sentence)
+            self._put(sentence)
         self._queue.put_nowait(None)
 
     async def wait(self) -> None:
@@ -197,9 +213,15 @@ class SpokenAnswer:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
 
+    def _put(self, sentence: str) -> None:
+        if self._on_sentence is not None:
+            self._on_sentence(sentence)
+        self._queue.put_nowait(sentence)
+
     def _ensure_started(self) -> None:
         if self._task is None:
-            self._task = asyncio.ensure_future(self._make_speaker().run(self._queue))
+            self._speaker = self._make_speaker()
+            self._task = asyncio.ensure_future(self._speaker.run(self._queue))
 
 
 async def play_error_sound(path: Path, command: str = PLAY_FILE_COMMAND) -> None:

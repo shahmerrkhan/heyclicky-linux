@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QRect, Qt, pyqtSignal
@@ -17,7 +19,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..config import settings
-from ..llm.prefixes import parse_prefixes
+from ..llm.prefixes import parse_prefixes, strip_speak
 from .area_selector import AreaSelectorOverlay
 from .cursor import BlueCursor
 from .design import MODE_COLORS, Colors, Fonts, Radius, Sizes
@@ -170,13 +172,13 @@ class _ModeSwitch(QFrame):
 
 
 class _ChipRow(QWidget):
-    """One chip per command (strong, search, write), shown while it's typed.
+    """One chip per command (strong, search, write, speak), shown while it's typed.
 
     `text()` reads like the old single chip ("strong · search") so existing
     checks and callers keep working.
     """
 
-    CHIPS = (("strong", "chipStrong"), ("search", "chipSearch"), ("write", "chipWrite"))
+    CHIPS = (("strong", "chipStrong"), ("search", "chipSearch"), ("write", "chipWrite"), ("speak", "chipSpeak"))
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -427,7 +429,7 @@ class _InputCard(QWidget):
             QFrame#modeSwitch QPushButton:disabled {{
                 color: {Colors.TEXT_FAINT};
             }}
-            QLabel#chipStrong, QLabel#chipSearch, QLabel#chipWrite {{
+            QLabel#chipStrong, QLabel#chipSearch, QLabel#chipWrite, QLabel#chipSpeak {{
                 border: 1px solid transparent;
                 border-radius: 11px;
                 padding: 3px 9px;
@@ -439,6 +441,7 @@ class _InputCard(QWidget):
             QLabel#chipStrong {{ background-color: {Colors.CHIP_STRONG}; }}
             QLabel#chipSearch {{ background-color: {Colors.CHIP_SEARCH}; }}
             QLabel#chipWrite {{ background-color: {Colors.CHIP_WRITE}; color: {Colors.TEXT_ON_ACCENT_DARK}; }}
+            QLabel#chipSpeak {{ background-color: {Colors.CHIP_SPEAK}; }}
             QPushButton#areaBtn {{
                 background-color: {Colors.GLASS_INSET};
                 border: none;
@@ -577,6 +580,10 @@ class _InputCard(QWidget):
                 labels.append("search")
             if parsed.write and self._mode == "vision":  # in Write mode it's already on
                 labels.append("write")
+            if parsed.speak:
+                labels.append("speak")
+        elif strip_speak(self._line_edit.text())[1]:  # Code mode: /speak is the only command
+            labels.append("speak")
         self._prefix_chip.set_chips(labels)
 
     def _select_mode(self, mode: str) -> None:
@@ -684,9 +691,13 @@ class Overlay(QObject):
         self._area_selector = AreaSelectorOverlay()
 
         self._selected_area: QRect | None = None
+        # True while a /speak answer is being written or spoken: Esc on the input
+        # bar then only closes the bar (set by the state machine).
+        self.input_esc_keeps_answer: Callable[[], bool] = lambda: False
+        self.input_esc_closed_at = 0.0  # monotonic time the bar's own Esc last closed just the bar
 
         self._input_card.submitted.connect(self._handle_input_submit)
-        self._input_card.cancelled.connect(self.dismiss)
+        self._input_card.cancelled.connect(self._on_input_cancelled)
         self._input_card.area_select_requested.connect(self._begin_area_selection)
         self._input_card.area_cleared.connect(self._clear_selected_area)
         self._input_card.mode_changed.connect(self.mode_changed.emit)
@@ -760,9 +771,26 @@ class Overlay(QObject):
     def hide_input(self) -> None:
         self._input_card.hide()
 
+    def input_visible(self) -> bool:
+        return self._input_card.isVisible()
+
+    def restore_input(self) -> None:
+        """Bring the hidden input bar back where it was, with its text, and focus it."""
+        self._input_card.show()
+        self._input_card.raise_()
+        self._input_card.activateWindow()
+        self._input_card._line_edit.setFocus()
+
     def apply_agent_mode(self, mode: str, workspace: str, allow_shell: bool) -> None:
         """Push persisted preferences into the input card."""
         self._input_card.apply_mode(mode, workspace, allow_shell)
+
+    def _on_input_cancelled(self) -> None:
+        if self.input_esc_keeps_answer():
+            self.hide_input()
+            self.input_esc_closed_at = time.monotonic()
+        else:
+            self.dismiss()
 
     def dismiss(self) -> None:
         self._input_card.hide()

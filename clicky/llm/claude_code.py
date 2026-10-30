@@ -26,7 +26,7 @@ import logging
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -64,6 +64,14 @@ class ClaudeCodeRequest:
     max_turns: int | None = None
 
 
+@dataclass
+class ClaudeCodeOutcome:
+    """Filled in while a run streams: what /speak reads aloud instead of the whole bubble."""
+
+    edited_files: list[str] = field(default_factory=list)  # in first-edit order, no repeats
+    closing_text: str = ""  # Claude's text after its last tool call (its own summary)
+
+
 class ClaudeCodeError(RuntimeError):
     """Raised when the `claude` binary is missing or exits non-zero."""
 
@@ -83,6 +91,7 @@ class ClaudeCodeClient:
     async def stream_response(
         self,
         request: ClaudeCodeRequest,
+        outcome: ClaudeCodeOutcome | None = None,
     ) -> AsyncIterator[str]:
         if not request.cwd.exists():
             raise ClaudeCodeError(
@@ -111,7 +120,7 @@ class ClaudeCodeClient:
                 "Install Claude Code: https://docs.anthropic.com/en/docs/claude-code"
             ) from exc
 
-        parser = _StreamParser()
+        parser = _StreamParser(outcome)
         accumulated = ""
         assert proc.stdout is not None
         try:
@@ -186,8 +195,10 @@ class _StreamParser:
     character.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, outcome: ClaudeCodeOutcome | None = None) -> None:
         self._blocks: dict[int, dict] = {}
+        self._outcome = outcome
+        self._closing: list[str] = []  # text blocks since the last tool call
 
     def handle(self, event: dict) -> str:
         if event.get("type") != "stream_event":
@@ -233,14 +244,39 @@ class _StreamParser:
     def _on_block_stop(self, inner: dict) -> str:
         idx = inner.get("index", 0)
         state = self._blocks.get(idx)
-        if state is None or state.get("type") != "tool_use":
+        if state is None:
+            return ""
+        if state.get("type") == "text":
+            self._note_text(state["text"])
+            return ""
+        if state.get("type") != "tool_use":
             return ""
         try:
             tool_input = json.loads(state["input_json"]) if state["input_json"] else {}
         except json.JSONDecodeError:
             tool_input = {}
-        return _format_tool_chip(state.get("name") or "tool", tool_input)
+        name = state.get("name") or "tool"
+        self._note_tool(name, tool_input)
+        return _format_tool_chip(name, tool_input)
 
+    def _note_text(self, text: str) -> None:
+        if self._outcome is None or not text.strip():
+            return
+        self._closing.append(text.strip())
+        self._outcome.closing_text = "\n\n".join(self._closing)
+
+    def _note_tool(self, name: str, tool_input: dict) -> None:
+        if self._outcome is None:
+            return
+        self._closing = []
+        self._outcome.closing_text = ""
+        if name in _EDIT_TOOLS:
+            path = tool_input.get("file_path") or tool_input.get("notebook_path") or tool_input.get("path")
+            if path and path not in self._outcome.edited_files:
+                self._outcome.edited_files.append(str(path))
+
+
+_EDIT_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "NotebookEdit"})
 
 _TOOL_LINE = re.compile(
     r"^\s*(?:" + "|".join(re.escape(m) for m in sorted(set(_TOOL_MARKERS.values()) | {"›"})) + r") [A-Za-z]\w*(?::.*)?$",
