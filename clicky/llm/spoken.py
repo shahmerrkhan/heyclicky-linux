@@ -2,12 +2,14 @@
 
 Voice (Fn+F5) answers don't use this; they are spoken as they stream.
 
-  - Vision: the answer, then "Answered by Gemini 3 Flash, using 4 sources."
+  - Vision: the answer.
   - Code: never any code. "Edited app.py and panel.py." first, then Claude's
-    closing summary (its text after the last tool call), then "Answered by
-    Claude Code."
-  - Write: a status line ("Draft typed into your window."), the draft, then
-    "Written by Gemini …". Nothing at all when Esc stopped the typing.
+    closing summary (its text after the last tool call). Nothing at all when
+    Claude edited nothing and wrote nothing.
+  - Write: a status line ("Draft typed into your window."), then the draft.
+    Nothing at all when Esc stopped the typing.
+
+Who answered is only shown in the bubble footer, never spoken.
 
 Text longer than CUTOFF_CHARS (counted after removing code, links and
 markdown) is replaced by a short summary from the fast model. If that step
@@ -57,19 +59,6 @@ _COMMAND_LINE = re.compile(r"^(?: {4}|\t|\$ ).*$", re.MULTILINE)
 _SENTENCE = re.compile(r"[^.!?…]+(?:[.!?…]+[\"')\]]*|$)\s*")
 
 Summarize = Callable[[str, str], Awaitable[str]]  # (text, mode) -> summary ("" when it failed)
-
-
-def readable_model_name(model: str) -> str:
-    """"gemini-3.8-flash" → "Gemini 3.8 Flash"."""
-    words = [w for w in re.split(r"[-_\s]+", model.strip()) if w]
-    return " ".join(w if any(c.isdigit() for c in w) else w.capitalize() for w in words)
-
-
-def answered_by_line(model_label: str, sources: int = 0, verb: str = "Answered") -> str:
-    line = f"{verb} by {model_label}"
-    if sources:
-        line += f", using {sources} source" + ("s" if sources != 1 else "")
-    return line + "."
 
 
 def edited_files_line(paths: list[str]) -> str:

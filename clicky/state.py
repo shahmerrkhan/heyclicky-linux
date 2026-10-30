@@ -495,11 +495,11 @@ class CompanionStateMachine(QObject):
 
     def _say(self, text: str) -> None:
         """Speak a finished /speak text (or explain in the bubble why it can't be)."""
+        if not text.strip():
+            return  # nothing to say (e.g. Claude Code edited nothing and wrote nothing)
         blocker = self._speak_blocker()
         if blocker is not None:
             self._add_note(blocker)
-            return
-        if not text.strip():
             return
         speech = self._new_spoken_answer(kind="speak")
         self._end_speech(speech, text, error=False)
@@ -729,7 +729,7 @@ class CompanionStateMachine(QObject):
             if speak:
                 if succeeded:
                     body = await speech_text.fit_for_speech(parsed.spoken_text, "vision", self._summarizer())
-                    self._say(speech_text.join_spoken(body, _spoken_answered_by(answer, search)))
+                    self._say(body)
                 else:
                     self._say(speech_text.FAILED_LINE)
             self._finish_question()
@@ -859,7 +859,7 @@ class CompanionStateMachine(QObject):
                     status = speech_text.write_status_line(result, self._draft_copied, replacing)
                     if status is not None:  # None: Esc stopped the typing, so say nothing
                         body = await speech_text.fit_for_speech(draft, "writing", self._summarizer())
-                        self._say(speech_text.join_spoken(status, body, _spoken_answered_by(answer, search, "Written")))
+                        self._say(speech_text.join_spoken(status, body))
             elif speak:
                 self._say(speech_text.FAILED_LINE)
             self._end_speech(None, None, error=voice and not succeeded)
@@ -1166,17 +1166,13 @@ class CompanionStateMachine(QObject):
             self._finish_question()
 
     async def _say_claude_code(self, outcome: ClaudeCodeOutcome, accumulated: str) -> None:
-        """/speak in Code mode: edited files, then Claude's closing summary (never code), then who answered."""
+        """/speak in Code mode: edited files, then Claude's closing summary (never code)."""
         files = speech_text.edited_files_line(outcome.edited_files)
-        label = "Claude Code"
-        if settings.claude_code_model:
-            label += f" using {speech_text.readable_model_name(settings.claude_code_model)}"
-        answered_by = speech_text.answered_by_line(label)
         body = ""
         if accumulated.strip():
             closing = speech_text.without_code(outcome.closing_text or strip_tool_lines(accumulated))
             body = await speech_text.fit_for_speech(closing, "code", self._summarizer())
-        self._say(speech_text.join_spoken(files, body, answered_by))
+        self._say(speech_text.join_spoken(files, body))
 
     def _parse_workspace_prefix(self, prompt: str) -> tuple[str | None, str]:
         """Pull a leading `@/path/to/dir ...` (or `@"path with spaces" ...`) off the prompt.
@@ -1262,12 +1258,6 @@ def _answered_by_line(answer: RoutedAnswer) -> str:
     if answer.first_failure_reason:
         line += f" — {answer.first_failure_reason}"
     return line + "."
-
-
-def _spoken_answered_by(answer: RoutedAnswer, search: SearchOutcome | None, verb: str = "Answered") -> str:
-    """ "Answered by Gemini 3.8 Flash, using 4 sources." (the sources the footer links to)."""
-    sources = len(one_link_per_site(search.results)) if search is not None else 0
-    return speech_text.answered_by_line(speech_text.readable_model_name(answer.choice.model), sources, verb)
 
 
 def _credits_used_up_note() -> str:
