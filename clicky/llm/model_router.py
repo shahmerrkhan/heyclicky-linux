@@ -1,8 +1,8 @@
 """Fast-model-first answering, with the strong model as backup or on request.
 
-Default order (no /p): fast, strong, fast, strong, ... for `rounds` rounds,
+Default order (no strong button): fast, strong, fast, strong, ... for `rounds` rounds,
 with a short pause between rounds, then an error.
-With /p: strong (long timer), then fast, then an error. No alternating.
+With the strong button (or "power mode"): strong (long timer), then fast, then an error. No alternating.
 
 Each try is one model under one first-word timer that also covers a single
 retry after a "busy" error. A try fails when the model is too slow (no first
@@ -154,7 +154,7 @@ class ModelRouter:
 
         `on_status` gets short progress notes ("trying <model>…") while no
         answer has started yet. `strong_timeout_s` replaces the strong
-        model's first-word timer when it goes first (writing uses 30 s; /p 90 s).
+        model's first-word timer when it goes first (writing uses 30 s; the strong button 90 s).
         """
         if self._limits.is_daily_limited(self._fast.model) and self._limits.is_daily_limited(
             self._strong.model

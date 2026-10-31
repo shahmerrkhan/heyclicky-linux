@@ -238,7 +238,7 @@ def _show_missing_key_notice(tray: TrayController) -> None:
         notes.append("Vision answers won't work until GEMINI_API_KEY is set. Code mode works normally.")
     if not settings.tavily_api_key.strip():
         notes.append(
-            "Web search (/s) is off until TAVILY_API_KEY is set; /s questions are answered without it."
+            "Web search is off until TAVILY_API_KEY is set; questions with search on are answered without it."
         )
     if not notes:
         return

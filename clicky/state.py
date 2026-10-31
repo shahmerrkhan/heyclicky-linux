@@ -5,7 +5,7 @@ import html
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from pathlib import Path
 from typing import cast
@@ -28,7 +28,8 @@ from .llm.gemini import GeminiClient, GeminiReply, GeminiRequest, LabeledImage
 from .llm.memory import ChatMemory, summary_for_system_prompt
 from .llm.model_router import ModelChoice, ModelRouter, RoutedAnswer, RouterError
 from .llm.point_parser import PointingResult, parse_point_tag
-from .llm.prefixes import ParsedPrompt, parse_prefixes, parse_spoken_prefixes, strip_speak
+from .llm import length as answer_length
+from .llm.prefixes import AskOptions, ParsedPrompt, parse_spoken_prefixes
 from .llm.prompts import COMPANION_TEXT_RESPONSE_SYSTEM_PROMPT, WRITING_SYSTEM_PROMPT
 from .llm.search_query import write_search_query
 from .llm import spoken as speech_text
@@ -97,21 +98,26 @@ class CompanionStateMachine(QObject):
 
     Two operating modes:
       - vision (default): screenshot + question (+ Tavily web results with
-        /s) → Gemini, fast model first with the strong model as backup (or
-        strong first with /p) → streamed answer + [POINT] cursor animation.
+        the search button) → Gemini, fast model first with the strong model as
+        backup (or strong first with the strong button) → streamed answer +
+        [POINT] cursor animation.
       - code: question → spawn `claude -p` as a subprocess in a configured
         workspace → stream Claude Code's progress (text + tool chips) into
         the same bubble.
 
     Questions can be typed (input bar) or spoken (hold the talk key). Answers
-    to spoken questions are read aloud as they stream; a typed question with
-    /speak is read aloud once its answer is complete (see llm/speech_text.py). A
-    spoken Code-mode question lands in the input bar first so it can be
-    checked and edited. While Clicky speaks, Esc is grabbed so it only stops
-    the speech.
+    to spoken Vision questions are read aloud as they stream; with the input
+    bar's speak switch on, a typed answer is read aloud once it's complete (see
+    llm/spoken.py). A spoken Code-mode question lands in the input bar first
+    so it can be checked and edited (its length words light a length button);
+    its answer then follows the speak switch. While Clicky speaks, Esc is
+    grabbed so it only stops the speech. The length buttons (and length words
+    in a voice question, see llm/length.py) set the answer length for one
+    question.
 
     Clicky always starts in vision mode; the mode chosen while it runs is
-    not saved (the Code workspace, shell switch and Voice switch are).
+    not saved (the Code workspace, shell switch, Voice switch and speak
+    switch are).
     """
 
     state_changed = pyqtSignal(CompanionState)
@@ -141,11 +147,11 @@ class CompanionStateMachine(QObject):
         self._listener: VoiceListener | None = None
         self._listen_start: asyncio.Task | None = None
         self._speech: SpokenAnswer | None = None
-        self._speech_kind: str | None = None  # "voice" (Fn+F5) or "speak" (typed /speak)
+        self._speech_kind: str | None = None  # "voice" (Fn+F5) or "speak" (the speak switch)
         self._speech_tail: asyncio.Task | None = None  # error sound after the spoken part
         self._speech_grab: EscGrab | None = None  # Esc, held while an answer is spoken
         self._speech_grab_owner: SpokenAnswer | None = None
-        self._speak_task: asyncio.Task | None = None  # a typed /speak question still being answered
+        self._speak_task: asyncio.Task | None = None  # a speak-switch question still being answered
         self._explanation = ""  # the bubble's explanation line (notes are added to it)
         self._draft_copied = False  # the last draft that wasn't typed (fully) went to the clipboard
         self._voice_cleanups: set[asyncio.Task] = set()
@@ -156,7 +162,6 @@ class CompanionStateMachine(QObject):
         self._typer = DraftTyper()
         self._typing_cancel: asyncio.Event | None = None
         self._last_draft: TypedDraft | None = None  # typed in full; a follow-up may replace it
-        self._voice_code_pending = False  # the input bar holds a voice transcript (Code mode)
         self._listen_timer = QTimer(self)
         self._listen_timer.setInterval(1000)
         self._listen_timer.timeout.connect(self._show_listening)
@@ -167,6 +172,7 @@ class CompanionStateMachine(QObject):
         overlay.mode_changed.connect(self._on_mode_changed)
         overlay.allow_shell_changed.connect(self._on_allow_shell_changed)
         overlay.workspace_changed.connect(self._on_workspace_changed)
+        overlay.speak_changed.connect(self.set_speak_on)
         overlay.bubble_link_clicked.connect(self._on_bubble_link_clicked)
 
         overlay.apply_agent_mode(
@@ -174,6 +180,7 @@ class CompanionStateMachine(QObject):
             workspace=self._persisted.claude_code_workspace or "",
             allow_shell=self._persisted.claude_code_allow_shell,
         )
+        overlay.set_speak_switch(self._persisted.speak_on)
 
     @property
     def state(self) -> CompanionState:
@@ -196,6 +203,18 @@ class CompanionStateMachine(QObject):
         if not on:
             self.stop_voice()
 
+    @property
+    def speak_on(self) -> bool:
+        return self._persisted.speak_on
+
+    def set_speak_on(self, on: bool) -> None:
+        """The input bar's speak switch (typed questions only). Saved across restarts."""
+        if on == self._persisted.speak_on:
+            return
+        self._persisted.speak_on = on
+        save_state(self._persisted)
+        logger.info("speak switch → %s", "on" if on else "off")
+
     def _set_state(self, new_state: CompanionState) -> None:
         if new_state == self._state:
             return
@@ -208,7 +227,7 @@ class CompanionStateMachine(QObject):
         """Called when the hotkey fires or the tray icon is clicked."""
         self._note_writing_target()  # before the input bar takes focus
         if self._speak_active():
-            # A /speak answer keeps being written and spoken; only sending cuts it off.
+            # A speak-switch answer keeps being written and spoken; only sending cuts it off.
             self._set_state(CompanionState.AWAITING_PROMPT)
             self._overlay.show_input_near_cursor()  # also hides the answer bubble
             return
@@ -226,7 +245,6 @@ class CompanionStateMachine(QObject):
         self._note_writing_target()
         self._stop_voice_processes()  # kills Piper before Whisper can be needed
         self._cancel_current_task()
-        self._voice_code_pending = False
         self._voice_busy = True
 
         listener = VoiceListener(
@@ -311,18 +329,13 @@ class CompanionStateMachine(QObject):
 
     # --- slots ----------------------------------------------------------------
 
-    def _on_prompt_submitted(self, prompt: str, region: QRect | None) -> None:
-        code_mode = self._persisted.agent_mode == "code"
-        if code_mode:
-            prompt, speak = strip_speak(prompt)
-        else:
-            speak = parse_prefixes(prompt).speak
-        # A Fn+F5 transcript sent with /speak follows the /speak rules instead.
-        spoken = self._voice_code_pending and code_mode and not speak
-        self._voice_code_pending = False
+    def _on_prompt_submitted(self, prompt: str, region: QRect | None, options: AskOptions | None = None) -> None:
+        options = options or AskOptions()
+        # The speak switch: typed questions, and a Code-mode voice transcript sent from the bar.
+        speak = self._persisted.speak_on
         self._stop_voice_processes()
-        self._cancel_current_task()  # a /speak answer may still be running: sending cuts it off
-        self._voice_busy = spoken
+        self._cancel_current_task()  # a spoken answer may still be running: sending cuts it off
+        self._voice_busy = False
         self._set_state(CompanionState.PROCESSING)
         self._overlay.update_bubble_text("…")
         self._overlay.update_bubble_footer("")
@@ -334,12 +347,19 @@ class CompanionStateMachine(QObject):
         if self._persisted.agent_mode == "code":
             workspace, stripped = self._parse_workspace_prefix(prompt)
             self._current_task = asyncio.ensure_future(
-                self._run_claude_code(stripped, workspace, spoken=spoken, speak=speak)
+                self._run_claude_code(stripped, workspace, speak=speak, length=options.length)
             )
             self._speak_task = self._current_task if speak else None
             return
 
-        parsed = parse_prefixes(prompt)
+        parsed = ParsedPrompt(
+            question=prompt.strip(),
+            strong=options.strong,
+            search=options.search,
+            write=options.write,
+            speak=speak,
+            length=options.length,
+        )
         if self._persisted.agent_mode == "writing" or parsed.write:
             self._current_task = asyncio.ensure_future(self._run_writing(parsed))
             self._speak_task = self._current_task if speak else None
@@ -347,14 +367,13 @@ class CompanionStateMachine(QObject):
 
         primary_index = _monitor_index_at_cursor()
         self._current_task = asyncio.ensure_future(
-            self._run_vision(prompt, primary_index, region)
+            self._run_vision(parsed, primary_index, region)
         )
         self._speak_task = self._current_task if speak else None
 
     def _on_overlay_dismissed(self) -> None:
         self._cancel_current_task()
         self._stop_voice_processes()
-        self._voice_code_pending = False
         self._voice_busy = False
         self._set_state(CompanionState.IDLE)
 
@@ -435,15 +454,16 @@ class CompanionStateMachine(QObject):
                 return
 
             if code_mode:
-                # Edit the transcript, then Enter runs it (and its answer is spoken).
+                # Edit the transcript, then Enter runs it (spoken only with the speak switch on).
+                # Length words light the matching length button, which can still be changed.
+                decision = await self._voice_length(parsed.question, "code")
                 self._voice_busy = False
-                self._voice_code_pending = True
                 self._set_state(CompanionState.AWAITING_PROMPT)
-                self._overlay.show_input_with_text(parsed.question)
+                self._overlay.show_input_with_text(parsed.question, length=decision.length, note=decision.note)
                 return
 
             await self._run_vision(
-                transcript,
+                parsed,
                 primary_index,
                 None,
                 voice=VoiceQuestion(transcript=transcript, parsed=parsed, screens=screens, note=note),
@@ -464,6 +484,19 @@ class CompanionStateMachine(QObject):
         self._voice_busy = False
         self._set_state(CompanionState.IDLE)
 
+    async def _voice_length(self, question: str, mode: str) -> answer_length.LengthDecision:
+        """Length words in a voice question, checked as in llm/length.py (no trigger: no wait)."""
+        if not answer_length.find_triggers(question):
+            return answer_length.LengthDecision()
+        self._overlay.update_bubble_text("checking length words…")
+        client = None
+        if _gemini_setup_problem() is None:
+            self._ensure_clients()
+            client = self._gemini
+        return await answer_length.decide_length(
+            question, mode, client, settings.gemini_fast_model, settings.gemini_model, self._usage
+        )
+
     def _new_spoken_answer(self, kind: str = "voice") -> SpokenAnswer | None:
         if self._voice_files.missing_for_speaking():
             return None
@@ -480,13 +513,13 @@ class CompanionStateMachine(QObject):
         return speech
 
     def _speak_active(self) -> bool:
-        """A typed /speak question is still being answered, or its answer is being spoken."""
+        """A speak-switch question is still being answered, or its answer is being spoken."""
         if self._speak_task is not None and not self._speak_task.done():
             return True
         return self._speech_kind == "speak" and self._is_speaking()
 
     def _speak_blocker(self) -> str | None:
-        """Why a /speak answer can't be spoken right now (None: it can)."""
+        """Why a speak-switch answer can't be spoken right now (None: it can)."""
         if not (settings.voice_enabled and self._persisted.voice_on):
             return "Voice is turned off, so this answer wasn't spoken."
         if self._voice_files.missing_for_speaking():
@@ -494,7 +527,7 @@ class CompanionStateMachine(QObject):
         return None
 
     def _say(self, text: str) -> None:
-        """Speak a finished /speak text (or explain in the bubble why it can't be)."""
+        """Speak a finished speak-switch text (or explain in the bubble why it can't be)."""
         if not text.strip():
             return  # nothing to say (e.g. Claude Code edited nothing and wrote nothing)
         blocker = self._speak_blocker()
@@ -619,15 +652,18 @@ class CompanionStateMachine(QObject):
 
     async def _run_vision(
         self,
-        prompt: str,
+        parsed_prompt: ParsedPrompt,
         primary_index: int | None,
         region: QRect | None,
         voice: VoiceQuestion | None = None,
     ) -> None:
         search: SearchOutcome | None = None
         search_note: str | None = None
+        length_note: str | None = None
+        length_check: asyncio.Task | None = None
         speech = self._new_spoken_answer() if voice is not None else None
-        speak = voice is None and parse_prefixes(prompt).speak
+        speak = voice is None and parsed_prompt.speak
+        question = parsed_prompt.question
         show = self._overlay.update_bubble_text
         if voice is not None:
             self._overlay.set_bubble_mode("vision")
@@ -644,20 +680,10 @@ class CompanionStateMachine(QObject):
                 self._finish_question()
                 return
 
-            if voice is not None:
-                parsed_prompt = voice.parsed
-                question = parsed_prompt.question
-            else:
-                parsed_prompt = parse_prefixes(prompt)
-                question = parsed_prompt.question
-                if parsed_prompt.has_prefix and not question:
-                    prefix = parsed_prompt.prefix_text
-                    show(f'type a question with {prefix}, e.g. "latest python release {prefix}".')
-                    if speak:
-                        self._say(speech_text.ASK_LINE)
-                    self._set_state(CompanionState.IDLE)
-                    return
             router = self._ensure_clients()
+            if voice is not None and answer_length.find_triggers(question):
+                # Runs alongside the voice search query (both use the fast model).
+                length_check = asyncio.ensure_future(self._voice_length(question, "vision"))
 
             if voice is not None:
                 screens = voice.screens
@@ -682,6 +708,13 @@ class CompanionStateMachine(QObject):
                     )
                 search, search_note = await self._run_search(query, show)
                 show("…")
+            if length_check is not None:
+                if not length_check.done():
+                    show("checking length words…")
+                decision = await length_check
+                parsed_prompt = replace(parsed_prompt, length=decision.length)
+                length_note = decision.note or None
+                show("…")
             request = self._build_vision_request(question, screens, search)
 
             self._set_state(CompanionState.RESPONDING)
@@ -695,7 +728,9 @@ class CompanionStateMachine(QObject):
 
             answer = await router.answer(
                 request=request,
-                system_prompt=COMPANION_TEXT_RESPONSE_SYSTEM_PROMPT + summary_for_system_prompt(self._memory.summary),
+                system_prompt=COMPANION_TEXT_RESPONSE_SYSTEM_PROMPT
+                + summary_for_system_prompt(self._memory.summary)
+                + answer_length.instruction(parsed_prompt.length, "vision"),
                 on_text=show_streaming,
                 on_status=show,
                 prefer_strong=parsed_prompt.strong,
@@ -719,7 +754,9 @@ class CompanionStateMachine(QObject):
             show(_final_bubble_text(answer, parsed))
             searched_for = search.query if voice is not None and search is not None else None
             self._overlay.update_bubble_footer(
-                self._vision_footer_html(search, _join_notes(voice, search_note), answer, searched_for=searched_for)
+                self._vision_footer_html(
+                    search, _join_notes(voice, search_note, length_note), answer, searched_for=searched_for
+                )
             )
             self._end_speech(speech, parsed.spoken_text if succeeded else None, error=not succeeded)
 
@@ -737,7 +774,9 @@ class CompanionStateMachine(QObject):
         except RouterError as exc:
             logger.warning("no gemini answer: %s", exc)
             show(str(exc))
-            self._overlay.update_bubble_footer(self._vision_footer_html(search, _join_notes(voice, search_note), None))
+            self._overlay.update_bubble_footer(
+                self._vision_footer_html(search, _join_notes(voice, search_note, length_note), None)
+            )
             self._end_speech(speech, None, error=voice is not None)
             if speak:
                 self._say(speech_text.FAILED_LINE)
@@ -752,6 +791,9 @@ class CompanionStateMachine(QObject):
             if speak:
                 self._say(speech_text.FAILED_LINE)
             self._finish_question()
+        finally:
+            if length_check is not None and not length_check.done():
+                length_check.cancel()
 
     # --- writing pipeline -----------------------------------------------------
 
@@ -760,11 +802,13 @@ class CompanionStateMachine(QObject):
 
         Strong model first (WRITING_STRONG_TIMEOUT_S to start), the fast model
         as backup. `said` is the voice transcript (None for typed requests).
-        Drafts are read aloud only with /speak (after typing); a failed voice
-        request plays the error sound.
+        Typed drafts are read aloud only with the speak switch on (after typing);
+        voice drafts stay silent, and a failed voice request plays the error sound.
         """
         voice = said is not None
         speak = not voice and parsed.speak
+        length_check: asyncio.Task | None = None
+        length_note: str | None = None
         # Typed into the window the user was in when they asked, even if they
         # open the input bar (or switch windows) while the draft is written.
         target = self._writing_target
@@ -786,12 +830,13 @@ class CompanionStateMachine(QObject):
                 self._finish_question()
                 return
             if not question:
-                show('type what to write, e.g. "tell sarah the deploy slipped to thursday /w".')
-                if speak:
-                    self._say(speech_text.ASK_LINE)
+                show("type what to write first.")
                 self._finish_question()
                 return
             router = self._ensure_clients()
+            if voice and answer_length.find_triggers(question):
+                # Runs alongside the voice search query (both use the fast model).
+                length_check = asyncio.ensure_future(self._voice_length(question, "writing"))
 
             if parsed.search:
                 query = question
@@ -799,6 +844,13 @@ class CompanionStateMachine(QObject):
                     show("writing a search query…")
                     query, _ = await write_search_query(self._gemini, settings.gemini_fast_model, question, [])
                 search, search_note = await self._run_search(query, show)
+                show("…")
+            if length_check is not None:
+                if not length_check.done():
+                    show("checking length words…")
+                decision = await length_check
+                parsed = replace(parsed, length=decision.length)
+                length_note = decision.note or None
                 show("…")
             request = GeminiRequest(
                 user_prompt=question,
@@ -824,7 +876,8 @@ class CompanionStateMachine(QObject):
                     system_prompt=WRITING_SYSTEM_PROMPT
                     + instructions
                     + REVISION_INSTRUCTIONS
-                    + summary_for_system_prompt(self._memory.summary),
+                    + summary_for_system_prompt(self._memory.summary)
+                    + answer_length.instruction(parsed.length, "writing"),
                     on_text=show_streaming,
                     on_status=show,
                     prefer_strong=True,
@@ -847,7 +900,7 @@ class CompanionStateMachine(QObject):
                 self._memory.add(question, draft)
 
             show(_final_draft_text(answer, draft))
-            notes = " ".join(n for n in (note, search_note) if n) or None
+            notes = " ".join(n for n in (note, search_note, length_note) if n) or None
             self._overlay.update_bubble_footer(self._vision_footer_html(search, notes, answer))
             if succeeded:
                 replacing = is_revision(reply.text) and self._last_draft is not None
@@ -868,7 +921,7 @@ class CompanionStateMachine(QObject):
         except RouterError as exc:
             logger.warning("no gemini draft: %s", exc)
             show(str(exc))
-            notes = " ".join(n for n in (note, search_note) if n) or None
+            notes = " ".join(n for n in (note, search_note, length_note) if n) or None
             self._overlay.update_bubble_footer(self._vision_footer_html(search, notes, None))
             self._end_speech(None, None, error=voice)
             if speak:
@@ -884,13 +937,16 @@ class CompanionStateMachine(QObject):
             if speak:
                 self._say(speech_text.FAILED_LINE)
             self._finish_question()
+        finally:
+            if length_check is not None and not length_check.done():
+                length_check.cancel()
 
     async def _capture_for_writing(self, target: WritingTarget | None = None) -> list[LabeledImage]:
         """Screenshot for a writing request, with Clicky's own windows hidden.
 
         Only the window the user was in (falls back to the screen under the
         cursor if that window is gone). An input bar opened meanwhile (while a
-        /speak draft is written) comes back with its text and focus afterwards;
+        speak-switch draft is written) comes back with its text and focus afterwards;
         the bubble then stays hidden.
         """
         target = target or self._writing_target
@@ -1035,7 +1091,7 @@ class CompanionStateMachine(QObject):
 
     def _search_unavailable_reason(self) -> str | None:
         if self._web_search is None:
-            return f"web search is off — add TAVILY_API_KEY to {ENV_FILE} to use /s."
+            return f"web search is off — add TAVILY_API_KEY to {ENV_FILE} to use search."
         if self._usage.usage.search_credits_exhausted:
             return _credits_used_up_note()
         return None
@@ -1049,7 +1105,7 @@ class CompanionStateMachine(QObject):
             self._usage.mark_search_credits_exhausted()
             return _credits_used_up_note()
         if outcome.error_kind == SearchErrorKind.RATE_LIMITED:
-            return "tavily is limiting how fast you can search — try /s again in a minute."
+            return "tavily is limiting how fast you can search — try again in a minute."
         if outcome.error_kind == SearchErrorKind.BAD_KEY:
             return f"tavily rejected the api key — check TAVILY_API_KEY in {ENV_FILE}."
         return "web search failed — tavily didn't respond."
@@ -1110,10 +1166,9 @@ class CompanionStateMachine(QObject):
     # --- code-mode pipeline ---------------------------------------------------
 
     async def _run_claude_code(
-        self, prompt: str, workspace_override: str | None, spoken: bool = False, speak: bool = False
+        self, prompt: str, workspace_override: str | None, speak: bool = False, length: str | None = None
     ) -> None:
-        speech = self._new_spoken_answer() if spoken else None
-        outcome = ClaudeCodeOutcome()  # edited files and Claude's closing text, for /speak
+        outcome = ClaudeCodeOutcome()  # edited files and Claude's closing text, for the speak switch
         accumulated = ""
         try:
             workspace_str = workspace_override or self._persisted.claude_code_workspace or ""
@@ -1125,6 +1180,7 @@ class CompanionStateMachine(QObject):
                 allow_shell=self._persisted.claude_code_allow_shell,
                 model=settings.claude_code_model or None,
                 max_turns=settings.claude_code_max_turns or None,
+                append_system_prompt=answer_length.instruction(length, "code") or None,
             )
 
             self._set_state(CompanionState.RESPONDING)
@@ -1137,12 +1193,9 @@ class CompanionStateMachine(QObject):
             async for chunk in stream:
                 accumulated = chunk
                 self._overlay.update_bubble_text(header + accumulated)
-                if speech is not None:
-                    speech.feed(strip_tool_lines(accumulated))
 
             if not accumulated.strip():
                 self._overlay.update_bubble_text(header + "(no output)")
-            self._end_speech(speech, strip_tool_lines(accumulated), error=False)
             if speak:
                 await self._say_claude_code(outcome, accumulated)
             self._finish_question()
@@ -1150,7 +1203,6 @@ class CompanionStateMachine(QObject):
         except ClaudeCodeError as exc:
             logger.warning("claude code error: %s", exc)
             self._overlay.update_bubble_text(str(exc))
-            self._end_speech(speech, None, error=spoken)
             if speak:
                 self._say(speech_text.FAILED_LINE)
             self._finish_question()
@@ -1160,13 +1212,12 @@ class CompanionStateMachine(QObject):
         except Exception as exc:
             logger.exception("claude code pipeline failed")
             self._overlay.update_bubble_text(f"error: {exc}")
-            self._end_speech(speech, None, error=spoken)
             if speak:
                 self._say(speech_text.FAILED_LINE)
             self._finish_question()
 
     async def _say_claude_code(self, outcome: ClaudeCodeOutcome, accumulated: str) -> None:
-        """/speak in Code mode: edited files, then Claude's closing summary (never code)."""
+        """Speak switch in Code mode: edited files, then Claude's closing summary (never code)."""
         files = speech_text.edited_files_line(outcome.edited_files)
         body = ""
         if accumulated.strip():
@@ -1220,8 +1271,10 @@ class CompanionStateMachine(QObject):
         self._current_task = None
 
 
-def _join_notes(voice: VoiceQuestion | None, search_note: str | None) -> str | None:
-    notes = [n for n in (voice.note if voice is not None else None, search_note) if n]
+def _join_notes(
+    voice: VoiceQuestion | None, search_note: str | None, length_note: str | None = None
+) -> str | None:
+    notes = [n for n in (voice.note if voice is not None else None, search_note, length_note) if n]
     return " ".join(notes) or None
 
 

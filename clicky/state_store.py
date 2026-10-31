@@ -31,6 +31,7 @@ class PersistedState:
     claude_code_workspace: str | None = None
     claude_code_allow_shell: bool = False
     voice_on: bool = True
+    speak_on: bool = False  # the input bar's speak switch (typed questions only)
 
 
 def _store_path() -> Path:
@@ -54,6 +55,7 @@ def load_state() -> PersistedState:
         claude_code_workspace=data.get("claude_code_workspace"),
         claude_code_allow_shell=bool(data.get("claude_code_allow_shell", False)),
         voice_on=bool(data.get("voice_on", True)),
+        speak_on=bool(data.get("speak_on", False)),
     )
 
 

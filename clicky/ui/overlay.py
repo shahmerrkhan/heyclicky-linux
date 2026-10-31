@@ -19,7 +19,8 @@ from PyQt6.QtWidgets import (
 )
 
 from ..config import settings
-from ..llm.prefixes import parse_prefixes, strip_speak
+from ..llm.length import LABELS, LEVELS
+from ..llm.prefixes import AskOptions
 from .area_selector import AreaSelectorOverlay
 from .cursor import BlueCursor
 from .design import MODE_COLORS, Colors, Fonts, Radius, Sizes
@@ -171,14 +172,24 @@ class _ModeSwitch(QFrame):
         return self._buttons[mode]
 
 
-class _ChipRow(QWidget):
-    """One chip per command (strong, search, write, speak), shown while it's typed.
+class _OptionsRow(QWidget):
+    """The second row: strong, search, write, four length buttons and the speak switch.
 
-    `text()` reads like the old single chip ("strong · search") so existing
-    checks and callers keep working.
+    Strong, search, write and the length last one question (`reset_one_question`).
+    One length at a time; clicking the lit one turns it off (none = today's length).
+    The speak switch stays as set and is saved by the state machine. No button takes focus.
+    Which buttons show depends on the mode (`set_mode`).
     """
 
-    CHIPS = (("strong", "chipStrong"), ("search", "chipSearch"), ("write", "chipWrite"), ("speak", "chipSpeak"))
+    speak_toggled = pyqtSignal(bool)
+
+    # name, label, object name, key, modes where it shows
+    TOGGLES = (
+        ("strong", "strong", "optStrong", "Alt+P", ("vision",)),
+        ("search", "search", "optSearch", "Alt+S", ("vision", "writing")),
+        ("write", "write", "optWrite", "Alt+W", ("vision",)),
+    )
+    LENGTH_KEYS = ("Alt+4", "Alt+5", "Alt+6", "Alt+7")
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -186,31 +197,107 @@ class _ChipRow(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
-        self._chips: dict[str, QLabel] = {}
-        for name, object_name in self.CHIPS:
-            chip = QLabel(name, self)
-            chip.setObjectName(object_name)
-            chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            chip.hide()
-            layout.addWidget(chip)
-            self._chips[name] = chip
-        self.hide()
 
-    def set_chips(self, names: list[str]) -> None:
-        for name, chip in self._chips.items():
-            chip.setVisible(name in names)
-        self.setVisible(bool(names))
+        self._toggles: dict[str, QPushButton] = {}
+        self._shows_in: dict[str, tuple[str, ...]] = {}
+        for name, label, object_name, key, modes in self.TOGGLES:
+            button = self._button(label, object_name, f"{label} for this question ({key})")
+            layout.addWidget(button)
+            self._toggles[name] = button
+            self._shows_in[name] = modes
 
-    def text(self) -> str:
-        return " · ".join(name for name, chip in self._chips.items() if not chip.isHidden())
+        layout.addSpacing(6)
+        self._length_switch = QFrame(self)
+        self._length_switch.setObjectName("lengthSwitch")
+        length_layout = QHBoxLayout(self._length_switch)
+        length_layout.setContentsMargins(3, 3, 3, 3)
+        length_layout.setSpacing(2)
+        self._lengths: dict[str, QPushButton] = {}
+        for level, key in zip(LEVELS, self.LENGTH_KEYS):
+            button = self._button(LABELS[level], "lengthBtn", f"{LABELS[level]} answer, this question only ({key})")
+            button.clicked.connect(lambda checked, lv=level: self.set_length(lv if checked else None))
+            length_layout.addWidget(button)
+            self._lengths[level] = button
+        layout.addWidget(self._length_switch)
+
+        layout.addStretch(1)
+        self._speak = self._button("speak: off", "speakBtn", "read typed answers aloud (Alt+K)")
+        self._speak.toggled.connect(self._on_speak_toggled)
+        layout.addWidget(self._speak)
+
+    def _button(self, label: str, object_name: str, tooltip: str) -> QPushButton:
+        button = QPushButton(label, self)
+        button.setObjectName(object_name)
+        button.setCheckable(True)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setToolTip(tooltip)
+        return button
+
+    def set_mode(self, mode: str) -> None:
+        for name, button in self._toggles.items():
+            shown = mode in self._shows_in[name]
+            button.setVisible(shown)
+            if not shown:
+                button.setChecked(False)
+
+    def toggle(self, name: str) -> None:
+        """Alt+P / Alt+S / Alt+W: flip a button that's shown in this mode."""
+        button = self._toggles[name]
+        if not button.isHidden():
+            button.toggle()
+
+    def press_length(self, level: str) -> None:
+        """Alt+4..7: like a click (pressing the lit one turns it off)."""
+        self.set_length(None if self.length() == level else level)
+
+    def set_length(self, level: str | None) -> None:
+        for name, button in self._lengths.items():
+            button.setChecked(name == level)
+
+    def length(self) -> str | None:
+        return next((name for name, button in self._lengths.items() if button.isChecked()), None)
+
+    def is_on(self, name: str) -> bool:
+        button = self._toggles[name]
+        return button.isChecked() and not button.isHidden()
+
+    def reset_one_question(self) -> None:
+        for button in self._toggles.values():
+            button.setChecked(False)
+        self.set_length(None)
+
+    def set_speak(self, on: bool) -> None:
+        """Show the saved switch without emitting `speak_toggled`."""
+        self._speak.blockSignals(True)
+        self._speak.setChecked(on)
+        self._speak.blockSignals(False)
+        self._speak.setText("speak: on" if on else "speak: off")
+
+    def toggle_speak(self) -> None:
+        self._speak.toggle()
+
+    def speak_on(self) -> bool:
+        return self._speak.isChecked()
+
+    def _on_speak_toggled(self, on: bool) -> None:
+        self._speak.setText("speak: on" if on else "speak: off")
+        self.speak_toggled.emit(on)
+
+    def button(self, name: str) -> QPushButton:
+        """A button by name: strong, search, write, speak, or a length level."""
+        if name == "speak":
+            return self._speak
+        return self._toggles.get(name) or self._lengths[name]
 
 
 class _InputCard(QWidget):
     """Floating input bar anchored near the cursor ("command palette" look).
 
     Top-level frameless top-most window holding a dark glass card:
-      - top row: Vision / Code / Write switch, the growing input box, one chip
-        per typed command, the area button (+ badge when an area is picked);
+      - top row: Vision / Code / Write switch, the growing input box, the area
+        button (+ badge when an area is picked);
+      - options row: strong, search, write, four length buttons, the speak switch;
       - code row (Code mode only): workspace and "allow shell";
       - hint line: Enter / Shift+Enter / Esc / area / talk key.
 
@@ -220,16 +307,18 @@ class _InputCard(QWidget):
       - 'writing': turn messy thoughts into a message, typed into the window
         the user was in.
     Alt+1 / Alt+2 / Alt+3 switch to vision / code / writing. The mode is never
-    saved: Clicky always starts in vision.
+    saved: Clicky always starts in vision. Alt+P / Alt+S / Alt+W strong, search,
+    write; Alt+4..7 extra short, short, medium, long; Alt+K the speak switch.
     """
 
-    submitted = pyqtSignal(str)
+    submitted = pyqtSignal(str, object)  # (prompt, AskOptions)
     cancelled = pyqtSignal()
     area_select_requested = pyqtSignal()
     area_cleared = pyqtSignal()
     mode_changed = pyqtSignal(str)
     allow_shell_changed = pyqtSignal(bool)
     workspace_changed = pyqtSignal(str)
+    speak_changed = pyqtSignal(bool)
 
     SELECTABLE_MODES = ("vision", "code", "writing")
 
@@ -280,14 +369,7 @@ class _InputCard(QWidget):
         _palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(Colors.TEXT_FAINT))
         _palette.setColor(QPalette.ColorRole.Text, QColor(Colors.TEXT))
         self._line_edit.setPalette(_palette)
-        self._line_edit.textChanged.connect(self._refresh_prefix_chip)
         row.addWidget(self._line_edit, stretch=1)
-
-        # Shows a chip per /p, /s (or /ps, /sp) and /w command typed anywhere in
-        # the box, in vision and writing mode. Uses the router's own parser so it
-        # always matches.
-        self._prefix_chip = _ChipRow(self._card)
-        row.addWidget(self._prefix_chip, alignment=Qt.AlignmentFlag.AlignTop)
 
         self._badge = QFrame(self._card)
         self._badge.setObjectName("badge")
@@ -317,6 +399,11 @@ class _InputCard(QWidget):
         row.addWidget(self._area_btn, alignment=Qt.AlignmentFlag.AlignTop)
 
         card_layout.addLayout(row)
+
+        # --- options row: strong / search / write, length, speak -------------
+        self._options = _OptionsRow(self._card)
+        self._options.speak_toggled.connect(self.speak_changed.emit)
+        card_layout.addWidget(self._options)
 
         # --- code-mode row (hidden until mode == 'code') ---------------------
         self._code_row = QWidget(self._card)
@@ -352,6 +439,7 @@ class _InputCard(QWidget):
         hint = "↵ send   ⇧↵ new line   esc close   ◫ area"
         if settings.voice_enabled:
             hint += "   hold Fn+F5 to talk"
+        self._hint_text = hint
         self._hint = QLabel(hint, self._card)
         self._hint.setObjectName("hint")
         card_layout.addWidget(self._hint)
@@ -360,6 +448,17 @@ class _InputCard(QWidget):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(lambda m=mode: self._select_mode(m))
+        for sequence, name in (("Alt+P", "strong"), ("Alt+S", "search"), ("Alt+W", "write")):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(lambda n=name: self._options.toggle(n))
+        for sequence, level in zip(_OptionsRow.LENGTH_KEYS, LEVELS):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(lambda lv=level: self._options.press_length(lv))
+        speak_key = QShortcut(QKeySequence("Alt+K"), self)
+        speak_key.setContext(Qt.ShortcutContext.WindowShortcut)
+        speak_key.activated.connect(self._options.toggle_speak)
 
         self._card.setStyleSheet(self._stylesheet())
 
@@ -429,19 +528,48 @@ class _InputCard(QWidget):
             QFrame#modeSwitch QPushButton:disabled {{
                 color: {Colors.TEXT_FAINT};
             }}
-            QLabel#chipStrong, QLabel#chipSearch, QLabel#chipWrite, QLabel#chipSpeak {{
-                border: 1px solid transparent;
+            QPushButton#optStrong, QPushButton#optSearch, QPushButton#optWrite, QPushButton#speakBtn {{
+                background-color: {Colors.GLASS_INSET};
+                border: none;
                 border-radius: 11px;
-                padding: 3px 9px;
+                color: {Colors.TEXT_DIM};
+                padding: 4px 10px;
                 font-family: "{Fonts.FAMILY}";
                 font-size: {Fonts.SMALL_PX}px;
                 font-weight: 600;
-                color: white;
             }}
-            QLabel#chipStrong {{ background-color: {Colors.CHIP_STRONG}; }}
-            QLabel#chipSearch {{ background-color: {Colors.CHIP_SEARCH}; }}
-            QLabel#chipWrite {{ background-color: {Colors.CHIP_WRITE}; color: {Colors.TEXT_ON_ACCENT_DARK}; }}
-            QLabel#chipSpeak {{ background-color: {Colors.CHIP_SPEAK}; }}
+            QPushButton#optStrong:hover:!checked, QPushButton#optSearch:hover:!checked,
+            QPushButton#optWrite:hover:!checked, QPushButton#speakBtn:hover:!checked {{
+                color: {Colors.TEXT};
+                background-color: rgba(255, 255, 255, 52);
+            }}
+            QPushButton#optStrong:checked {{ background-color: {Colors.CHIP_STRONG}; color: white; }}
+            QPushButton#optSearch:checked {{ background-color: {Colors.CHIP_SEARCH}; color: white; }}
+            QPushButton#optWrite:checked {{ background-color: {Colors.CHIP_WRITE}; color: {Colors.TEXT_ON_ACCENT_DARK}; }}
+            QPushButton#speakBtn:checked {{ background-color: {Colors.CHIP_SPEAK}; color: white; }}
+            QFrame#lengthSwitch {{
+                background-color: {Colors.GLASS_INSET};
+                border: none;
+                border-radius: {Radius.SEGMENT}px;
+            }}
+            QFrame#lengthSwitch QPushButton {{
+                background: transparent;
+                border: none;
+                border-radius: {Radius.SEGMENT_CELL}px;
+                color: {Colors.TEXT_DIM};
+                font-family: "{Fonts.FAMILY}";
+                font-size: {Fonts.SMALL_PX}px;
+                font-weight: 600;
+                padding: 2px 8px;
+            }}
+            QFrame#lengthSwitch QPushButton:hover:!checked {{
+                background-color: {Colors.GLASS_HOVER};
+                color: {Colors.TEXT};
+            }}
+            QFrame#lengthSwitch QPushButton:checked {{
+                background-color: {Colors.TEXT};
+                color: {Colors.TEXT_ON_ACCENT_DARK};
+            }}
             QPushButton#areaBtn {{
                 background-color: {Colors.GLASS_INSET};
                 border: none;
@@ -534,7 +662,22 @@ class _InputCard(QWidget):
         fade_in(self)
 
     def reset_prompt_text(self) -> None:
+        """A fresh bar: no text, no one-question picks, no note."""
         self._line_edit.clear()
+        self._options.reset_one_question()
+        self.set_note("")
+
+    def set_length(self, length: str | None) -> None:
+        """Light one length button (None: none lit)."""
+        self._options.set_length(length)
+
+    def set_speak(self, on: bool) -> None:
+        """Show the saved speak switch (without emitting `speak_changed`)."""
+        self._options.set_speak(on)
+
+    def set_note(self, note: str) -> None:
+        """A note in the hint line (e.g. how a voice transcript's length words were read)."""
+        self._hint.setText(f"{note}   ·   {self._hint_text}" if note else self._hint_text)
 
     def set_prompt_text(self, text: str) -> None:
         self._line_edit.setText(text)
@@ -563,28 +706,12 @@ class _InputCard(QWidget):
 
         self._workspace_btn.setText(f"in: {_friendly_path(self._workspace)}")
         self._code_row.setVisible(self._mode == "code")
+        self._options.set_mode(self._mode)
         self._line_edit.setPlaceholderText(_PLACEHOLDERS[self._mode])
         self._card.setStyleSheet(self._stylesheet())
-        self._refresh_prefix_chip()
         self.adjustSize()
 
     # --- internals ---------------------------------------------------------
-
-    def _refresh_prefix_chip(self) -> None:
-        labels: list[str] = []
-        if self._mode in ("vision", "writing"):
-            parsed = parse_prefixes(self._line_edit.text())
-            if parsed.strong:
-                labels.append("strong")
-            if parsed.search:
-                labels.append("search")
-            if parsed.write and self._mode == "vision":  # in Write mode it's already on
-                labels.append("write")
-            if parsed.speak:
-                labels.append("speak")
-        elif strip_speak(self._line_edit.text())[1]:  # Code mode: /speak is the only command
-            labels.append("speak")
-        self._prefix_chip.set_chips(labels)
 
     def _select_mode(self, mode: str) -> None:
         if mode not in self.SELECTABLE_MODES:
@@ -652,8 +779,16 @@ class _InputCard(QWidget):
 
     def _on_return(self) -> None:
         text = self._line_edit.text().strip()
-        if text:
-            self.submitted.emit(text)
+        if not text:
+            return
+        options = AskOptions(
+            strong=self._options.is_on("strong"),
+            search=self._options.is_on("search"),
+            write=self._options.is_on("write"),
+            length=self._options.length(),
+        )
+        self._options.reset_one_question()  # the picks last one question
+        self.submitted.emit(text, options)
 
     def _on_clear_area(self) -> None:
         self.set_selected_area(None)
@@ -674,11 +809,12 @@ class Overlay(QObject):
       • AreaSelectorOverlay — the dim-and-drag region picker
     """
 
-    prompt_submitted = pyqtSignal(str, object)  # (prompt, QRect | None)
+    prompt_submitted = pyqtSignal(str, object, object)  # (prompt, QRect | None, AskOptions)
     overlay_dismissed = pyqtSignal()
     mode_changed = pyqtSignal(str)
     allow_shell_changed = pyqtSignal(bool)
     workspace_changed = pyqtSignal(str)
+    speak_changed = pyqtSignal(bool)  # the input bar's speak switch was flipped
     bubble_link_clicked = pyqtSignal(str)
 
     def __init__(self) -> None:
@@ -691,7 +827,7 @@ class Overlay(QObject):
         self._area_selector = AreaSelectorOverlay()
 
         self._selected_area: QRect | None = None
-        # True while a /speak answer is being written or spoken: Esc on the input
+        # True while a speak-switch answer is being written or spoken: Esc on the input
         # bar then only closes the bar (set by the state machine).
         self.input_esc_keeps_answer: Callable[[], bool] = lambda: False
         self.input_esc_closed_at = 0.0  # monotonic time the bar's own Esc last closed just the bar
@@ -703,6 +839,7 @@ class Overlay(QObject):
         self._input_card.mode_changed.connect(self.mode_changed.emit)
         self._input_card.allow_shell_changed.connect(self.allow_shell_changed.emit)
         self._input_card.workspace_changed.connect(self.workspace_changed.emit)
+        self._input_card.speak_changed.connect(self.speak_changed.emit)
         self._bubble.stop_requested.connect(self.dismiss)
         self._bubble.link_clicked.connect(self.bubble_link_clicked.emit)
         self._area_selector.area_selected.connect(self._on_area_selected)
@@ -719,10 +856,16 @@ class Overlay(QObject):
         self._input_card.set_selected_area(self._selected_area)
         self._input_card.show_at_global(cursor_pos.x() + 28, cursor_pos.y() + 4)
 
-    def show_input_with_text(self, text: str) -> None:
-        """Open the input bar with `text` already typed (a voice transcript to edit)."""
+    def show_input_with_text(self, text: str, length: str | None = None, note: str = "") -> None:
+        """Open the input bar with `text` already typed (a voice transcript to edit).
+
+        `length` lights that length button and `note` shows in the hint line; both are set after the
+        fresh-bar reset so it doesn't clear them.
+        """
         self.show_input_near_cursor()
         self._input_card.set_prompt_text(text)
+        self._input_card.set_length(length)
+        self._input_card.set_note(note)
 
     def hide_bubble(self) -> None:
         self._bubble.hide()
@@ -785,6 +928,10 @@ class Overlay(QObject):
         """Push persisted preferences into the input card."""
         self._input_card.apply_mode(mode, workspace, allow_shell)
 
+    def set_speak_switch(self, on: bool) -> None:
+        """Show the saved speak switch in the input bar."""
+        self._input_card.set_speak(on)
+
     def _on_input_cancelled(self) -> None:
         if self.input_esc_keeps_answer():
             self.hide_input()
@@ -818,8 +965,8 @@ class Overlay(QObject):
 
     # --- internals ------------------------------------------------------------
 
-    def _handle_input_submit(self, prompt: str) -> None:
+    def _handle_input_submit(self, prompt: str, options: AskOptions) -> None:
         self._input_card.hide()
         region = self._selected_area
         self._selected_area = None
-        self.prompt_submitted.emit(prompt, region)
+        self.prompt_submitted.emit(prompt, region, options)

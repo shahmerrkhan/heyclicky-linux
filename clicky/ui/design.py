@@ -28,7 +28,7 @@ class Colors:
     MODE_CODE = "#22a06b"
     MODE_WRITE = "#e0a33a"
 
-    # One chip per command.
+    # One colour per option button in the input bar (strong, search, write, speak).
     CHIP_STRONG = "#3a7bff"
     CHIP_SEARCH = "#1fa37a"
     CHIP_WRITE = "#e0a33a"

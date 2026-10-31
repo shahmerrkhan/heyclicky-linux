@@ -1,6 +1,8 @@
-"""/speak: what Clicky says aloud after a typed answer.
+"""The speak switch: what Clicky says aloud after a typed answer.
 
-Voice (Fn+F5) answers don't use this; they are spoken as they stream.
+Fn+F5 voice answers in Vision don't use this; they are spoken as they stream.
+A Code-mode voice transcript sent from the input bar follows the switch, so
+it uses this too.
 
   - Vision: the answer.
   - Code: never any code. "Edited app.py and panel.py." first, then Claude's
@@ -37,7 +39,6 @@ MAX_FILES_NAMED = 3
 
 FAILED_LINE = "Sorry, there was an issue on my end, so that didn't go through."
 REST_IN_BUBBLE = "The rest is in the bubble."
-ASK_LINE = "Hey, what do you want to talk about?"  # /speak sent with no question
 
 SUMMARY_SYSTEM_PROMPT = """\
 you turn a written text into a short spoken summary that will be read aloud by text-to-speech.

@@ -33,12 +33,12 @@ class Settings(BaseSettings):
     )
     gemini_model: str = Field(
         default="gemini-3.8-flash",
-        description="Strong Gemini model: backup when the fast one fails, or first with /p.",
+        description="Strong Gemini model: backup when the fast one fails, or first with the strong button.",
     )
     gemini_thinking_level: str = Field(default="medium", description="Thinking level for GEMINI_MODEL.")
     gemini_fast_model: str = Field(
         default="gemini-3.5-flash-lite",
-        description="Fast Gemini model, answers every question first (unless /p).",
+        description="Fast Gemini model, answers every question first (unless the strong button is on).",
     )
     gemini_fast_thinking_level: str = Field(
         default="medium",
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     )
     strong_request_timeout_s: float = Field(
         default=90.0,
-        description="Seconds the strong model gets when asked for with /p.",
+        description="Seconds the strong model gets when asked for with the strong button.",
     )
     fallback_rounds: int = Field(
         default=3,
@@ -69,7 +69,7 @@ class Settings(BaseSettings):
 
     tavily_api_key: str = Field(
         default="",
-        description="Tavily API key for /s web search. Empty = search off; everything else works.",
+        description="Tavily API key for web search (search button). Empty = search off; everything else works.",
     )
     hotkey: str = Field(
         default="<ctrl>+<alt>+<space>",

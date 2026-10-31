@@ -8,8 +8,8 @@ Clicky is the little AI buddy that lives next to your cursor. Hit a hotkey, ask 
 
 Clicky has three modes you can flip between in the input bar (it always starts in Vision):
 
-- **Vision mode** (default): screenshot + question → Gemini (called directly; add `/p` anywhere in a question for the strong model or `/s` to add Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
-- **Write mode**: messy thoughts → a ready-to-send message, shown in the bubble and typed into the box you were in (see [Writing mode](#writing-mode-w)).
+- **Vision mode** (default): screenshot + question → Gemini (called directly; the **strong** button asks the strong model first, **search** adds Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
+- **Write mode**: messy thoughts → a ready-to-send message, shown in the bubble and typed into the box you were in (see [Writing mode](#writing-mode)).
 - **Code mode**: prompt → spawns `claude -p` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) as a subprocess in a configured workspace → its progress (text + tool calls) streams into the same bubble. Lets you ask Clicky to *do* things in a directory, not just describe what it sees.
 
 ## Quick start
@@ -27,7 +27,7 @@ make install
 # 4. Add your API keys
 cp .env.example .env
 # Open .env in your editor and set GEMINI_API_KEY=... (https://aistudio.google.com/apikey)
-# and, for /s web search, TAVILY_API_KEY=... (https://app.tavily.com, free plan)
+# and, for web search, TAVILY_API_KEY=... (https://app.tavily.com, free plan)
 
 # 5. Run it
 make run
@@ -52,31 +52,60 @@ This writes two small files, with the repo's path filled in at install time: `~/
 - **Logs** (no terminal): `~/.local/state/clicky/clicky.log` (Clicky, 1 MB x 3 files) and `launcher.log` next to it (starts, exits, restarts, crash traces). From a terminal, `make run` logs to the terminal as before.
 - **Stop it:** tray > Quit, or `pkill -TERM -f "python -m clicky"` (a clean stop, no restart). **Don't start it at login:** untick Clicky in Settings > Session and Startup > Application Autostart, or run `make desktop-uninstall`.
 
-## Fast model, strong model, and `/p`
+## Input bar buttons
+
+There are no typed commands: what you type is sent exactly as typed (`/p` or `//s` is just text). Instead, a second row under the text box has buttons. None of them takes focus, so you keep typing.
+
+```
+[Vision|Code|Write]  ask clicky anything…                              ◫ area
+[strong] [search] [write]  [extra short|short|medium|long]       [speak: off]
+```
+
+| Button | Key | Shown in | What it does |
+|---|---|---|---|
+| **strong** | Alt+P | Vision | Strong model first (see below) |
+| **search** | Alt+S | Vision, Write | Tavily web search first (see [Web search](#web-search)) |
+| **write** | Alt+W | Vision | A one-off draft (see [Writing mode](#writing-mode)) |
+| **extra short / short / medium / long** | Alt+4 / 5 / 6 / 7 | all modes | Answer length (below) |
+| **speak** | Alt+K | all modes | Read typed answers aloud (below) |
+
+- **strong**, **search**, **write** and the length last **one question**: they reset after you send and whenever the bar opens fresh.
+- **Length**: one lit at a time; clicking the lit one turns it off. None lit = the normal length. Typed text is never searched for length words; only the buttons set it.
+
+  | | Questions and search | Write drafts | Code: Claude Code's closing report |
+  |---|---|---|---|
+  | none | normal | normal | normal |
+  | extra short | 1 sentence, ≤ ~25 words | 1–2 sentences, ≤ ~35 words | 1 sentence, ≤ ~25 words |
+  | short | 3–5 sentences, ~60–110 words | 3–6 sentences, ~60–120 words | 2–4 sentences, ~40–80 words |
+  | medium | 2 short paragraphs, ~120–180 words | 2 short paragraphs, ~120–170 words | 1–2 short paragraphs, ~100–160 words |
+  | long | 3–6 short paragraphs, ~200–400 words | 2–4 paragraphs, ~200–300 words | 3–5 short paragraphs, ~200–350 words |
+
+  It's one instruction line at the end of the system prompt (Code: `--append-system-prompt`, about the closing report only, never the work itself). No token cap and nothing is cut, so sizes are approximate. The line is never saved into chat memory. In Write mode a length button wins over "make it shorter" in your text.
+- **speak** (on/off, remembered across restarts, off on first run) reads a **typed** answer aloud with Piper once it's complete. Answers over 600 spoken characters get a short summary from the fast model instead. Code mode says which files were edited, then Claude's closing report, never code; Write mode says whether the draft was typed, then reads it. If something fails you hear one short failure line. Esc (held while Clicky speaks), × or Fn+F5 stop it; sending a new question cuts it off, opening the input bar doesn't. With voice off or Piper missing, the bubble says why nothing was spoken. Fn+F5 voice answers don't use the switch (see [Voice](#voice-hold-to-talk)), except a Code-mode transcript sent from the bar, which follows it.
+
+## Fast model, strong model, and the strong button
 
 Every question goes to the **fast model** first (`GEMINI_FAST_MODEL`, default `gemini-3.5-flash-lite`, medium thinking) with a 10-second first-word timer. If it fails, the **strong model** (`GEMINI_MODEL`, default `gemini-3.8-flash`, medium thinking) takes over with a 20-second timer. They alternate fast → strong for 3 rounds, with a 3-second pause between rounds, and then Clicky shows an error.
 
 - Each try gets one retry after 2 seconds if the model says it's busy.
 - Busy, a used-up limit, too slow (no first word in time), and an empty answer all move on to the other model. A blocked answer (safety filter) is shown with its reason. A bad key, unknown model, or bad request stops right away.
 - A model that reports its **daily** limit used up is skipped until midnight Pacific, so later questions go straight to the other one. If both are at their daily limits you get the error immediately.
-- Add **`/p`** anywhere in a question to ask the strong model first, with a 90-second timer. If it fails, the footer says why and the fast model answers instead (no alternating after that).
-- Commands: `/p` (strong) and `/s` (search) work anywhere in the question, in any order and any case — `who won the cup /p /s`, `what is /s the latest python`, `/ps q`, `/Sp q`. Each is removed before the question goes to Gemini or Tavily. A command must stand alone: with a space or the start/end of the text on each side, so `/p,`, `(/s)`, `/usr/bin/python`, `x.com/p` and `10/27` don't count. Anything inside a closed pair of double quotes or backticks is left alone (`"xcopy /s"`), an unclosed quote protects nothing, and `//s` types a literal `/s`. A small **strong** / **search** / **write** chip in the input bar shows what the typed commands will do. Commands apply in vision and writing mode, not in Code mode.
-- **`/speak`** (Vision, Code and Write, stacks with the others, `//speak` for a literal) also reads a typed answer aloud with Piper once it's complete: answers over 600 spoken characters get a short summary from the fast model, then who answered (and how many sources). Code mode says which files were edited and Claude's closing summary, never code; Write mode says whether the draft was typed, then reads it. Esc (held while Clicky speaks), × or Fn+F5 stop it; sending a new question cuts it off, opening the input bar doesn't. With voice off or Piper missing, the bubble says why nothing was spoken.
+- Click **strong** (or Alt+P, or say "power mode") to ask the strong model first, with a 90-second timer. If it fails, the footer says why and the fast model answers instead (no alternating after that).
 - The footer always names the model that answered, e.g. `answered by the strong model (gemini-3.8-flash) after 3 tries — the fast model was busy`. While switching, the bubble shows `trying <model>…`.
 - Once an answer starts it is never cut off. Closing the bubble cancels everything in flight. Both models share one conversation history.
 
-## Web search (`/s`)
+## Web search
 
-Add `/s` anywhere in a question (for example `latest python release /s`) to search the web first. The question, with the commands removed, goes to [Tavily](https://tavily.com) as typed (advanced depth, 10 results, 2 passages per site); the results go to Gemini as untrusted reference text, and a **sources:** line with one link per site appears under the answer. Links open in the browser set by `LINK_BROWSER_COMMAND` (default `opera-gx`).
+Click **search** (or Alt+S, or say "web search") to search the web first. A typed question goes to [Tavily](https://tavily.com) as typed (advanced depth, 10 results, 2 passages per site); the results go to Gemini as untrusted reference text, and a **sources:** line with one link per site appears under the answer. Links open in the browser set by `LINK_BROWSER_COMMAND` (default `opera-gx`).
 
-Without `TAVILY_API_KEY`, or when the month's credits are used up, `/s` questions are answered without search and the bubble footer says why.
+Without `TAVILY_API_KEY`, or when the month's credits are used up, questions with search on are answered without search and the bubble footer says why.
 
-## Writing mode (`/w`)
+## Writing mode
 
 Dump messy thoughts — typed or spoken — and get a ready-to-send message, shown in the bubble **and typed straight into the box you were in**, with no confirm step.
 
-- **Starting it**: the **Write** mode (click it or **Alt+3**), `/w` anywhere in a typed question, or **"write mode"** at the start of a voice request (a one-off draft: you stay in Vision or Code). In Write mode, voice goes straight to drafting. `/s` still searches first; `/p` has no extra effect (writing already starts with the strong model). `/w` is ignored in Code mode.
-- **Tone**: professional by default, short (about 2–5 sentences), plain text, no sign-off unless you ask. Say a different tone in the request ("make it casual") to override it.
+- **Starting it**: the **Write** mode (click it or **Alt+3**), the **write** button in Vision (Alt+W, a one-off draft), or **"write mode"** at the start of a voice request (a one-off draft: you stay in Vision or Code). In Write mode, voice goes straight to drafting. **search** still searches first; there's no strong button in Write mode (writing already starts with the strong model).
+- **Tone**: professional by default, short (about 2–5 sentences, or what a length button says), plain text, no sign-off unless you ask. Say a different tone in the request ("make it casual") to override it.
 - **Model**: the strong model first with `WRITING_STRONG_TIMEOUT_S` (default 30 s) to start, then the fast model.
 - **The screen is read only when needed**: typed requests go to the model as words only; if it can't write without seeing the screen ("reply to this"), it asks, and only then is a screenshot taken — of the window you were in only, with Clicky's own windows hidden. Voice requests that say "reply to this", "answer this email" and similar grab that window right away.
 - **Where it types**: the window that was active when you pressed Ctrl+Alt+Space or Fn+F5. If you've switched windows since, Clicky switches back first; if that window was closed, nothing is typed. Never into Clicky's own windows.
@@ -92,10 +121,11 @@ Clicky always starts in **Vision** mode; the mode you pick isn't saved.
 
 ## Voice (hold to talk)
 
-Hold **Fn+F5** (Linux key code 63, i.e. F5), say your question, let go. Clicky transcribes it on your machine, shows **you said: …**, and answers. Answers to spoken questions are read aloud sentence by sentence; typed questions stay silent.
+Hold **Fn+F5** (Linux key code 63, i.e. F5), say your question, let go. Clicky transcribes it on your machine, shows **you said: …**, and answers. Answers to spoken questions are read aloud sentence by sentence, in full; Esc stops them. Voice drafts in Write mode stay silent. Typed questions are spoken only with the **speak** switch on.
 
-- **Keywords** at the very start: **"power mode"** = strong model (like `/p`), **"web search"** = search (like `/s`), **"write mode"** = a one-off draft (like `/w`), in any order. For a voice web search the fast model first turns your transcript plus the screenshot into a short search query (the footer shows `searched for: …`); typed `/s` searches your text as typed.
-- **Code mode**: the transcript (keywords removed) lands in the input bar so you can fix misheard words; Enter runs it, and the answer is spoken without the tool lines.
+- **Keywords** at the very start: **"power mode"** = strong model (like the strong button), **"web search"** = search (like the search button), **"write mode"** = a one-off draft (like the write button), in any order. For a voice web search the fast model first turns your transcript plus the screenshot into a short search query (the footer shows `searched for: …`); a typed search uses your text as typed.
+- **Length words** anywhere in what you say ("briefly", "in detail", "tl;dr", "walk me through"… full list in `clicky/llm/length.py`) only wake a check; they never set a length on their own. The fast model judges whether each one is an instruction about the answer or part of what you're saying ("tell Sam I'll explain briefly" doesn't count), text only, 3 s. If that fails (busy, limits, timeout, unreadable), the strong model tries (5 s); a model known to be daily-limited is skipped. If both fail, simple rules decide (after "tell X", "say that", "write that" or inside quotes it doesn't count; at the start or end, after "explain", "tell me", "give me", "can you"… or before "please" it does). If the rules can't tell, Vision uses the word anyway and Write and Code use the normal length. The bubble shows "checking length words…" meanwhile (usually under 2 s, worst case about 8 s) and the footer says what was applied: `length: short`, `length: short (checked by simple rules)`, `length: short (not double-checked)`, `length words not checked, so normal length`, or `heard two lengths, so normal length`. The check costs one extra fast-model request, only when a length word is heard, and isn't counted in the questions estimate.
+- **Code mode**: the transcript (keywords removed) lands in the input bar so you can fix misheard words; length words light the matching length button (the hint line says how they were read) and you can change it. Enter runs it; the answer is spoken only with the **speak** switch on (edited files, then the closing report), silent otherwise.
 - **Stopping**: pressing the talk key again, Esc (from any app), closing the bubble, the input-bar hotkey, the tray's **Stop listening / speaking**, or quitting all stop the recorder, Whisper, Piper and playback.
 - **Silence**: nothing heard → "didn't catch that", no Gemini call; silent stretches skip Whisper.
 - **No length limit.** Safety nets instead: the key is re-checked once a second (a lost release stops listening), 2 minutes of pure silence stops it, less than 1 GB free disk stops it, a piece Whisper can't finish in 60 s becomes `[part missing]`, and phrases Whisper repeats more than 3 times in a row are collapsed. Each piece's audio is deleted right after it's transcribed; no recording is kept.
@@ -174,10 +204,10 @@ Overlay (transparent fullscreen PyQt6 window)   ↓ let go: transcript ("power m
    ↓ user types and presses Enter       ↓ (web search: fast model writes the query)
 Screenshot (mss, all monitors)
    ↓
-(/s only) Tavily web search → results as untrusted text
+(search button / "web search" only) Tavily web search → results as untrusted text
    ↓
 Gemini API (google-genai SDK): fast model first (10 s first-word timer),
-   ↓ fails → strong model (20 s), alternating 3 rounds · /p → strong (90 s) then fast
+   ↓ fails → strong model (20 s), alternating 3 rounds · strong button → strong (90 s) then fast
    ↓ streamed chunks
 Bubble UI (text streaming, then sources + notes + usage footer)
    ↓ [POINT:x,y] if present (0-1000 scale, x across then y down)
@@ -190,7 +220,8 @@ Convert to screen pixels (clamped) → blue cursor bezier animation
 | State machine | `clicky/state.py` | `CompanionManager.swift` |
 | LLM streaming client | `clicky/llm/gemini.py` | `ClaudeAPI.swift` |
 | Fast/strong model order, retry, fallback | `clicky/llm/model_router.py` | (new) |
-| `/p` and `/s` commands, spoken keywords | `clicky/llm/prefixes.py` | (new) |
+| Input bar choices, spoken keywords | `clicky/llm/prefixes.py` | (new) |
+| Answer length, voice length check | `clicky/llm/length.py` | (new) |
 | Chat memory (last 5 + summary) | `clicky/llm/memory.py` | (new) |
 | Voice search query | `clicky/llm/search_query.py` | (new) |
 | Talk key | `clicky/input/push_to_talk.py` | (new) |

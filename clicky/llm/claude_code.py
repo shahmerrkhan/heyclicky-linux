@@ -62,11 +62,13 @@ class ClaudeCodeRequest:
     allow_shell: bool = False
     model: str | None = None
     max_turns: int | None = None
+    # Extra system-prompt text (the closing report's length), passed with --append-system-prompt.
+    append_system_prompt: str | None = None
 
 
 @dataclass
 class ClaudeCodeOutcome:
-    """Filled in while a run streams: what /speak reads aloud instead of the whole bubble."""
+    """Filled in while a run streams: what the speak switch reads aloud instead of the whole bubble."""
 
     edited_files: list[str] = field(default_factory=list)  # in first-edit order, no repeats
     closing_text: str = ""  # Claude's text after its last tool call (its own summary)
@@ -178,6 +180,8 @@ class ClaudeCodeClient:
             cmd += ["--model", request.model]
         if request.max_turns is not None:
             cmd += ["--max-turns", str(request.max_turns)]
+        if request.append_system_prompt:
+            cmd += ["--append-system-prompt", request.append_system_prompt]
 
         return cmd
 

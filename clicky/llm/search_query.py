@@ -3,7 +3,7 @@
 Search engines want a few keywords, not minutes of transcript. Before a
 voice "web search", the fast model gets the transcript plus the screenshot
 (so "this error" can become the actual error text) and writes one query.
-Typed /s questions skip this and search with the text as typed.
+Typed questions (search button) skip this and search with the text as typed.
 
 If the step fails, the start of the transcript is used instead, so a
 search still happens.

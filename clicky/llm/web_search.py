@@ -1,4 +1,4 @@
-"""Web search via Tavily, for questions typed with a `/s` prefix (see prefixes.py).
+"""Web search via Tavily, for questions sent with the search button or the spoken "web search".
 
 Results go to Gemini as plain text, clearly marked as untrusted reference
 material, and come back to the bubble as a "sources:" line of links.
