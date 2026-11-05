@@ -87,6 +87,13 @@ class Settings(BaseSettings):
             "The URL is appended as the last argument. Empty = system default browser."
         ),
     )
+    my_name: str = Field(
+        default="",
+        description=(
+            "Your name, for sign-offs in Write mode (\"Best regards,\" then this name). Empty = read it "
+            "from the screen, else the name you gave Clicky before, else Clicky asks once."
+        ),
+    )
     max_tokens: int = Field(
         default=8192,
         description="Output token cap per answer. Includes Gemini's thinking tokens.",

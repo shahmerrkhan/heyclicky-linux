@@ -9,6 +9,15 @@ Order of attempts (the first that works wins):
      file), so nothing the user copied is lost;
   3. key by key with xdotool, in small chunks, line breaks as Shift+Enter.
 
+Where in the box (`where`): at the caret (the default), at the very start or
+end of the box (next to text already there, nothing removed), or "replace":
+the box's whole text swapped for the new text (only when the user asked; see
+fill.py). Start/end fall back to Ctrl+Home / Ctrl+End before pasting or typing.
+
+A follow-up may swap only the part of a box Clicky typed last time (`rewrite_part`):
+that part must be found in the box exactly once (whitespace aside); the rest of the
+box is never touched, and is checked afterwards.
+
 Safety rules:
   - only the remembered window: it's re-checked, focus is handed back to it,
     and nothing is typed unless it really is the active window afterwards;
@@ -28,8 +37,12 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .target import WritingTarget, active_window_target, refresh_target
+
+if TYPE_CHECKING:
+    from .fields import Place
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +62,9 @@ class Method:
     KEYS = "typed key by key"
     REPLACE = "replaced the previous draft"
     REPLACE_PASTE = "replaced the previous draft (select all, paste)"
+    REPLACE_BOX = "replaced the box's text"
+    REPLACE_BOX_PASTE = "replaced the box's text (select all, paste)"
+    REWRITE = "replaced the text it typed last time"
 
 
 @dataclass
@@ -64,10 +80,15 @@ class TypeResult:
 
 @dataclass
 class TypedDraft:
-    """The last draft Clicky typed in full: what and where (for follow-up replacing)."""
+    """The last draft Clicky typed in full: what and where (for follow-up replacing).
+
+    After a draft that went into several boxes, `text` is the main text only and
+    `place` is its box (focus is moved back there before replacing).
+    """
 
     target: WritingTarget
     text: str
+    place: Place | None = None
 
 
 def text_for_target(draft: str, target: WritingTarget) -> str:
@@ -251,6 +272,22 @@ def release_held_keys() -> list[int]:
     return released
 
 
+def find_span(text: str, part: str) -> tuple[int, int] | None:
+    """Where `part` sits in `text` (start, end), whitespace aside — only when it's there exactly once.
+
+    Browsers read line breaks back differently, so all whitespace is ignored when comparing;
+    the span runs from the part's first to its last non-space character.
+    """
+    keep = [i for i, ch in enumerate(text) if not ch.isspace()]
+    flat, wanted = "".join(text[i] for i in keep), _squash(part)
+    if not wanted:
+        return None
+    at = flat.find(wanted)
+    if at < 0 or flat.find(wanted, at + 1) >= 0:
+        return None
+    return keep[at], keep[at + len(wanted) - 1] + 1
+
+
 def _is_active(target: WritingTarget) -> bool:
     active = active_window_target()
     return active is not None and active.window_id == target.window_id
@@ -260,7 +297,9 @@ class DraftTyper:
     def __init__(self) -> None:
         self._restore_task: asyncio.Task | None = None
 
-    async def type_draft(self, target: WritingTarget | None, draft: str, cancel: asyncio.Event) -> TypeResult:
+    async def type_draft(
+        self, target: WritingTarget | None, draft: str, cancel: asyncio.Event, where: str = "caret"
+    ) -> TypeResult:
         if target is None:
             return TypeResult(False, why_not="there was no window to type into")
         if target.pid == os.getpid():
@@ -270,23 +309,61 @@ class DraftTyper:
             return TypeResult(False, why_not=f"{target.app_name} was closed")
         if not await self._activate(current):
             return TypeResult(False, why_not=f"couldn't switch back to {target.app_name}")
-        text = text_for_target(draft, current)
-        if not text:
+        # Text added next to existing text keeps its leading/trailing line breaks (the gap).
+        text = text_for_target(draft, current) if where == "caret" or current.is_terminal else draft
+        if not text.strip():
             return TypeResult(False, why_not="the draft was empty")
         if cancel.is_set():
             return TypeResult(False, why_not="stopped before typing", stopped=True)
+        if where == "replace":
+            return await self._replace_box(current, text)
 
         if not current.is_terminal and current.pid is not None:
-            result = await atspi("insert", current.pid, text=text)
+            args = (where,) if where in ("start", "end") else ()
+            result = await atspi("insert", current.pid, *args, text=text)
             if result.get("ok"):
                 return TypeResult(True, Method.INSERT, text, len(text), insert_offset=result.get("offset"))
             logger.info("direct insert not possible: %s", result.get("why"))
 
         if cancel.is_set():
             return TypeResult(False, why_not="stopped before typing", stopped=True)
+        if where in ("start", "end"):
+            key = "ctrl+Home" if where == "start" else "ctrl+End"
+            try:
+                await _run("xdotool", "key", "--clearmodifiers", key, timeout=3)
+            except (TimeoutError, OSError):
+                return TypeResult(False, why_not=f"couldn't move to the {where} of the box")
         if await self._paste(current, text):
             return TypeResult(True, Method.PASTE, text, len(text))
         return await self._keys(current, text, cancel)
+
+    async def _replace_box(self, target: WritingTarget, text: str) -> TypeResult:
+        """The box's whole text swapped for `text` (the user asked for it). Confirmed afterwards when readable."""
+        if target.pid is None or target.is_terminal:
+            return TypeResult(False, why_not="Clicky can't replace text in that window")
+        read = await atspi("read", target.pid)
+        if read.get("ok") and read.get("editable"):
+            done = await atspi("replace", target.pid, "0", str(len(read.get("text", ""))), text=text)
+            if not done.get("ok"):
+                return TypeResult(False, why_not="couldn't replace the text in that box, so it was left alone")
+            method = Method.REPLACE_BOX
+        else:
+            try:
+                await _run("xdotool", "key", "--clearmodifiers", "ctrl+a", timeout=3)
+            except (TimeoutError, OSError):
+                return TypeResult(False, why_not="couldn't select the text in that box, so it was left alone")
+            if not await self._paste(target, text):
+                return TypeResult(False, why_not="couldn't paste over the text in that box")
+            method = Method.REPLACE_BOX_PASTE
+        await asyncio.sleep(0.3)
+        after = await atspi("read", target.pid)
+        if after.get("ok") and _squash(after.get("text", "")) != _squash(text):
+            return TypeResult(False, why_not="couldn't confirm the new text is in the box")
+        return TypeResult(True, method, text, len(text))
+
+    async def activate(self, target: WritingTarget) -> bool:
+        """Bring the remembered window back to the front (True once it's active)."""
+        return await self._activate(target)
 
     async def _activate(self, target: WritingTarget) -> bool:
         if _is_active(target):
@@ -425,6 +502,62 @@ class DraftTyper:
         if not after.get("ok") or _squash(after.get("text", "")) != _squash(new_text):
             return TypeResult(False, why_not="couldn't confirm the new version is in the box")
         return TypeResult(True, Method.REPLACE_PASTE, new_text, len(new_text))
+
+    async def rewrite_part(self, target: WritingTarget, old: str, new: str, cancel: asyncio.Event) -> TypeResult:
+        """Swap the text Clicky typed last time (`old`) for `new` in the focused box; nothing else changes.
+
+        Native apps: replaced directly. Readable but not editable (Chrome, Opera): the old
+        part is selected through accessibility (and the selection read back), deleted with
+        BackSpace, checked, then the new text is typed at the caret.
+        """
+        if target.pid is None or target.is_terminal:
+            return TypeResult(False, why_not="Clicky can't read that box")
+        read = await atspi("read", target.pid)
+        if not read.get("ok"):
+            return TypeResult(False, why_not="Clicky can't read that box, so it can't tell which part it typed")
+        before = read.get("text", "")
+        span = find_span(before, old)
+        if span is None:
+            return TypeResult(False, why_not="Clicky can't tell which part of that box is the text it typed")
+        start, end = span
+        expected = _squash(before[:start] + new + before[end:])
+        if cancel.is_set():
+            return TypeResult(False, why_not="stopped before replacing", stopped=True)
+        if read.get("editable"):
+            done = await atspi("replace", target.pid, str(start), str(end - start), text=new)
+            if not done.get("ok"):
+                return TypeResult(False, why_not="couldn't replace the earlier text, so it was left alone")
+            await asyncio.sleep(0.3)
+            after = await atspi("read", target.pid)
+            if not after.get("ok") or _squash(after.get("text", "")) != expected:
+                return TypeResult(False, why_not="couldn't confirm the new version is in the box")
+            return TypeResult(True, Method.REWRITE, new, len(new))
+        selected = await atspi("select", target.pid, str(start), str(end))
+        if not selected.get("ok") or _squash(selected.get("text", "")) != _squash(old):
+            return TypeResult(False, why_not="couldn't select the earlier text, so it was left alone")
+        try:
+            await _run("xdotool", "key", "--clearmodifiers", "BackSpace", timeout=3)
+        except (TimeoutError, OSError):
+            return TypeResult(False, why_not="couldn't remove the earlier text, so it was left alone")
+        await asyncio.sleep(0.3)
+        after = await atspi("read", target.pid)
+        if not after.get("ok") or _squash(after.get("text", "")) != _squash(before[:start] + before[end:]):
+            # Something other than the earlier text changed: undo it and stop.
+            try:
+                await _run("xdotool", "key", "--clearmodifiers", "ctrl+z", timeout=3)
+            except (TimeoutError, OSError):
+                logger.warning("couldn't undo an unexpected change")
+            return TypeResult(False, why_not="the box didn't change as expected, so the change was undone")
+        result = await self.type_draft(target, new, cancel, "caret")
+        if not result.typed or result.why_not or result.stopped:
+            if not result.why_not and not result.stopped:
+                result.why_not = "the earlier text was removed, but the new version couldn't be typed"
+            return result
+        await asyncio.sleep(0.3)
+        after = await atspi("read", target.pid)
+        if after.get("ok") and _squash(after.get("text", "")) != expected:
+            return TypeResult(False, typed_chars=result.typed_chars, why_not="couldn't confirm the new version is in the box")
+        return TypeResult(True, Method.REWRITE, new, len(new))
 
     async def aclose(self) -> None:
         if self._restore_task is not None and not self._restore_task.done():

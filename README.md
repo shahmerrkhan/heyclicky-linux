@@ -9,7 +9,7 @@ Clicky is the little AI buddy that lives next to your cursor. Hit a hotkey, ask 
 Clicky has three modes you can flip between in the input bar (it always starts in Vision):
 
 - **Vision mode** (default): screenshot + question → Gemini (called directly; the **strong** button asks the strong model first, **search** adds Tavily web search results) → answer streams into a bubble, optionally pointing at something on screen.
-- **Write mode**: messy thoughts → a ready-to-send message, shown in the bubble and typed into the box you were in (see [Writing mode](#writing-mode)).
+- **Write mode**: messy thoughts → a ready-to-send message, shown in the bubble and typed into the right boxes of the window you were in (see [Writing mode](#writing-mode)).
 - **Code mode**: prompt → spawns `claude -p` ([Claude Code](https://docs.anthropic.com/en/docs/claude-code)) as a subprocess in a configured workspace → its progress (text + tool calls) streams into the same bubble. Lets you ask Clicky to *do* things in a directory, not just describe what it sees.
 
 ## Quick start
@@ -102,18 +102,21 @@ Without `TAVILY_API_KEY`, or when the month's credits are used up, questions wit
 
 ## Writing mode
 
-Dump messy thoughts — typed or spoken — and get a ready-to-send message, shown in the bubble **and typed straight into the box you were in**, with no confirm step.
+Dump messy thoughts — typed or spoken — and get a ready-to-send message, shown in the bubble **and typed straight into the right boxes of the window you were in**, with no confirm step. If Clicky can't tell which box is meant, it asks you to click it.
 
 - **Starting it**: the **Write** mode (click it or **Alt+3**), the **write** button in Vision (Alt+W, a one-off draft), or **"write mode"** at the start of a voice request (a one-off draft: you stay in Vision or Code). In Write mode, voice goes straight to drafting. **search** still searches first; there's no strong button in Write mode (writing already starts with the strong model).
-- **Tone**: professional by default, short (about 2–5 sentences, or what a length button says), plain text, no sign-off unless you ask. Say a different tone in the request ("make it casual") to override it.
+- **Tone**: professional by default, short (about 2–5 sentences, or what a length button says), plain text; Clicky then fits it to the app you're in (see **Where it types**). Say a different tone in the request ("make it casual") to override it.
 - **Model**: the strong model first with `WRITING_STRONG_TIMEOUT_S` (default 30 s) to start, then the fast model.
 - **The screen is read only when needed**: typed requests go to the model as words only; if it can't write without seeing the screen ("reply to this"), it asks, and only then is a screenshot taken — of the window you were in only, with Clicky's own windows hidden. Voice requests that say "reply to this", "answer this email" and similar grab that window right away.
-- **Where it types**: the window that was active when you pressed Ctrl+Alt+Space or Fn+F5. If you've switched windows since, Clicky switches back first; if that window was closed, nothing is typed. Never into Clicky's own windows.
+- **Where it types**: the window that was active when you pressed Ctrl+Alt+Space or Fn+F5 (Clicky switches back to it; if it was closed, nothing is typed; never into Clicky's own windows). First Clicky takes a screenshot of the whole screen (its own windows hidden) and lists that window's text boxes. The fast model (4 s, then the strong model, 6 s) decides what goes in which box, in what order, and writes the final text for that app: in an email app a full email (To, Subject, then "Hey Sam," / the message / "Thanks," or "Best regards," and your name); in a text editor the message only; in a chat app a plain message. Terminals skip this.
+- **Safety rules**: text already in a box is never removed unless your request clearly asks for it, in your own words; text can be added before or after it. Email addresses, phone numbers and links must appear in your words, the draft or the window. Focus is confirmed in each box before typing (accessibility first; otherwise one click inside that window, with the pointer put back). If anything fails, nothing more is typed: the bubble says why, shows the text and copies it to your clipboard.
+- **Not sure where**: the bubble asks you to click the box, then reply "done" (input box or Fn+F5). With several pieces, each box you click gets the piece that fits it. Any other message ends the wait and runs as a new question; Esc or × ends it; after 30 s it stops waiting.
+- **Your name** for sign-offs: `MY_NAME` in .env, else read from the screen, else the name you gave before, else Clicky asks once (reply in the input box or by voice; it's remembered).
 - **How it types**, first that works: direct insert through accessibility (AT-SPI) → paste (your clipboard text is put back about a second later; if the clipboard holds an image or file, paste is skipped) → key by key (line breaks as Shift+Enter, so chat apps don't send early). If focus moves away while typing key by key, typing stops (at most one 24-character chunk may still land in the new window).
 - **Terminals**: line breaks become spaces and Enter is **never** pressed; the bubble explains that pressing Enter would run the text as a command.
-- **Esc while typing** stops it; the app you're typing into never sees that Esc (Clicky holds Esc only while typing; the X server releases it even if Clicky crashes). If Esc can't be held, nothing is typed. The bubble stays open: "Stopped after N characters", with the full draft above.
-- **Follow-ups** ("make it shorter"): the previous draft is replaced only when Clicky can read the box and the draft is still there exactly as typed — in Chrome and Opera (which need the launcher flag below to be readable) only when the box holds nothing but the draft. Otherwise nothing is touched and the new version is copied to your clipboard. Clicky never deletes anything of yours.
-- Whenever a draft isn't typed (or only partly), the full draft is copied to your clipboard and the bubble says why.
+- **Esc while typing** stops it; the app you're typing into never sees that Esc (Clicky holds Esc only while typing; the X server releases it even if Clicky crashes). If Esc can't be held, nothing is typed. The bubble stays open, says how far it got and shows the rest. Esc while Clicky checks where to type stops the check; nothing is typed.
+- **Follow-ups** ("make it shorter", "also write the subject"): in the same window, a follow-up goes through the same where-to-type check, which is also told what Clicky typed last time and into which boxes. Clicky rewrites only the part it typed itself, and only when it finds that text in the box exactly once (in Chrome and Opera this needs the launcher flag below); everything else in the box stays, such as a signature, a quoted reply, or your own lines around it. It can also fill boxes that are still empty. If Clicky can't find its own text, nothing is typed and the new version is shown and copied to your clipboard. In a terminal, a follow-up isn't replaced in place; the new version is copied to your clipboard. Clicky never deletes anything of yours.
+- Whenever a draft isn't typed, or only partly, the part that wasn't typed is copied to your clipboard and the bubble says why.
 
 Chrome and Opera don't let accessibility insert text, so drafts are pasted there. To let Clicky *read* their text boxes (for follow-ups), start them with `--force-renderer-accessibility=form-controls`.
 
@@ -172,7 +175,7 @@ Both are saved to `~/.local/state/clicky/usage.json`.
 
 Dark glass cards with Noto Sans type, one colour per mode — **Vision** blue, **Code** green, **Write** amber — used on the mode switch and the bubble's tag.
 
-- **Input bar**: a Vision / Code / Write switch (click, or **Alt+1** / **Alt+2** / **Alt+3**), a box that grows with your text up to 8 lines and then scrolls (**Enter** sends, **Shift+Enter** adds a line, **Esc** closes), one chip per typed command (**strong**, **search**, **write**), and the ◫ area button.
+- **Input bar**: a Vision / Code / Write switch (click, or **Alt+1** / **Alt+2** / **Alt+3**), a box that grows with your text up to 8 lines and then scrolls (**Enter** sends, **Shift+Enter** adds a line, **Esc** closes), the ◫ area button, and a row of buttons under it (see [Input bar buttons](#input-bar-buttons)). In Code mode a third row shows the workspace and the `shell: off` switch.
 - **Listening pill**: while you hold the talk key, a small pill near the cursor shows a red dot and the time.
 - **Bubble**: up to 560 px wide, with the mode tag and × at the top, a quiet *you said: …* line for voice questions, the answer, and the footer. It never takes focus, so the window you were in stays focused.
 
@@ -212,7 +215,8 @@ Gemini API (google-genai SDK): fast model first (10 s first-word timer),
 Bubble UI (text streaming, then sources + notes + usage footer)
    ↓ [POINT:x,y] if present (0-1000 scale, x across then y down)
 Convert to screen pixels (clamped) → blue cursor bezier animation
-   (voice questions only) Piper reads the answer aloud, sentence by sentence → pacat
+   Piper reads the answer aloud → pacat (voice questions sentence by sentence; typed ones with speak on, once complete)
+   (Write mode) where-to-type check: box list + screenshot → fast model → typing chain (AT-SPI → paste → key by key)
 ```
 
 | Part | File | macOS counterpart |
@@ -242,11 +246,20 @@ Convert to screen pixels (clamped) → blue cursor bezier animation
 | Usage estimates (daily Gemini, monthly Tavily) | `clicky/usage_store.py` | (new) |
 | Worker proxy (legacy, unused by vision mode) | `worker/src/index.ts` | same idea, OpenAI-flavored |
 | Claude Code agent | `clicky/llm/claude_code.py` | (new — no macOS counterpart yet) |
-| Mode + workspace persistence | `clicky/state_store.py` | (new — no macOS counterpart yet) |
+| Saved settings (workspace, shell switch, voice and speak switches, your name; the mode is never saved) | `clicky/state_store.py` | (new — no macOS counterpart yet) |
+| Write mode: where to type | `clicky/writing/fields.py` | (new) |
+| Write mode: safety rules, click wait | `clicky/writing/fill.py` | (new) |
+| Your name for sign-offs | `clicky/writing/my_name.py` | (new) |
+| Typing chain, follow-up rewrite | `clicky/writing/typer.py`, `atspi_helper.py` | (new) |
+| Target window | `clicky/writing/target.py` | (new) |
+| Esc held while typing or speaking | `clicky/writing/esc_guard.py` | (new) |
+| Spoken summaries (speak switch) | `clicky/llm/spoken.py` | (new) |
+| Only one copy runs | `clicky/single_instance.py` | (new) |
+| Desktop launcher | `scripts/clicky-launch` | (new) |
 
 ## Linux-specific choices
 
-- **X11 + GNOME** is the primary target. On Wayland, `pynput` global hotkeys don't work reliably on most setups — that path will come later.
+- **X11** is the primary target (developed on XFCE). On Wayland, `pynput` global hotkeys don't work reliably on most setups — that path will come later.
 - **Default hotkey is `Ctrl+Alt+Space`** (modifier-only `Ctrl+Alt` doesn't trigger reliably on Linux). Override it in `.env`.
 - **GNOME 45+**: you need the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension for the tray icon to show up.
 - **Screenshot downscaling**: each monitor is resized to a 1600 px long edge before sending to keep payloads small. The model points on a 0-1000 scale, so the downscale never affects where the cursor lands.
@@ -263,8 +276,8 @@ make dev             # Run the app with DEBUG logging
 - [x] Code mode — Claude Code subprocess as a Clicky backend
 - [ ] Native GUI tools (click, type, scroll) via Gemini tool-calling, with per-action confirmation bubbles
 - [ ] Per-tool confirmation in Code mode via Claude Code `PreToolUse` hooks (IPC socket)
-- [ ] Microphone + AssemblyAI streaming (push-to-talk)
-- [ ] ElevenLabs TTS playback
+- [x] Push-to-talk voice (local whisper.cpp)
+- [x] Read answers aloud (local Piper)
 - [ ] Wayland fallback (XDG Portal screenshot, evdev hotkey)
 - [ ] Onboarding flow
 - [ ] PyInstaller single-file binary
@@ -272,9 +285,10 @@ make dev             # Run the app with DEBUG logging
 
 ## Credits
 
-- Original idea, design, and macOS implementation: [**clicky.so**](https://clicky.so) by [@farzaa](https://github.com/farzaa/clicky). Go look at the original — it's the real deal.;
+- Original idea, design, and macOS implementation: [**clicky.so**](https://clicky.so) by [@farzaa](https://github.com/farzaa/clicky). Go look at the original — it's the real deal.
 - This repo: a from-scratch Linux re-implementation in Python/PyQt6, written as a tribute so Linux users can run something close to the same experience.
 - This fork builds on [msari06/clicky-linux](https://github.com/msari06/clicky-linux) by Mehmet Sari, which was itself built from Farza's Clicky.
+
 ## License
 
 MIT (matches the original Clicky).

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, replace
@@ -50,6 +51,32 @@ from .tts.piper import PiperSpeaker, SpokenAnswer, play_error_sound
 from .writing.target import WritingTarget, active_window_target, refresh_target
 from .writing.esc_guard import SPEECH_MARGIN_S, EscGrab, speaking_time_s, typing_deadline_s
 from .writing.typer import DraftTyper, TypedDraft, TypeResult, explanation, set_clipboard_text
+from .writing.fields import (
+    FAILED,
+    FAILED_TEXT,
+    STOP,
+    UNSURE,
+    CheckResult,
+    Earlier,
+    Step,
+    check_plan,
+    focused_field,
+    match_piece,
+    move_to,
+)
+from .writing.fill import (
+    WAIT_S,
+    FillOutcome,
+    click_wait,
+    is_done,
+    outcome_line,
+    remember_typed,
+    run_steps,
+    shown_text,
+    type_into_clicked,
+    vet,
+)
+from .writing import my_name
 from .writing.screen_request import (
     REVISION_INSTRUCTIONS,
     SCREEN_INSTRUCTIONS,
@@ -86,6 +113,28 @@ class VoiceQuestion:
     parsed: ParsedPrompt
     screens: list[CapturedScreen]
     note: str | None = None  # why listening stopped, when a safety net stopped it
+
+
+@dataclass
+class _Waiting:
+    """Clicky is waiting for the user: to click the box(es) ("box") or to give their name ("name")."""
+
+    kind: str
+    replies: asyncio.Queue  # what the user sends meanwhile (input box or Fn+F5)
+    task: asyncio.Task | None  # the Write run that is waiting (Esc, × or another question cancels it)
+
+
+class _KnownTranscript:
+    """Stands in for a listener when a spoken reply turns out to be a new question."""
+
+    def __init__(self, transcript: str) -> None:
+        self._transcript = transcript
+
+    async def finish(self) -> str:
+        return self._transcript
+
+    async def cancel(self) -> None:
+        return None
 
 
 # Matches a leading `@<path> rest of prompt`. Supports quoted paths so that
@@ -161,7 +210,13 @@ class CompanionStateMachine(QObject):
         self._writing_target: WritingTarget | None = None
         self._typer = DraftTyper()
         self._typing_cancel: asyncio.Event | None = None
-        self._last_draft: TypedDraft | None = None  # typed in full; a follow-up may replace it
+        self._last_draft: TypedDraft | None = None  # typed plainly (terminals); a follow-up may replace it
+        # A checked draft: what went into which box, by window id (a follow-up there is checked again).
+        self._last_fill: tuple[int, list[Earlier]] | None = None
+        self._check_task: asyncio.Task | None = None  # the where-to-type check (Esc stops it)
+        self._waiting: _Waiting | None = None  # the click wait or the name question
+        self._wait_voice_task: asyncio.Task | None = None  # a spoken reply while waiting
+        self._pending_question: tuple[str, bool] | None = None  # (text, spoken): runs once the draft is done
         self._listen_timer = QTimer(self)
         self._listen_timer.setInterval(1000)
         self._listen_timer.timeout.connect(self._show_listening)
@@ -226,8 +281,9 @@ class CompanionStateMachine(QObject):
     def trigger_open_input(self) -> None:
         """Called when the hotkey fires or the tray icon is clicked."""
         self._note_writing_target()  # before the input bar takes focus
-        if self._speak_active():
-            # A speak-switch answer keeps being written and spoken; only sending cuts it off.
+        if self._speak_active() or self._waiting is not None:
+            # A speak-switch answer keeps being written and spoken, and a waiting draft keeps
+            # waiting (the bar is how the user replies); only sending cuts them off.
             self._set_state(CompanionState.AWAITING_PROMPT)
             self._overlay.show_input_near_cursor()  # also hides the answer bubble
             return
@@ -244,7 +300,8 @@ class CompanionStateMachine(QObject):
             return
         self._note_writing_target()
         self._stop_voice_processes()  # kills Piper before Whisper can be needed
-        self._cancel_current_task()
+        if self._waiting is None:  # a waiting draft hears the reply first
+            self._cancel_current_task()
         self._voice_busy = True
 
         listener = VoiceListener(
@@ -277,7 +334,11 @@ class CompanionStateMachine(QObject):
             AutoStop.DISK: "stopped listening: less than 1 GB of disk space left.",
             "lost": "stopped listening: the talk key's release was missed.",
         }.get(why)
-        self._current_task = asyncio.ensure_future(self._finish_voice(listener, start, note))
+        task = asyncio.ensure_future(self._finish_voice(listener, start, note))
+        if self._waiting is not None:
+            self._wait_voice_task = task  # the waiting draft stays the current task
+        else:
+            self._current_task = task
 
     def escape_pressed(self) -> None:
         """Esc from any app: stops a voice question or a spoken answer (typed ones use their own Esc).
@@ -289,6 +350,17 @@ class CompanionStateMachine(QObject):
         if self._speech_grab is not None:
             return
         if self._stop_typing():
+            return
+        if self._check_task is not None and not self._check_task.done():
+            self._check_task.cancel()  # nothing is typed; the draft stays in the bubble
+            return
+        if self._waiting is not None:
+            if self._overlay.input_visible():
+                self._overlay.hide_input()
+                return
+            if time.monotonic() - self._overlay.input_esc_closed_at < _SAME_ESC_S:
+                return  # the bar already closed on this same Esc
+            self._overlay.dismiss()  # the wait ends; nothing is typed
             return
         if self._speak_active():
             # Esc wasn't grabbed: the bar sees this Esc too. Either way it closes only the bar.
@@ -331,6 +403,10 @@ class CompanionStateMachine(QObject):
 
     def _on_prompt_submitted(self, prompt: str, region: QRect | None, options: AskOptions | None = None) -> None:
         options = options or AskOptions()
+        if self._waiting is not None:
+            if self._offer_reply(prompt, spoken=False):
+                return
+            self._end_wait()  # anything else ends the wait and runs as a new question
         # The speak switch: typed questions, and a Code-mode voice transcript sent from the bar.
         speak = self._persisted.speak_on
         self._stop_voice_processes()
@@ -372,6 +448,9 @@ class CompanionStateMachine(QObject):
         self._speak_task = self._current_task if speak else None
 
     def _on_overlay_dismissed(self) -> None:
+        self._end_wait()
+        if self._wait_voice_task is not None and not self._wait_voice_task.done():
+            self._wait_voice_task.cancel()
         self._cancel_current_task()
         self._stop_voice_processes()
         self._voice_busy = False
@@ -419,6 +498,15 @@ class CompanionStateMachine(QObject):
         try:
             if start is not None:
                 await asyncio.gather(start, return_exceptions=True)
+            known: str | None = None
+            if self._waiting is not None:
+                # A reply to a waiting draft ("done", a name); anything else ends the wait.
+                known = await listener.finish()
+                if not known.replace(PART_MISSING, "").strip() or self._offer_reply(known, spoken=True):
+                    self._voice_busy = False
+                    return
+                self._end_wait()
+                self._current_task = asyncio.current_task()
             code_mode = self._persisted.agent_mode == "code"
             writing_mode = self._persisted.agent_mode == "writing"
             screens: list[CapturedScreen] = []
@@ -435,7 +523,7 @@ class CompanionStateMachine(QObject):
             self._overlay.update_bubble_text("transcribing…")
             self._overlay.show_bubble_near_cursor()
 
-            transcript = await listener.finish()
+            transcript = known if known is not None else await listener.finish()
             if note:
                 self._overlay.update_bubble_footer(html.escape(note))
 
@@ -895,28 +983,42 @@ class CompanionStateMachine(QObject):
             succeeded = (
                 bool(draft) and not reply.was_blocked and not reply.was_cut_off and answer.interrupted_error is None
             )
+            # Only a draft typed plainly (terminals) is replaced in place; every other
+            # follow-up goes through the where-to-type check again.
+            replacing = (
+                succeeded
+                and is_revision(reply.text)
+                and self._last_draft is not None
+                and target is not None
+                and self._last_draft.target.window_id == target.window_id
+            )
+            # Terminals keep the plain typing (no check); everything else is checked first.
+            plain = replacing or (target is not None and target.is_terminal)
             if succeeded:
                 self._usage.record_question(used_search=search is not None)
-                self._memory.add(question, draft)
+                if plain:
+                    self._memory.add(question, draft)  # otherwise once the final text is known
 
             show(_final_draft_text(answer, draft))
             notes = " ".join(n for n in (note, search_note, length_note) if n) or None
             self._overlay.update_bubble_footer(self._vision_footer_html(search, notes, answer))
             if succeeded:
-                replacing = is_revision(reply.text) and self._last_draft is not None
                 if replacing:
                     result = await self._replace_draft(draft)
-                else:
-                    result = await self._type_draft(draft, target)
-                if speak:
                     status = speech_text.write_status_line(result, self._draft_copied, replacing)
-                    if status is not None:  # None: Esc stopped the typing, so say nothing
-                        body = await speech_text.fit_for_speech(draft, "writing", self._summarizer())
-                        self._say(speech_text.join_spoken(status, body))
+                elif plain:
+                    result = await self._type_draft(draft, target)
+                    status = speech_text.write_status_line(result, self._draft_copied, replacing)
+                else:
+                    status = await self._place_and_type(draft, question, target)
+                if speak and status is not None:  # None: Esc stopped the typing, so say nothing
+                    body = await speech_text.fit_for_speech(draft, "writing", self._summarizer())
+                    self._say(speech_text.join_spoken(status, body))
             elif speak:
                 self._say(speech_text.FAILED_LINE)
             self._end_speech(None, None, error=voice and not succeeded)
             self._finish_question()
+            self._run_pending_question()
 
         except RouterError as exc:
             logger.warning("no gemini draft: %s", exc)
@@ -990,12 +1092,10 @@ class CompanionStateMachine(QObject):
         """A follow-up ("make it shorter"): swap the previous draft only if it's provably untouched."""
         previous = self._last_draft
         assert previous is not None
-        result = await self._with_esc_grab(
-            draft, lambda cancel: self._typer.replace_previous(previous, draft, cancel)
-        )
+        result = await self._with_esc_grab(draft, lambda cancel: self._replace_at(previous, draft, cancel))
         self._draft_copied = False
         if result.typed and not result.why_not:
-            self._last_draft = TypedDraft(previous.target, result.text)
+            self._last_draft = TypedDraft(previous.target, result.text, previous.place)
             self._explain(explanation(result, previous.target, False))
             return result
         copied = await set_clipboard_text(draft)
@@ -1004,28 +1104,304 @@ class CompanionStateMachine(QObject):
         self._explain(f"Not replaced: {result.why_not}.{note}")
         return result
 
-    async def _with_esc_grab(self, draft: str, run) -> TypeResult:
+    async def _replace_at(self, previous: TypedDraft, draft: str, cancel: asyncio.Event) -> TypeResult:
+        """A draft typed into several boxes: focus goes back to its main box first."""
+        if previous.place is not None:
+            target = refresh_target(previous.target)
+            if target is None:
+                return TypeResult(False, why_not=f"{previous.target.app_name} was closed")
+            if not await self._typer.activate(target):
+                return TypeResult(False, why_not=f"couldn't switch back to {target.app_name}")
+            ok, why, _ = await move_to(target, previous.place)
+            if not ok:
+                return TypeResult(False, why_not=f"couldn't get back to the box it was typed in ({why})")
+        return await self._typer.replace_previous(previous, draft, cancel)
+
+    async def _with_esc_grab(self, draft: str, run, refused=None):
         """Run a typing job while Esc is grabbed; Esc (or the watchdog) stops it.
 
-        If Esc can't be grabbed, nothing is typed.
+        If Esc can't be grabbed, nothing is typed (`refused(why)` builds that result;
+        a TypeResult by default).
         """
         cancel = asyncio.Event()
         loop = asyncio.get_running_loop()
         # Esc is held while typing: it stops the typing and never reaches the app.
         esc = EscGrab(lambda: loop.call_soon_threadsafe(cancel.set), typing_deadline_s(draft))
         if not esc.acquire():
-            return TypeResult(
-                False, why_not="Clicky couldn't hold the Esc key (another program has it), so nothing was typed"
-            )
+            why = "Clicky couldn't hold the Esc key (another program has it), so nothing was typed"
+            return refused(why) if refused is not None else TypeResult(False, why_not=why)
         self._typing_cancel = cancel
         try:
             result = await run(cancel)
         finally:
             self._typing_cancel = None
             esc.release()
-        if esc.expired and not result.why_not:
+        if esc.expired and isinstance(result, TypeResult) and not result.why_not:
             result.why_not = "typing took too long"
+        if esc.expired and isinstance(result, FillOutcome) and result.stopped:
+            result.stopped, result.why = False, "typing took too long"
         return result
+
+    # --- where the draft goes (every Write draft outside terminals) ---------------------
+
+    async def _place_and_type(self, draft: str, request: str, target: WritingTarget | None) -> str | None:
+        """Work out what goes in which box (fields.py), apply the safety rules (fill.py), then type.
+
+        Returns the spoken status line (None: say nothing, Esc stopped the typing).
+        """
+        self._explain("checking where to type…")
+        self._ensure_clients()
+        earlier = self._earlier_in(target)
+        check = asyncio.ensure_future(
+            check_plan(
+                draft, request, target, self._gemini, settings.gemini_fast_model, settings.gemini_model,
+                self._usage, self._capture_whole_screen, earlier=earlier,
+            )
+        )
+        self._check_task = check
+        try:
+            result: CheckResult = await check
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise  # the whole run was cancelled (bubble closed, a new question)
+            self._memory.add(request, draft)
+            return await self._nothing_typed(draft, "Stopped before typing.", draft)
+        finally:
+            self._check_task = None
+
+        if result.status == FAILED:
+            logger.info("where-to-type check failed: %s", result.why)
+            self._memory.add(request, draft)
+            return await self._nothing_typed(draft, f"Not typed: {result.why}.", f"{FAILED_TEXT}\n\n{draft}")
+        steps = result.steps
+        why = (result.why or "it couldn't be done in that window") if result.status == STOP else None
+        why = why or vet(steps, request, draft, result.fields, earlier)
+        if why is not None:
+            known, _ = my_name.pick_name(settings.my_name, result.name_on_screen, self._persisted.my_name)
+            shown = shown_text([replace(s, text=my_name.fill_name(s.text, known)) for s in steps]) if steps else draft
+            self._memory.add(request, draft)
+            return await self._nothing_typed(shown, f"Not typed: {why}.", f"Didn't type anything: {why}.\n\n{shown}")
+
+        name_note = ""
+        if my_name.needs_name([s.text for s in steps]):
+            name, _ = my_name.pick_name(settings.my_name, result.name_on_screen, self._persisted.my_name)
+            if name is None:
+                unsigned = [replace(s, text=my_name.fill_name(s.text, None)) for s in steps]
+                self._overlay.update_bubble_text(shown_text(unsigned))
+                name, name_note = await self._ask_name()
+            steps = [replace(s, text=my_name.fill_name(s.text, name)) for s in steps]
+        shown = shown_text(steps)
+        self._overlay.update_bubble_text(shown)
+        self._memory.add(request, shown)  # every piece and what it is: a follow-up builds on this
+
+        if result.status == UNSURE:
+            status = await self._click_wait(steps, result)
+        else:
+            assert target is not None
+            outcome = await self._with_esc_grab(
+                "\n".join(s.text for s in steps),
+                lambda cancel: run_steps(
+                    target, steps, self._typer.type_draft, cancel, self._typer.activate, move_to,
+                    earlier, self._typer.rewrite_part,
+                ),
+                refused=lambda why: FillOutcome(rest=list(steps), why=why),
+            )
+            status = await self._report_fill(outcome, result, target, earlier)
+        if name_note:
+            self._add_note(name_note)
+        return status
+
+    def _earlier_in(self, target: WritingTarget | None) -> list[Earlier]:
+        """What Clicky typed last time in this window, from a checked draft (empty: not a follow-up)."""
+        if self._last_fill is None or target is None or self._last_fill[0] != target.window_id:
+            return []
+        return list(self._last_fill[1])
+
+    def _remember_fill(self, window_id: int, earlier: list[Earlier], typed) -> None:
+        pieces = remember_typed(earlier, typed)
+        self._last_fill = (window_id, pieces) if pieces else None
+
+    async def _nothing_typed(self, copy_text: str, line: str, bubble: str) -> str:
+        """Nothing was typed: the bubble shows why and the text, which is copied to the clipboard.
+
+        What Clicky typed before (in `_last_fill`) is still there, so it stays remembered."""
+        copied = await set_clipboard_text(copy_text)
+        self._draft_copied, self._last_draft = copied, None
+        self._overlay.update_bubble_text(bubble)
+        self._explain(line + (" It's copied to your clipboard." if copied else ""))
+        return f"Couldn't type the draft, so it's {'on your clipboard' if copied else 'in the bubble'}."
+
+    async def _report_fill(
+        self, outcome: FillOutcome, result: CheckResult, target: WritingTarget, earlier: list[Earlier] = ()
+    ) -> str | None:
+        """What was typed where; anything not typed is shown and copied."""
+        copied = False
+        if not outcome.complete:
+            rest = shown_text(outcome.rest)
+            copied = await set_clipboard_text(rest)
+            self._overlay.update_bubble_text(rest)
+        self._draft_copied = copied
+        self._explain(outcome_line(outcome, result.focused, copied))
+        self._last_draft = None
+        self._remember_fill(target.window_id, earlier, outcome.typed)
+        if outcome.complete:
+            return "Draft typed into your window."
+        if outcome.stopped:
+            return None
+        where = "on your clipboard" if copied else "in the bubble"
+        if not outcome.typed:
+            return f"Couldn't type the draft, so it's {where}."
+        return f"Typing stopped partway, so the rest is {where}."
+
+    async def _capture_whole_screen(self) -> list[CapturedScreen]:
+        """Every monitor, with Clicky's own windows hidden (the where-to-type check)."""
+        bar_open = self._overlay.input_visible()
+        self._overlay.hide_input()
+        self._overlay.hide_bubble()
+        try:
+            await asyncio.sleep(0.15)  # let the compositor drop Clicky's windows
+            return await asyncio.to_thread(capture_all_screens, _monitor_index_at_cursor())
+        finally:
+            if bar_open:
+                self._overlay.restore_input()
+            else:
+                self._overlay.show_bubble_near_cursor()
+
+    async def _click_wait(self, steps: list[Step], result: CheckResult) -> str | None:
+        """Unsure: nothing is typed until the user clicks the box(es) (fill.py `click_wait`)."""
+        if len(steps) == 1:
+            self._explain('Not sure which box this goes in. Click the box, then reply "done" in the input box.')
+        else:
+            self._explain(
+                "Not sure which boxes these go in. Click each box and Clicky types the piece that fits it "
+                '(reply "done" to stop early).'
+            )
+
+        async def match(pieces: list[Step], box, window: WritingTarget):
+            return await match_piece(
+                pieces, box, window, self._gemini, settings.gemini_fast_model, self._usage, result.images
+            )
+
+        async def type_into(window: WritingTarget, box, text: str) -> TypeResult:
+            return await self._with_esc_grab(
+                text,
+                lambda cancel: type_into_clicked(
+                    window, box, text, self._typer.activate, self._typer.type_draft, cancel
+                ),
+            )
+
+        replies: asyncio.Queue = asyncio.Queue()
+        self._waiting = _Waiting("box", replies, asyncio.current_task())
+        try:
+            outcome = await click_wait(steps, self._poll_focus, replies, match, type_into, self._explain, WAIT_S)
+        finally:
+            self._waiting = None
+        labels = [t.label for t in outcome.typed]
+        self._last_draft = None
+        window = next((t.target for t in outcome.typed if t.target is not None), None)
+        if window is not None:
+            same = [t for t in outcome.typed if t.target is not None and t.target.window_id == window.window_id]
+            self._remember_fill(window.window_id, self._earlier_in(window), same)
+        if outcome.ended == "all":
+            self._draft_copied = False
+            self._explain(f"Typed into {_join_labels(labels)}.")
+            return "Draft typed into your window."
+        rest = shown_text(outcome.rest) if outcome.rest else ""
+        copied = await set_clipboard_text(rest) if rest else False
+        self._draft_copied = copied
+        if rest:
+            self._overlay.update_bubble_text(rest)
+        typed = f"Typed into {_join_labels(labels)}. " if labels else "Nothing was typed. "
+        copy = " It's copied to your clipboard." if copied else ""
+        where = "on your clipboard" if copied else "in the bubble"
+        if outcome.ended == "timeout":
+            self._explain(f"{typed}Stopped waiting after {int(WAIT_S)} seconds.{copy}")
+            return f"Stopped waiting, so it's {where}."
+        if outcome.ended == "done":
+            self._explain(f'{typed}Stopped at your "done".{copy}')
+            return f"Stopped, so the rest is {where}."
+        self._explain(f"{typed}Stopped: {outcome.why}.{copy}")
+        return f"Couldn't type it, so it's {where}."
+
+    async def _poll_focus(self) -> tuple[WritingTarget, object] | None:
+        """The text box that has focus right now, in any window that isn't Clicky's (the click wait)."""
+        active = active_window_target()
+        if active is None or active.pid is None or active.pid == os.getpid():
+            return None
+        box = await focused_field(active.pid)
+        return (active, box) if box is not None else None
+
+    async def _ask_name(self) -> tuple[str | None, str]:
+        """Ask once for the name to sign with. Returns (name or None, a note for the bubble).
+
+        A reply that is a new question runs once the draft is typed (with no name).
+        """
+        self._explain(my_name.ASK_TEXT)
+        replies: asyncio.Queue = asyncio.Queue()
+        self._waiting = _Waiting("name", replies, asyncio.current_task())
+        try:
+            try:
+                text, spoken = await asyncio.wait_for(replies.get(), WAIT_S)
+            except TimeoutError:
+                return None, "No name came back, so it's signed without one."
+        finally:
+            self._waiting = None
+        self._explain("reading your reply…")
+        reply = await my_name.read_name_reply(
+            text, list(self._memory.recent), self._gemini, settings.gemini_fast_model, settings.gemini_model,
+            self._usage,
+        )
+        if reply.kind == my_name.NAME:
+            self._persisted.my_name = reply.name
+            save_state(self._persisted)
+            return reply.name, ""
+        if reply.kind == my_name.QUESTION:
+            self._pending_question = (text, spoken)
+            return None, "Signed without a name; your question runs next."
+        if reply.kind == my_name.UNKNOWN:
+            return None, "Couldn't make sense of the reply, so it's signed without a name."
+        return None, ""
+
+    def _offer_reply(self, text: str, spoken: bool) -> bool:
+        """Something the user sent while Clicky waits. True when the wait takes it.
+
+        The click wait takes only "done"; the name question takes any reply.
+        """
+        waiting = self._waiting
+        if waiting is None:
+            return False
+        if waiting.kind == "box":
+            if not is_done(text):
+                return False
+            waiting.replies.put_nowait(text)
+        else:
+            waiting.replies.put_nowait((text, spoken))
+        self._set_state(CompanionState.RESPONDING)
+        self._overlay.show_bubble_near_cursor()
+        return True
+
+    def _end_wait(self) -> None:
+        """End a wait (Esc, ×, another question): its run is cancelled, so nothing is typed."""
+        waiting, self._waiting = self._waiting, None
+        if waiting is not None and waiting.task is not None and not waiting.task.done():
+            waiting.task.cancel()
+
+    def _run_pending_question(self) -> None:
+        """A reply to the name question that was a new question: run it now the draft is done."""
+        pending, self._pending_question = self._pending_question, None
+        if pending is None:
+            return
+        text, spoken = pending
+        asyncio.get_running_loop().call_soon(self._start_question, text, spoken)
+
+    def _start_question(self, text: str, spoken: bool) -> None:
+        if not spoken:
+            self._on_prompt_submitted(text, None, AskOptions())
+            return
+        self._cancel_current_task()
+        self._voice_busy = True
+        self._current_task = asyncio.ensure_future(self._finish_voice(_KnownTranscript(text), None, None))
 
     def _stop_typing(self) -> bool:
         """Stop a draft being typed (the bubble stays open). True if one was."""
@@ -1276,6 +1652,12 @@ def _join_notes(
 ) -> str | None:
     notes = [n for n in (voice.note if voice is not None else None, search_note, length_note) if n]
     return " ".join(notes) or None
+
+
+def _join_labels(labels: list[str]) -> str:
+    if len(labels) <= 1:
+        return "".join(labels)
+    return ", ".join(labels[:-1]) + " and " + labels[-1]
 
 
 def _monitor_index_at_cursor() -> int | None:
