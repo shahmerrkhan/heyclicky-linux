@@ -1117,33 +1117,22 @@ class CompanionStateMachine(QObject):
         return result
 
     async def _replace_draft(self, draft: str) -> TypeResult:
-        """A follow-up ("make it shorter"): swap the previous draft only if it's provably untouched."""
+        """A follow-up ("make it shorter") to a draft typed plainly, which is only ever in a terminal.
+
+        The typer never replaces text in a terminal (it can't read it), so nothing is replaced:
+        the new version is copied to the clipboard, and the bubble says why.
+        """
         previous = self._last_draft
         assert previous is not None
-        result = await self._with_esc_grab(draft, lambda cancel: self._replace_at(previous, draft, cancel))
+        result = await self._with_esc_grab(
+            draft, lambda cancel: self._typer.replace_previous(previous, draft, cancel)
+        )
         self._draft_copied = False
-        if result.typed and not result.why_not:
-            self._last_draft = TypedDraft(previous.target, result.text, previous.place)
-            self._explain(explanation(result, previous.target, False))
-            return result
         copied = await set_clipboard_text(draft)
         self._draft_copied = copied
         note = " The new version is copied to your clipboard." if copied else ""
         self._explain(f"Not replaced: {result.why_not}.{note}")
         return result
-
-    async def _replace_at(self, previous: TypedDraft, draft: str, cancel: asyncio.Event) -> TypeResult:
-        """A draft typed into several boxes: focus goes back to its main box first."""
-        if previous.place is not None:
-            target = refresh_target(previous.target)
-            if target is None:
-                return TypeResult(False, why_not=f"{previous.target.app_name} was closed")
-            if not await self._typer.activate(target):
-                return TypeResult(False, why_not=f"couldn't switch back to {target.app_name}")
-            ok, why, _ = await move_to(target, previous.place)
-            if not ok:
-                return TypeResult(False, why_not=f"couldn't get back to the box it was typed in ({why})")
-        return await self._typer.replace_previous(previous, draft, cancel)
 
     async def _with_esc_grab(self, draft: str, run, refused=None):
         """Run a typing job while Esc is grabbed; Esc (or the watchdog) stops it.
