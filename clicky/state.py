@@ -34,8 +34,8 @@ from .llm.prefixes import AskOptions, ParsedPrompt, parse_spoken_prefixes
 from .llm.prompts import COMPANION_TEXT_RESPONSE_SYSTEM_PROMPT, WRITING_SYSTEM_PROMPT
 from .llm.search_query import write_search_query
 from .llm import spoken as speech_text
-from .screen.capture import CapturedScreen, capture_all_screens, capture_region
-from .screen.monitors import find_monitor_at_global_point
+from .screen.capture import CapturedScreen, capture_all_screens, capture_region, clip_to_desktop
+from .screen.monitors import enumerate_monitors, find_monitor_at_global_point
 from .llm.web_search import (
     SearchErrorKind,
     SearchOutcome,
@@ -54,6 +54,7 @@ from .writing.typer import DraftTyper, TypedDraft, TypeResult, explanation, set_
 from .writing.fields import (
     FAILED,
     FAILED_TEXT,
+    TOO_SLOW_TEXT,
     STOP,
     UNSURE,
     CheckResult,
@@ -95,6 +96,7 @@ logger = logging.getLogger(__name__)
 
 VOICE_WORK_DIR = Path.home() / ".cache" / "clicky" / "voice"
 _SAME_ESC_S = 0.5  # the bar's Esc and the keyboard reader's Esc arrive within this of each other
+WARM_AGAIN_S = 30.0  # no second Gemini warm-up within this many seconds
 
 
 class CompanionState(Enum):
@@ -179,6 +181,8 @@ class CompanionStateMachine(QObject):
         self._gemini: GeminiClient | None = None
         self._router: ModelRouter | None = None
         self._web_search: WebSearch | None = None
+        self._warm_task: asyncio.Future | None = None  # the Gemini warm-up in flight
+        self._warmed_at = -WARM_AGAIN_S  # monotonic time of the last warm-up started
         self._usage = UsageTracker()
         self._claude_code = ClaudeCodeClient(binary_path=settings.claude_code_path)
         self._memory = ChatMemory()
@@ -281,6 +285,7 @@ class CompanionStateMachine(QObject):
     def trigger_open_input(self) -> None:
         """Called when the hotkey fires or the tray icon is clicked."""
         self._note_writing_target()  # before the input bar takes focus
+        self._warm_up()
         if self._speak_active() or self._waiting is not None:
             # A speak-switch answer keeps being written and spoken, and a waiting draft keeps
             # waiting (the bar is how the user replies); only sending cuts them off.
@@ -299,6 +304,7 @@ class CompanionStateMachine(QObject):
         if not self._persisted.voice_on or self._voice_files.missing_for_listening():
             return
         self._note_writing_target()
+        self._warm_up()
         self._stop_voice_processes()  # kills Piper before Whisper can be needed
         if self._waiting is None:  # a waiting draft hears the reply first
             self._cancel_current_task()
@@ -381,8 +387,30 @@ class CompanionStateMachine(QObject):
         else:
             self._stop_voice_processes()
 
+    def _warm_up(self) -> None:
+        """Open the Gemini connection in the background (input bar opened, talk key down).
+
+        A free metadata call: never a screenshot or any text. At most one at a time, and not
+        again within WARM_AGAIN_S. Never blocks and never fails the question.
+        """
+        if not settings.gemini_api_key.strip():
+            return
+        if self._warm_task is not None and not self._warm_task.done():
+            return
+        now = time.monotonic()
+        if now - self._warmed_at < WARM_AGAIN_S:
+            return
+        self._ensure_clients()
+        if self._gemini is None:
+            return
+        self._warmed_at = now
+        self._warm_task = asyncio.ensure_future(self._gemini.warm_up(settings.gemini_fast_model))
+
     async def aclose(self) -> None:
         task = self._current_task
+        if self._warm_task is not None and not self._warm_task.done():
+            self._warm_task.cancel()
+            await asyncio.gather(self._warm_task, return_exceptions=True)
         self._release_speech_grab()
         self._cancel_current_task()
         self._stop_voice_processes()
@@ -1152,10 +1180,12 @@ class CompanionStateMachine(QObject):
         self._explain("checking where to type…")
         self._ensure_clients()
         earlier = self._earlier_in(target)
+        name_known = my_name.pick_name(settings.my_name, None, self._persisted.my_name)[0] is not None
         check = asyncio.ensure_future(
             check_plan(
                 draft, request, target, self._gemini, settings.gemini_fast_model, settings.gemini_model,
-                self._usage, self._capture_whole_screen, earlier=earlier,
+                self._usage, lambda: self._capture_target_window(target), earlier=earlier,
+                max_output_tokens=settings.max_tokens, name_known=name_known,
             )
         )
         self._check_task = check
@@ -1254,13 +1284,26 @@ class CompanionStateMachine(QObject):
             return f"Couldn't type the draft, so it's {where}."
         return f"Typing stopped partway, so the rest is {where}."
 
-    async def _capture_whole_screen(self) -> list[CapturedScreen]:
-        """Every monitor, with Clicky's own windows hidden (the where-to-type check)."""
+    async def _capture_target_window(self, target: WritingTarget | None) -> list[CapturedScreen]:
+        """The window the draft is for, with Clicky's own windows hidden (the where-to-type check).
+
+        Only the part of the window that is on screen; every monitor when none of it is (or no window).
+        """
         bar_open = self._overlay.input_visible()
         self._overlay.hide_input()
         self._overlay.hide_bubble()
         try:
             await asyncio.sleep(0.15)  # let the compositor drop Clicky's windows
+            current = refresh_target(target) if target is not None else None
+            area = None
+            if current is not None:
+                area = clip_to_desktop(current.x, current.y, current.width, current.height, enumerate_monitors())
+            if area is not None:
+                shot = await asyncio.to_thread(capture_region, *area)
+                # Not a user-picked area: labelled as screen 1, points map back through the area itself.
+                return [replace(shot, is_user_region=False)]
+            if current is not None:
+                logger.info("where-to-type: the window isn't on screen, so the whole screen is used")
             return await asyncio.to_thread(capture_all_screens, _monitor_index_at_cursor())
         finally:
             if bar_open:
@@ -1270,7 +1313,9 @@ class CompanionStateMachine(QObject):
 
     async def _click_wait(self, steps: list[Step], result: CheckResult) -> str | None:
         """Unsure: nothing is typed until the user clicks the box(es) (fill.py `click_wait`)."""
-        if len(steps) == 1:
+        if result.no_plan:
+            self._explain(TOO_SLOW_TEXT)
+        elif len(steps) == 1:
             self._explain('Not sure which box this goes in. Click the box, then reply "done" in the input box.')
         else:
             self._explain(

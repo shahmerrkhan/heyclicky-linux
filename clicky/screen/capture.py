@@ -157,3 +157,19 @@ def capture_region(
         is_primary_focus=True,
         is_user_region=True,
     )
+
+
+def clip_to_desktop(
+    x: int, y: int, width: int, height: int, monitors: list[MonitorInfo]
+) -> tuple[int, int, int, int] | None:
+    """The part of a rectangle that lies on the desktop (all monitors' bounding box), or None."""
+    if not monitors or width <= 0 or height <= 0:
+        return None
+    left = max(x, min(m.x for m in monitors))
+    top = max(y, min(m.y for m in monitors))
+    right = min(x + width, max(m.x + m.width for m in monitors))
+    bottom = min(y + height, max(m.y + m.height for m in monitors))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right - left, bottom - top
+

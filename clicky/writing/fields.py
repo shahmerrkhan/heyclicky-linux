@@ -1,12 +1,23 @@
 """What a Write draft becomes, and where each piece goes, in the window the user was in.
 
 Before any draft is typed (every Write draft, however it started; never for terminals):
-  1. a screenshot of the whole screen (all monitors), Clicky's own windows hidden;
+  1. a screenshot of the window the text is for (only the part on screen; every monitor when
+     none of it is), Clicky's own windows hidden, read by Gemini at medium detail;
   2. the window's text boxes, from accessibility (name, kind, position, focus, the text in it);
   3. a model works out from the screen what kind of app and box this is and writes
      the final text for each box that should get some, in typing order:
-     the fast model first (FAST_TIMEOUT_S), the strong model as backup (STRONG_TIMEOUT_S);
-     a model remembered as daily-limited is skipped.
+     the fast model first (FAST_TIMEOUT_S), the strong model as backup (STRONG_TIMEOUT_S),
+     then one quick retry of the fast model (RETRY_TIMEOUT_S); a model remembered as
+     daily-limited is skipped. When none of them gives a usable plan, the user is asked
+     to click the box (as for "unsure"), with the whole draft as one piece.
+     The fast stage only: when its first request hasn't answered by SECOND_REQUEST_S, the
+     same request is sent once more, and the first readable answer of the two is used (`_race`).
+     The easy case (`easy_case`: not a follow-up, the focused box is the only empty box, not a
+     browser) first asks the fast model without the screenshot (TEXT_ONLY_TIMEOUT_S); it may
+     answer "need the screen". That answer, "unsure", an unreadable reply, a failure, or a plan
+     that needs the user's name while it isn't known yet: the screenshot is taken and the steps
+     above run. Every request's timer is cut to what is left of one budget (the three stage
+     timers added up, TOTAL_S by default), so the text-only try never makes the check longer.
 
 The result is one of:
   - "go": a box for every piece. A box from the list is reached through
@@ -17,8 +28,8 @@ The result is one of:
     user is asked to click the box.
   - "stop": text already in a box would have to change and the user didn't ask
     for that, or the task can't be done there. Nothing is typed; the reason is shown.
-  - "failed": no screenshot, no field list, both models failed or were too slow,
-    or an unreadable reply. Nothing is typed.
+  - "failed": no window, no screenshot, no field list, Gemini not set up, or both models
+    remembered as daily-limited. Nothing is typed.
 
 A follow-up in the same window ("make it shorter", "also write the subject") goes
 through the same check: the model also gets what Clicky typed last time and into
@@ -47,10 +58,23 @@ from .typer import _run, atspi
 
 logger = logging.getLogger(__name__)
 
-FAST_TIMEOUT_S = 4.0
-STRONG_TIMEOUT_S = 6.0
+FAST_TIMEOUT_S = 3.0
+STRONG_TIMEOUT_S = 3.0
+RETRY_TIMEOUT_S = 2.0  # one quick retry of the fast model after both stages failed
+SECOND_REQUEST_S = 1.8  # the fast stage only: the same request again if no usable plan by then
 MATCH_TIMEOUT_S = 4.0  # the click wait: which piece fits the box the user clicked
 NORMALIZED_MAX = 1000
+IMAGE_DETAIL = "medium"  # how closely Gemini looks at the screenshot (the check and the click wait)
+TEXT_ONLY_TIMEOUT_S = 1.5  # the easy case: the fast model without the screenshot, before the steps above
+TOTAL_S = FAST_TIMEOUT_S + STRONG_TIMEOUT_S + RETRY_TIMEOUT_S  # the most all requests together may take
+MIN_STAGE_SHARE = 0.25  # a stage with less than this share of its own timer left isn't started
+NEED_SCREEN = "need_screen"  # the text-only answer "I need to see the screen"
+# Browsers (WM_CLASS class, lower case): a web page's boxes are never the easy case.
+BROWSER_CLASSES = {
+    "google-chrome", "chromium", "chromium-browser", "opera", "firefox", "firefox-esr", "navigator",
+    "brave-browser", "microsoft-edge", "vivaldi-stable", "epiphany", "org.gnome.epiphany", "librewolf",
+    "waterfox", "falkon", "qutebrowser", "tor browser", "midori", "floorp", "zen",
+}
 
 GO, UNSURE, STOP, FAILED = "go", "unsure", "stop", "failed"
 TYPE, ADD_START, ADD_END, REPLACE = "type", "add_start", "add_end", "replace"
@@ -60,9 +84,11 @@ NAME_SLOT = "{MY_NAME}"  # where the user's own name goes (filled in by Clicky)
 
 # The bubble text when nothing could be typed (the draft follows it).
 FAILED_TEXT = "Couldn't find a suitable place to type or paste the text in. Here is what you can type in it:"
+# The bubble line when the click wait starts because no model gave a plan in time (or they errored).
+TOO_SLOW_TEXT = "Gemini was too slow to place the text. Click the box you want and reply done."
 
 PLAN_SYSTEM_PROMPT = """\
-you decide what clicky types, and where. the user asked clicky to write something. you get their request, clicky's draft, screenshots of the user's whole screen, and a numbered list of the text boxes in the window the text is for (from accessibility: name, kind, where it is on the screenshots, whether it has focus, and the text already in it).
+you decide what clicky types, and where. the user asked clicky to write something. you get their request, clicky's draft, a screenshot of the window the text is for (the whole screen when that window isn't on it), and a numbered list of the text boxes in that window (from accessibility: name, kind, where it is on the screenshots, whether it has focus, and the text already in it).
 
 work out from the screen what kind of app and box this is. then write the final text for each box that should get some, and leave every other box alone.
 
@@ -113,6 +139,12 @@ status:
 
 reply with json only, like:
 {"status": "go", "why": "", "name_on_screen": null, "steps": [{"box": 2, "do": "type", "what": "recipient address", "text": "sam@example.com"}, {"box": 4, "do": "add_start", "what": "message", "main": true, "text": "Hey Sam,\\n\\nI'll be there by 5.\\n\\nBest regards,\\n{MY_NAME}"}], "leave": [{"box": 1, "why": "already has text"}]}
+"""
+
+TEXT_ONLY_PROMPT = """
+
+this time there is no screenshot: you only get the window's name and its text boxes (the focused box is the only empty one). if that is enough to tell what kind of app and box this is and where the text goes, answer as usual, with "box" numbers only (there is no screen to point at) and "name_on_screen": null.
+if you'd need to see the screen to be sure, reply exactly {"status": "need_screen"}.
 """
 
 MATCH_SYSTEM_PROMPT = """\
@@ -204,6 +236,8 @@ class CheckResult:
     focused: Field | None = None  # where focus was when the check ran
     reply: dict = dc_field(default_factory=dict)  # the model's whole reply
     images: list[LabeledImage] = dc_field(default_factory=list)  # the screenshot, for the click wait
+    no_plan: bool = False  # UNSURE because no model gave a usable plan in time (not because it was unsure)
+    text_only: bool = False  # the plan came from the easy case's request without the screenshot
 
 
 Capture = Callable[[], Awaitable[list[CapturedScreen]]]
@@ -268,7 +302,7 @@ def _box_text(f: Field) -> str:
 
 def _describe_field(number: int, f: Field, screens: list[CapturedScreen], earlier: list[Earlier]) -> str:
     kind = "multi-line" if f.multi_line else "one line"
-    where = _normalized(screens, *f.centre) if f.w > 0 else "position unknown"
+    where = (_normalized(screens, *f.centre) if screens else "not shown") if f.w > 0 else "position unknown"
     focus = ", HAS FOCUS" if f.focused else ""
     mine = ", clicky typed into it last time" if earlier_for(f, earlier) is not None else ""
     return f'{number}. "{f.label}" ({f.role}, {kind}{focus}{mine}), centre {where}, text: {_box_text(f)}'
@@ -408,6 +442,168 @@ def read_reply(reply: str, fields: list[Field], screens: list[CapturedScreen]) -
     return CheckResult(status, steps=steps, why=why.strip(), name_on_screen=name, reply=data)
 
 
+Ask = Callable[[], Awaitable[str]]
+Read = Callable[[str], CheckResult | None]
+
+
+def _note_failure(model: str, exc: BaseException, limits: DailyLimits, copy: str = "") -> None:
+    if classify_error(exc) == GeminiErrorKind.DAILY_QUOTA:
+        limits.mark_daily_limited(model)
+    logger.warning("where-to-type check by %s%s failed: %s", model, copy, exc)
+
+
+# Failures a second identical request may get past; a daily limit, a bad key, an unknown model
+# or a bad request can't be helped by asking again.
+_TEMPORARY = (GeminiErrorKind.BUSY, GeminiErrorKind.RATE_LIMITED)
+
+
+def _temporary(exc: BaseException) -> bool:
+    """A 503-style busy answer, a network error, a timeout or a per-minute 429."""
+    return isinstance(exc, TimeoutError) or classify_error(exc) in _TEMPORARY
+
+
+def _note_unreadable(model: str, reply: str, copy: str = "") -> None:
+    logger.warning("where-to-type check by %s%s: unreadable reply (%d characters)", model, copy, len(reply or ""))
+
+
+async def _single(ask: Ask, read: Read, model: str, timeout_s: float, limits: DailyLimits) -> CheckResult | None:
+    """One request under its timer: the plan, or None (failed, too slow or unreadable)."""
+    try:
+        reply = await asyncio.wait_for(ask(), timeout=timeout_s)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the next stage, then the click wait
+        _note_failure(model, exc, limits)
+        return None
+    result = read(reply)
+    if result is None:
+        _note_unreadable(model, reply)
+    return result
+
+
+async def _race(
+    ask: Ask, read: Read, model: str, timeout_s: float, second_at_s: float, limits: DailyLimits
+) -> CheckResult | None:
+    """The fast stage: request 1 at once; the same request 2 at `second_at_s` if 1 hasn't answered yet.
+
+    Exactly one plan can come out of here. The first readable reply wins; the other request is
+    cancelled at once and anything it sends back is never read. A failed or unreadable reply from
+    one leaves the other running until `timeout_s` (both share that one timer).
+    Request 1 ending early (before `second_at_s`): request 2 goes out at once when it failed with
+    a temporary error (`_temporary`) or came back unreadable; any other failure (daily limit, bad
+    key, unknown model, bad request) ends the stage, since asking again can't help.
+    Request 2 is sent at most once, never after the timer, and never when the model is
+    remembered as daily-limited by then. Cancelling (Esc, bubble closed) cancels both.
+    """
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    deadline = start + timeout_s
+    running: dict[asyncio.Future, int] = {asyncio.ensure_future(ask()): 1}
+    second_sent = second_at_s >= timeout_s  # no room for a second request
+    try:
+        while running:
+            wake = deadline if second_sent else min(deadline, start + second_at_s)
+            done, _ = await asyncio.wait(
+                running, timeout=max(0.0, wake - loop.time()), return_when=asyncio.FIRST_COMPLETED
+            )
+            worth_asking_again = False
+            for task in sorted(done, key=lambda t: running[t]):  # together: request 1 first
+                copy = running.pop(task)
+                label = f" (request {copy})"
+                exc = task.exception()
+                if exc is not None:
+                    _note_failure(model, exc, limits, label)
+                    worth_asking_again = _temporary(exc)
+                    continue
+                reply = task.result()
+                result = read(reply)
+                if result is None:
+                    _note_unreadable(model, reply, label)
+                    worth_asking_again = True
+                    continue
+                logger.info("where-to-type: request %d answered first, after %.1f s", copy, loop.time() - start)
+                return result
+            if done:
+                if running or second_sent:
+                    continue
+                # Request 1 ended without a plan before request 2 was due.
+                if not worth_asking_again or loop.time() >= deadline:
+                    return None
+                why = "right away, after request 1 failed early"
+            elif loop.time() >= deadline:
+                logger.warning("where-to-type check by %s: no usable plan within %g s", model, timeout_s)
+                return None
+            else:
+                why = f"after {second_at_s:g} s with no answer"
+            second_sent = True
+            if limits.is_daily_limited(model):
+                continue
+            logger.info("where-to-type: the same request is sent again, %s", why)
+            running[asyncio.ensure_future(ask())] = 2
+        return None
+    finally:
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+
+
+def easy_case(target: WritingTarget, fields: list[Field], earlier: list[Earlier]) -> str:
+    """Why this isn't the easy case, for the log ("" when it is). Never any box text."""
+    if earlier:
+        return "a follow-up"
+    if is_browser(target):
+        return "a browser"
+    focused = [f for f in fields if f.focused]
+    if len(focused) != 1:
+        return "no focused box in the list"
+    if focused[0].text is None or focused[0].text.strip():
+        return "the focused box isn't empty"
+    if any(f.text is None or not f.text.strip() for f in fields if not f.focused):
+        return "another box is empty (or can't be read)"
+    return ""
+
+
+def is_browser(target: WritingTarget) -> bool:
+    return target.app_class.lower() in BROWSER_CLASSES
+
+
+async def _text_only(
+    ask: Ask, fields: list[Field], name_known: bool, model: str, timeout_s: float, limits: DailyLimits
+) -> CheckResult | None:
+    """The easy case: one request without the screenshot. A "go" or "stop" plan, or None (the screenshot is needed)."""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    outcome = ""
+    try:
+        reply = await asyncio.wait_for(ask(), timeout=timeout_s)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the screenshot request next
+        _note_failure(model, exc, limits, " (text only)")
+        outcome = "failed"
+    else:
+        data = _json_object(reply or "")
+        result = read_reply(reply, fields, [])
+        if data is not None and data.get("status") == NEED_SCREEN:
+            outcome = "need the screen"
+        elif result is None:
+            _note_unreadable(model, reply, " (text only)")
+            outcome = "unreadable"
+        elif result.status == UNSURE:
+            outcome = "unsure"
+        elif not name_known and any(NAME_SLOT in s.text for s in result.steps):
+            outcome = "needs your name, which isn't known yet"
+        else:
+            result.name_on_screen, result.text_only = None, True
+            logger.info("where-to-type: text only: %s after %.1f s", result.status, loop.time() - start)
+            return result
+    logger.info(
+        "where-to-type: text only: %s after %.1f s, so the screenshot is taken", outcome, loop.time() - start
+    )
+    return None
+
+
 async def check_plan(
     draft: str,
     request: str,
@@ -421,12 +617,59 @@ async def check_plan(
     fast_timeout_s: float = FAST_TIMEOUT_S,
     strong_timeout_s: float = STRONG_TIMEOUT_S,
     earlier: list[Earlier] = (),
+    max_output_tokens: int = 8192,
+    retry_timeout_s: float = RETRY_TIMEOUT_S,
+    second_request_s: float = SECOND_REQUEST_S,
+    name_known: bool = False,
+    text_only_timeout_s: float = TEXT_ONLY_TIMEOUT_S,
 ) -> CheckResult:
-    """What to type into which box of the target window, for this draft (`earlier`: a follow-up)."""
+    """What to type into which box of the target window, for this draft (`earlier`: a follow-up).
+
+    `max_output_tokens`: the reply cap (MAX_TOKENS), high so a long email never comes back cut off.
+    `name_known`: the user's name is already known (setting or saved), so a plan may sign without the screen.
+    The requests together never take longer than the three stage timers added up (`total_s` below),
+    whether or not the text-only request ran first.
+    """
     if target is None or target.pid is None:
         return CheckResult(FAILED, why="there was no window to type into")
     if client is None:
         return CheckResult(FAILED, why="Gemini isn't set up")
+    fields = await fields_of(target.pid)
+    if fields is None:
+        return CheckResult(FAILED, why=f"couldn't list the text boxes in {target.app_name}")
+    logger.info("where-to-type: %s", fields_summary(fields, target.app_class))
+    if earlier:
+        logger.info("where-to-type: a follow-up, Clicky typed into %d box(es) last time", len(earlier))
+    focused = next((f for f in fields if f.focused), None)
+    loop = asyncio.get_running_loop()
+    total_s = fast_timeout_s + strong_timeout_s + retry_timeout_s
+    budget_end: float | None = None  # set when the first request goes out
+
+    def left() -> float:
+        return total_s if budget_end is None else budget_end - loop.time()
+
+    def ask_with(request_obj: GeminiRequest, system_prompt: str, model: str) -> Ask:
+        return lambda: client.generate_text(
+            request_obj, system_prompt, model, thinking_level="low", max_output_tokens=max_output_tokens
+        )
+
+    not_easy = easy_case(target, fields, earlier)
+    if not not_easy and limits.is_daily_limited(fast_model):
+        not_easy = "the fast model is daily-limited"
+    if not_easy:
+        logger.info("where-to-type: text only: not used (%s)", not_easy)
+    else:
+        budget_end = loop.time() + total_s
+        text_request = GeminiRequest(user_prompt=_prompt(draft, request, target, fields, [], earlier))
+        result = await _text_only(
+            ask_with(text_request, PLAN_SYSTEM_PROMPT + TEXT_ONLY_PROMPT, fast_model),
+            fields, name_known, fast_model, min(text_only_timeout_s, left()), limits,
+        )
+        if result is not None:
+            result.decided_by, result.fields, result.focused = "fast, text only", fields, focused
+            logger.info("where-to-type: %s", plan_summary(result))
+            return result
+
     try:
         screens = await capture()
     except asyncio.CancelledError:
@@ -436,35 +679,36 @@ async def check_plan(
         screens = []
     if not screens:
         return CheckResult(FAILED, why="couldn't take a screenshot")
-    fields = await fields_of(target.pid)
-    if fields is None:
-        return CheckResult(FAILED, why=f"couldn't list the text boxes in {target.app_name}")
-    logger.info("where-to-type: %s", fields_summary(fields, target.app_class))
-    if earlier:
-        logger.info("where-to-type: a follow-up, Clicky typed into %d box(es) last time", len(earlier))
-    focused = next((f for f in fields if f.focused), None)
     images = [LabeledImage(data=s.image_data, label=s.label_for_model()) for s in screens]
-    request_obj = GeminiRequest(user_prompt=_prompt(draft, request, target, fields, screens, earlier), images=images)
+    request_obj = GeminiRequest(
+        user_prompt=_prompt(draft, request, target, fields, screens, earlier), images=images, image_detail=IMAGE_DETAIL
+    )
 
-    for role, model, timeout_s in (("fast", fast_model, fast_timeout_s), ("strong", strong_model, strong_timeout_s)):
+    stages = (
+        ("fast", fast_model, fast_timeout_s),
+        ("strong", strong_model, strong_timeout_s),
+        ("fast retry", fast_model, retry_timeout_s),
+    )
+    def read(reply: str) -> CheckResult | None:
+        return read_reply(reply, fields, screens)
+
+    asked = False  # a stage was asked (both models daily-limited: nothing is typed, as before)
+    for role, model, stage_s in stages:
         if limits.is_daily_limited(model):
             continue
-        try:
-            reply = await asyncio.wait_for(
-                client.generate_text(request_obj, PLAN_SYSTEM_PROMPT, model, thinking_level="low"), timeout=timeout_s
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - the next model, then give up
-            if classify_error(exc) == GeminiErrorKind.DAILY_QUOTA:
-                limits.mark_daily_limited(model)
-            logger.warning("where-to-type check by %s failed: %s", model, exc)
+        if budget_end is None:
+            budget_end = loop.time() + total_s
+        timeout_s = min(stage_s, left())
+        if timeout_s < stage_s * MIN_STAGE_SHARE:
+            logger.info("where-to-type: no time left for the %s stage", role)
             continue
-        result = read_reply(reply, fields, screens)
+        asked = True
+        ask = ask_with(request_obj, PLAN_SYSTEM_PROMPT, model)
+        if role == "fast":
+            result = await _race(ask, read, model, timeout_s, second_request_s, limits)
+        else:
+            result = await _single(ask, read, model, timeout_s, limits)
         if result is None:
-            logger.warning(
-                "where-to-type check by %s: unreadable reply (%d characters)", model, len(reply or "")
-            )
             continue
         if result.status == UNSURE and not result.steps:
             result.steps = [Step(draft, "the text", main=True)]
@@ -473,7 +717,16 @@ async def check_plan(
         result.decided_by, result.fields, result.focused, result.images = role, fields, focused, images
         logger.info("where-to-type: %s", plan_summary(result))
         return result
-    return CheckResult(FAILED, why="couldn't work out where the text goes", fields=fields, focused=focused, images=images)
+    if not asked:
+        return CheckResult(
+            FAILED, why="couldn't work out where the text goes", fields=fields, focused=focused, images=images
+        )
+    # No usable plan in time: the user clicks the box, and the whole draft is one piece.
+    logger.info("where-to-type: no plan from any model, so the user is asked to click the box")
+    return CheckResult(
+        UNSURE, steps=[Step(draft, "the text", main=True)], why="Gemini didn't work out the box in time",
+        decided_by="none", fields=fields, focused=focused, images=images, no_plan=True,
+    )
 
 
 async def match_piece(
@@ -505,7 +758,7 @@ async def match_piece(
     for i, piece in enumerate(pieces, start=1):
         preview = piece.text if len(piece.text) <= 300 else piece.text[:300] + " …"
         lines.append(f"{i}. {piece.what or 'text'}: {json.dumps(preview, ensure_ascii=False)}")
-    request = GeminiRequest(user_prompt="\n".join(lines), images=list(images))
+    request = GeminiRequest(user_prompt="\n".join(lines), images=list(images), image_detail=IMAGE_DETAIL)
     try:
         reply = await asyncio.wait_for(
             client.generate_text(request, MATCH_SYSTEM_PROMPT, fast_model, thinking_level="low"), timeout=timeout_s

@@ -303,7 +303,7 @@ async def _ask_model(
         return None
     verdicts = parse_verdicts(reply, len(triggers))
     if verdicts is None:
-        logger.warning("length check by %s: unreadable reply %r", model, reply[:200])
+        logger.warning("length check by %s: unreadable reply (%d characters)", model, len(reply or ""))
     return verdicts
 
 

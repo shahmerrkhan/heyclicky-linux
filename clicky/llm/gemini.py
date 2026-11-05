@@ -13,10 +13,14 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import AsyncIterator
 
+import logging
+
 import httpx
 from google import genai
 from google.genai import errors, types
 
+
+logger = logging.getLogger(__name__)
 
 # Finish reasons that mean "Gemini stopped on purpose and withheld the answer".
 # MAX_TOKENS is handled separately (the answer was cut off, not blocked).
@@ -53,6 +57,8 @@ class GeminiRequest:
     history: list[ConversationTurn] = field(default_factory=list)
     # Web search results as plain text, already wrapped as untrusted reference text.
     search_context: str | None = None
+    # How closely Gemini looks at the images: "low", "medium" or "high" (None: Gemini's default).
+    image_detail: str | None = None
 
 
 @dataclass
@@ -120,6 +126,12 @@ def _detect_image_media_type(image_data: bytes) -> str:
     return "image/jpeg"
 
 
+def _media_resolution(request: GeminiRequest) -> types.MediaResolution | None:
+    if request.image_detail is None or not request.images:
+        return None
+    return types.MediaResolution(f"MEDIA_RESOLUTION_{request.image_detail.upper()}")
+
+
 def _build_contents(request: GeminiRequest) -> list[types.Content]:
     contents: list[types.Content] = []
 
@@ -149,6 +161,19 @@ class GeminiClient:
     async def aclose(self) -> None:
         await self._client.aio.aclose()
 
+    async def warm_up(self, model: str) -> bool:
+        """Open the connection to Gemini before a question needs it.
+
+        Asks for the model's description (a free metadata call: no prompt, no image, no text
+        of the user's, no tokens). Never raises; returns whether it worked.
+        """
+        try:
+            await self._client.aio.models.get(model=model)
+        except Exception as exc:  # noqa: BLE001 - warming is best effort
+            logger.debug("gemini warm-up failed: %s", type(exc).__name__)
+            return False
+        return True
+
     async def stream_response(
         self,
         request: GeminiRequest,
@@ -168,6 +193,7 @@ class GeminiClient:
             system_instruction=system_prompt,
             max_output_tokens=self._max_tokens,
             thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel(thinking_level.upper())),
+            media_resolution=_media_resolution(request),
         )
 
         reply = GeminiReply()
@@ -219,6 +245,7 @@ class GeminiClient:
             system_instruction=system_prompt,
             max_output_tokens=max_output_tokens,
             thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel(thinking_level.upper())),
+            media_resolution=_media_resolution(request),
         )
         response = await self._client.aio.models.generate_content(
             model=model,
