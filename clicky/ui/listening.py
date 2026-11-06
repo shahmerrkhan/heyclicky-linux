@@ -1,4 +1,4 @@
-"""Small "listening" pill shown near the cursor while the talk key is held.
+"""Small "listening" pill shown at the top centre of the screen while the talk key is held.
 
 A red dot and a timer ("Listening 0:07 · let go to send"). It replaces the
 answer bubble during recording so the previous answer isn't overwritten
@@ -8,11 +8,15 @@ the user's own window focused the whole time.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+import time
+
+from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
-from .design import Colors, Fonts
+from .design import Colors, Fonts, Sizes
 from .effects import DEFAULT_SHADOW_MARGIN, apply_drop_shadow, fade_in
+
+TOP_MARGIN = Sizes.BUBBLE_TOP_GAP
 
 
 class ListeningPill(QWidget):
@@ -28,10 +32,11 @@ class ListeningPill(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
+        self._area: QRect | None = None  # set at the top centre: the timer text re-centres it
+        self.closed_at = 0.0  # when it was last hidden (a screenshot waits for the compositor)
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(
-            DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN
-        )
+        # Above the card only the top gap, like the bubble: it never covers a top panel.
+        outer.setContentsMargins(DEFAULT_SHADOW_MARGIN, TOP_MARGIN, DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN)
         card = QFrame(self)
         card.setObjectName("pill")
         card.setStyleSheet(
@@ -77,11 +82,37 @@ class ListeningPill(QWidget):
     def set_seconds(self, seconds: int) -> None:
         self._label.setText(f"Listening  {seconds // 60}:{seconds % 60:02d} · let go to send")
         self.adjustSize()
+        self._place()
 
     def show_near(self, global_x: int, global_y: int) -> None:
+        """The card's top-left at this screen point."""
+        self._area = None
         self.adjustSize()
-        self.move(global_x - DEFAULT_SHADOW_MARGIN, global_y - DEFAULT_SHADOW_MARGIN)
+        self.move(global_x - DEFAULT_SHADOW_MARGIN, global_y - TOP_MARGIN)
+        self._show()
+
+    def show_at_top_centre(self, area: QRect) -> None:
+        """Centred on `area` (a screen's usable area), the card's top Sizes.BUBBLE_TOP_GAP below its top."""
+        self._area = QRect(area)
+        self.adjustSize()
+        self._place()
+        self._show()
+
+    def card_rect(self) -> QRect:
+        card = self.findChild(QFrame, "pill")
+        return QRect(self.mapToGlobal(card.pos()), card.size())
+
+    def _place(self) -> None:
+        if self._area is not None:
+            x = self._area.x() + (self._area.width() - self.width()) // 2
+            self.move(x, self._area.y() + Sizes.BUBBLE_TOP_GAP - TOP_MARGIN)
+
+    def _show(self) -> None:
         if not self.isVisible():
             self.show()
             fade_in(self)
         self.raise_()
+
+    def hideEvent(self, event) -> None:
+        self.closed_at = time.monotonic()
+        super().hideEvent(event)

@@ -1,22 +1,21 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QPoint, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFontMetrics, QKeyEvent, QMouseEvent
+from PyQt6.QtCore import QEasingCurve, QPoint, QRect, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
+from PyQt6.QtGui import QKeyEvent, QMouseEvent, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QScrollArea,
-    QScrollBar,
     QSizePolicy,
     QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
 
-from .design import MODE_COLORS, Colors, Fonts, Radius, Sizes
-from .effects import DEFAULT_SHADOW_MARGIN, ThinkingDots, apply_drop_shadow, fade_in
+from .design import MODE_COLORS, Colors, Fonts, Motion, Radius, Sizes
+from .effects import DEFAULT_SHADOW_MARGIN, ThinkingDots, apply_drop_shadow
 
 
 THINKING_SENTINEL = "…"
@@ -31,19 +30,20 @@ AUTO_FOLLOW_SLACK_PX = 12
 # the rest of the card padding stays a drag zone.
 RESIZE_CORNER_PX = 14
 
-# Width of the inner card padding considered a drag handle on left/top/right.
-# Anywhere on the card that isn't an interactive child (label, scrollbar, stop
-# button) is also treated as a drag handle — this is just a hint for the cursor.
-DRAG_EDGE_PX = 14
-
 # Minimum size the user is allowed to shrink the bubble to.
 MIN_BUBBLE_WIDTH = 280
 
-# Text column width in auto-size mode: as wide as the longest line needs,
-# between these bounds (the footer reads badly any narrower than the minimum).
-MIN_TEXT_WIDTH = 360
 SCROLLBAR_ALLOWANCE = 14
 MIN_BUBBLE_HEIGHT = 80
+
+# The card's padding (left 16, right 8) and border (1 px each side), around the answer area.
+_CARD_SIDES = 16 + 8 + 2
+# The answer area is always this wide (the card is Sizes.BUBBLE_WIDTH); the text wraps inside it.
+TEXT_AREA_WIDTH = Sizes.BUBBLE_WIDTH - _CARD_SIDES
+WRAP_WIDTH = TEXT_AREA_WIDTH - SCROLLBAR_ALLOWANCE
+# The window's room for the shadow. Above the card only the top gap: the window starts right at
+# the top of the usable area, so it never covers a top panel (its clock stays clickable).
+TOP_MARGIN = Sizes.BUBBLE_TOP_GAP
 
 # QT's sentinel for "no maximum" — used to lift the auto-mode size caps when
 # the user takes manual control of the window size.
@@ -53,9 +53,8 @@ _QWIDGETSIZE_MAX = 16777215
 class _Card(QFrame):
     """The visible glass card inside the bubble.
 
-    Owns the move/resize gesture state. The bubble's outer QWidget is moved
-    and resized in response to drags landing on the card's padding (anywhere
-    not occupied by the text label, scrollbar, or × button).
+    Owns the resize gesture: dragging the bottom-right corner resizes the bubble.
+    Nothing moves it: the bubble stays at the top centre of the screen.
     """
 
     user_resized = pyqtSignal()
@@ -63,7 +62,6 @@ class _Card(QFrame):
     def __init__(self) -> None:
         super().__init__()
         self.setMouseTracking(True)
-        self._drag_origin: tuple[QPoint, QPoint] | None = None
         self._resize_origin: tuple[QPoint, QSize] | None = None
 
     # --- gesture helpers --------------------------------------------------
@@ -74,26 +72,11 @@ class _Card(QFrame):
             and local.y() >= self.height() - RESIZE_CORNER_PX
         )
 
-    def _is_in_drag_zone(self, local: QPoint) -> bool:
-        """True if the click landed on card padding or a non-selectable label (header, "you said")."""
-        child = self.childAt(local)
-        if child is None:
-            return True
-        node: QWidget | None = child
-        while node is not None and node is not self:
-            if isinstance(node, QLabel) and node.textInteractionFlags() == Qt.TextInteractionFlag.NoTextInteraction:
-                return True
-            if isinstance(node, (QLabel, QScrollBar, QPushButton)):
-                return False
-            node = node.parentWidget()
-        return True
-
     # --- mouse events -----------------------------------------------------
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt naming)
         # Defensive: a fresh press resets any stale gesture state so we never
-        # carry a previous drag/resize into a new click.
-        self._drag_origin = None
+        # carry a previous resize into a new click.
         self._resize_origin = None
         if event.button() == Qt.MouseButton.LeftButton:
             local = event.position().toPoint()
@@ -103,25 +86,18 @@ class _Card(QFrame):
                 self._resize_origin = (global_pos, window.size())
                 event.accept()
                 return
-            if self._is_in_drag_zone(local):
-                self._drag_origin = (global_pos, window.pos())
-                event.accept()
-                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        # Safety net: if the left button isn't held, any drag/resize in flight
+        # Safety net: if the left button isn't held, any resize in flight
         # must be stale (a release event got eaten — e.g. the cursor briefly
         # left the window during a fast drag and the WM swallowed it on its
-        # way back). Clear state so this doesn't turn into a sticky drag.
+        # way back). Clear state so this doesn't turn into a sticky resize.
         if not (event.buttons() & Qt.MouseButton.LeftButton):
-            self._drag_origin = None
             self._resize_origin = None
             local = event.position().toPoint()
             if self._is_in_resize_zone(local):
                 self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-            elif self._is_in_drag_zone(local):
-                self.setCursor(Qt.CursorShape.SizeAllCursor)
             else:
                 self.unsetCursor()
             super().mouseMoveEvent(event)
@@ -129,12 +105,6 @@ class _Card(QFrame):
 
         global_pos = event.globalPosition().toPoint()
         window = self.window()
-        if self._drag_origin is not None:
-            origin_global, origin_pos = self._drag_origin
-            delta = global_pos - origin_global
-            window.move(origin_pos + delta)
-            event.accept()
-            return
         if self._resize_origin is not None:
             origin_global, origin_size = self._resize_origin
             delta = global_pos - origin_global
@@ -147,8 +117,7 @@ class _Card(QFrame):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if self._drag_origin is not None or self._resize_origin is not None:
-            self._drag_origin = None
+        if self._resize_origin is not None:
             self._resize_origin = None
             event.accept()
             return
@@ -159,8 +128,48 @@ class _Card(QFrame):
         super().leaveEvent(event)
 
 
+class _Still(QWidget):
+    """The still picture of the bubble shown while it rolls, revealed from the top down.
+
+    Covers the whole bubble window while the real card is hidden; `shown` is the share
+    (0 to 1) of the picture's height that is visible, always from the top edge.
+    A click on it is passed on (`pressed`), so "–" and × still work mid-roll.
+    """
+
+    pressed = pyqtSignal(QPoint)
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._picture: QPixmap | None = None
+        self.shown = 0.0
+        self.hide()
+
+    def set_picture(self, picture: QPixmap) -> None:
+        self._picture = picture
+        self.update()
+
+    def set_shown(self, share: float) -> None:
+        self.shown = share
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        if self._picture is None:
+            return
+        painter = QPainter(self)
+        painter.setClipRect(0, 0, self.width(), round(self.height() * self.shown))
+        painter.drawPixmap(0, 0, self._picture)
+        painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.pressed.emit(event.position().toPoint())
+        event.accept()
+
+
 class ResponseBubble(QWidget):
-    """Streaming answer bubble shown next to the cursor ("command palette" look).
+    """Streaming answer bubble, fixed at the top centre of the screen ("command palette" look).
 
     Top-level frameless top-most window with a dark glass card, top to bottom:
       - header: a mode tag (Vision / Code / Write, in the mode's colour) and ×,
@@ -174,24 +183,35 @@ class ResponseBubble(QWidget):
     every button has NoFocus), so voice and later writing mode keep the
     user's own window focused.
 
+    Placement: the card is Sizes.BUBBLE_WIDTH wide, centred, its top BUBBLE_TOP_GAP below the
+    top of the usable area of a screen (`show_at_top_centre`); it only grows downward.
+
     Sizing modes:
       - **auto** (default): for each new chunk the bubble re-fits to its
-        content up to `BUBBLE_MAX_HEIGHT`, then scrolls.
+        content (height only; the width is fixed) up to `BUBBLE_MAX_HEIGHT`, then scrolls.
       - **manual**: once the user drags the bottom-right corner the bubble
         keeps the size they gave it. New chunks update the text but leave the
         outer dimensions alone (scrollbar absorbs overflow). The next
         thinking-dots state resets back to auto.
 
-    The card is draggable from any non-interactive area (padding, header,
-    "you said" line). Hovering the bottom-right 14 px exposes a
-    diagonal-resize cursor.
+    Nothing drags the bubble. Hovering the bottom-right 14 px exposes a
+    diagonal-resize cursor; the next answer goes back to the auto size.
+
+    Opening rolls it down and closing rolls it up (`roll_down`, `roll_up`): the top edge stays
+    put and a still picture of the card is revealed from the top downward (Motion.BUBBLE_OPEN_MS,
+    ease-out) or hidden upward (Motion.BUBBLE_CLOSE_MS, ease-in). One progress value (0 hidden,
+    1 open) drives it, so a roll the other way starts from wherever it is, taking that share of
+    the time. Changes that arrive during a roll are applied when it ends; then it grows downward.
+    `hide()` is instant (screenshots).
 
     Auto-follow streaming: when text grows we snap the scrollbar to bottom,
     unless the user has scrolled up to re-read — then we leave them put.
     """
 
     stop_requested = pyqtSignal()
+    hide_requested = pyqtSignal()  # "–": roll the bubble out of the way (the answer keeps going)
     link_clicked = pyqtSignal(str)
+    rolled_up = pyqtSignal()  # a roll-up ended: the bubble is hidden now
 
     MODE_LABELS = {"vision": "Vision", "code": "Code", "writing": "Write"}
 
@@ -207,17 +227,16 @@ class ResponseBubble(QWidget):
         self.setMouseTracking(True)
         self.setMinimumSize(
             MIN_BUBBLE_WIDTH + 2 * DEFAULT_SHADOW_MARGIN,
-            MIN_BUBBLE_HEIGHT + 2 * DEFAULT_SHADOW_MARGIN,
+            MIN_BUBBLE_HEIGHT + TOP_MARGIN + DEFAULT_SHADOW_MARGIN,
         )
 
+        self._area: QRect | None = None  # the usable area of the screen it sits on
         self._user_sized = False
         self._mode: str | None = None
         max_w = Sizes.BUBBLE_MAX_WIDTH
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(
-            DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN
-        )
+        outer.setContentsMargins(DEFAULT_SHADOW_MARGIN, TOP_MARGIN, DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN)
 
         self._card = _Card()
         self._card.setObjectName("bubble")
@@ -228,7 +247,7 @@ class ResponseBubble(QWidget):
         apply_drop_shadow(self._card, blur=28, dy=8, alpha=140)
 
         column = QVBoxLayout(self._card)
-        column.setContentsMargins(16, 12, 10, 12)
+        column.setContentsMargins(16, 12, 8, 12)
         column.setSpacing(8)
 
         # --- header: mode tag + × -------------------------------------------
@@ -241,6 +260,14 @@ class ResponseBubble(QWidget):
         self._mode_tag.hide()
         header.addWidget(self._mode_tag, alignment=Qt.AlignmentFlag.AlignVCenter)
         header.addStretch(1)
+        self._hide_btn = QPushButton("–", self._card)
+        self._hide_btn.setObjectName("hideBtn")
+        self._hide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hide_btn.setFixedSize(22, 22)
+        self._hide_btn.setToolTip("hide (the answer keeps going)")
+        self._hide_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._hide_btn.clicked.connect(self.hide_requested.emit)
+        header.addWidget(self._hide_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         self._stop = QPushButton("×", self._card)
         self._stop.setObjectName("stopBtn")
         self._stop.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -334,6 +361,17 @@ class ResponseBubble(QWidget):
         self._footer.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # links still open on click
         self._footer.hide()
         column.addWidget(self._footer)
+
+        # --- the roll: a still picture over the whole window, revealed from the top ----------
+        self._still = _Still(self)
+        self._still.pressed.connect(self._on_still_pressed)
+        self._shown = 0.0  # 0 hidden, 1 open
+        self._roll_target = 0.0
+        self._rolling = False
+        self._refit_waiting = False  # a change arrived during the roll: refit when it ends
+        self._roll = QVariantAnimation(self)
+        self._roll.valueChanged.connect(self._on_roll_value)
+        self._roll.finished.connect(self._on_roll_done)
 
         self.hide()
 
@@ -429,6 +467,21 @@ class ResponseBubble(QWidget):
             QPushButton#stopBtn:pressed {{
                 background: rgba(255, 77, 94, 150);
             }}
+            QPushButton#hideBtn {{
+                color: {Colors.TEXT_DIM};
+                background: transparent;
+                border: none;
+                border-radius: 11px;
+                font-size: 16px;
+                padding: 0;
+            }}
+            QPushButton#hideBtn:hover {{
+                color: white;
+                background: {Colors.GLASS_HOVER};
+            }}
+            QPushButton#hideBtn:pressed {{
+                background: rgba(255, 255, 255, 40);
+            }}
         """
 
     # --- public API --------------------------------------------------------
@@ -438,7 +491,7 @@ class ResponseBubble(QWidget):
             self._reset_to_auto_sizing()
             self._label.clear()
             self.set_footer("")
-            self._set_text_area(MIN_TEXT_WIDTH // 2, 28)
+            self._set_text_area(TEXT_AREA_WIDTH, 28)
             self._stack.setCurrentIndex(self._thinking_index)
             self._thinking.start()
             self._refit()
@@ -452,10 +505,9 @@ class ResponseBubble(QWidget):
         self._label.setText(text)
 
         if not self._user_sized:
-            # Auto size: the text gets an exact width (from its longest line)
-            # and the exact height that width needs; the visible area is
-            # capped at BUBBLE_MAX_HEIGHT and scrolls past it.
-            wrap_w = self._auto_text_width(text)
+            # Auto size: the text gets the fixed width and the exact height that
+            # width needs; the visible area is capped at BUBBLE_MAX_HEIGHT and scrolls past it.
+            wrap_w = WRAP_WIDTH
             # Unlock the previous answer's size first: Qt measures within it.
             self._label.setMinimumSize(0, 0)
             self._label.setMaximumSize(_QWIDGETSIZE_MAX, _QWIDGETSIZE_MAX)
@@ -496,18 +548,151 @@ class ResponseBubble(QWidget):
         self._explain.setVisible(bool(text))
         self._refit()
 
-    def show_at_global(self, global_x: int, global_y: int) -> None:
-        x = global_x - DEFAULT_SHADOW_MARGIN
-        y = global_y - DEFAULT_SHADOW_MARGIN
-        self.adjustSize()
-        self.move(x, y)
+    def show_at_top_centre(self, area: QRect) -> None:
+        """Roll it down at the top centre of `area` (a screen's usable area, global coordinates).
+
+        Already open: it stays where it is (only its contents change). Rolling up: it turns round."""
+        if not self._rolling and self.isVisible() and self._shown >= 1.0:
+            return
+        if not self._rolling:
+            self._area = QRect(area)
+        self.roll_down()
+
+    def roll_down(self) -> None:
+        """Open: revealed from the top down (from wherever a roll-up has got to)."""
+        if not self._rolling:
+            if self.isVisible() and self._shown >= 1.0:
+                return
+            self._shown = 0.0
+            self._take_still()
         self.show()
         self.raise_()
-        fade_in(self)
+        self._roll_to(1.0)
+
+    def roll_up(self) -> None:
+        """Close: hidden from the bottom up (from wherever a roll-down has got to); then really hidden."""
+        if not self.isVisible():
+            return
+        if not self._rolling:
+            self._take_still()
+        self._roll_to(0.0)
+
+    def is_open(self) -> bool:
+        """Fully open, or rolling down (not rolling up, not hidden)."""
+        return self.isVisible() and (self._roll_target == 1.0 if self._rolling else self._shown >= 1.0)
+
+    def shown_share(self) -> float:
+        return self._shown
+
+    def card_rect(self) -> QRect:
+        """Where the card is on screen (global coordinates), without the shadow margin."""
+        return QRect(self.mapToGlobal(self._card.pos()), self._card.size())
 
     def hide(self) -> None:
+        """Instant (no roll): for screenshots and the backup click."""
+        if self._rolling:
+            self._roll.stop()
+            self._rolling = False
+        self._end_still()
+        self._shown = 0.0
+        self._roll_target = 0.0
         self._thinking.stop()
         super().hide()
+
+    # --- the roll --------------------------------------------------------
+
+    def _take_still(self) -> None:
+        """Freeze the card as it is now (its latest content, laid out) into the still picture."""
+        self._card.show()
+        self._refit_waiting = False
+        self._refit()
+        self._place()
+        picture = self.grab()
+        self.setFixedSize(self.size())  # no size changes until the roll ends
+        self._still.setGeometry(self.rect())
+        self._still.set_picture(picture)
+        self._still.set_shown(self._shown)
+        self._still.show()
+        self._still.raise_()
+        self._card.hide()
+
+    def _end_still(self) -> None:
+        self._still.hide()
+        self._card.show()
+        self.setMinimumSize(
+            MIN_BUBBLE_WIDTH + 2 * DEFAULT_SHADOW_MARGIN,
+            MIN_BUBBLE_HEIGHT + TOP_MARGIN + DEFAULT_SHADOW_MARGIN,
+        )
+        self.setMaximumSize(_QWIDGETSIZE_MAX, _QWIDGETSIZE_MAX)
+
+    def _roll_to(self, target: float) -> None:
+        self._roll.stop()
+        self._roll_target = target
+        left = abs(target - self._shown)
+        if left == 0:
+            self._rolling = True
+            self._on_roll_done()
+            return
+        opening = target == 1.0
+        full_ms = Motion.BUBBLE_OPEN_MS if opening else Motion.BUBBLE_CLOSE_MS
+        self._roll.setDuration(max(1, round(full_ms * left)))
+        self._roll.setEasingCurve(QEasingCurve.Type.OutCubic if opening else QEasingCurve.Type.InCubic)
+        self._roll.setStartValue(self._shown)
+        self._roll.setEndValue(target)
+        self._rolling = True
+        self._roll.start()
+
+    def _on_still_pressed(self, local: QPoint) -> None:
+        """A click on the still picture mid-roll: "–" and × work there too (the card is laid out under it)."""
+        for button, signal in ((self._hide_btn, self.hide_requested), (self._stop, self.stop_requested)):
+            if button.geometry().translated(self._card.pos()).contains(local):
+                signal.emit()
+                return
+
+    def restore_now(self) -> None:
+        """Back fully open where it was, without rolling (after a screenshot or the backup click)."""
+        if self._rolling:
+            self._roll.stop()
+            self._rolling = False
+            self._end_still()
+        self._shown = self._roll_target = 1.0
+        self._refit()
+        self._place()
+        self.show()
+        self.raise_()
+
+    def text(self) -> str:
+        """The answer text shown (the thinking dots: THINKING_SENTINEL)."""
+        return THINKING_SENTINEL if self._stack.currentIndex() == self._thinking_index else self._label.text()
+
+    def footer(self) -> str:
+        return self._footer.text()
+
+    def explanation(self) -> str:
+        return self._explain.text()
+
+    def area(self) -> QRect | None:
+        """The usable area of the screen it was last placed on."""
+        return QRect(self._area) if self._area is not None else None
+
+    def _on_roll_value(self, value) -> None:
+        self._shown = float(value)
+        self._still.set_shown(self._shown)
+
+    def _on_roll_done(self) -> None:
+        if not self._rolling:
+            return
+        self._rolling = False
+        self._shown = self._roll_target
+        self._end_still()
+        if self._shown >= 1.0:
+            # Open: what arrived during the roll is applied now, and the card grows downward.
+            self._refit_waiting = False
+            self._refit()
+            return
+        self._thinking.stop()
+        super().hide()
+        self.rolled_up.emit()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape:
@@ -517,16 +702,6 @@ class ResponseBubble(QWidget):
 
     # --- sizing-mode internals --------------------------------------------
 
-    def _auto_text_width(self, text: str) -> int:
-        """Wrap width for `text`: its longest line (or the "you said" line), within bounds."""
-        self._label.ensurePolished()
-        metrics = QFontMetrics(self._label.font())
-        longest = max((metrics.horizontalAdvance(line) for line in text.splitlines()), default=0)
-        if self._said.isVisibleTo(self):
-            self._said.ensurePolished()
-            longest = max(longest, QFontMetrics(self._said.font()).horizontalAdvance(self._said.text()))
-        return max(MIN_TEXT_WIDTH, min(Sizes.BUBBLE_MAX_WIDTH, longest + 8))
-
     def _set_text_area(self, width: int, height: int) -> None:
         """Size the answer area (and the stack holding it) together, so neither clips the other."""
         self._scroll.setFixedSize(width, height)
@@ -535,9 +710,23 @@ class ResponseBubble(QWidget):
     def _refit(self) -> None:
         if self._user_sized:
             return
+        if self._rolling:
+            self._refit_waiting = True  # the still picture is shown: refit when the roll ends
+            return
         self._card.layout().activate()
         self.layout().activate()
-        self.adjustSize()
+        # Not adjustSize(): it caps a window at 2/3 of the screen, which a long answer can reach.
+        self.resize(self.sizeHint().expandedTo(self.minimumSize()))
+        self._place()
+
+    def _place(self) -> None:
+        """Centred on the area, the card's top BUBBLE_TOP_GAP below its top (the window starts at it).
+
+        Not while the user has resized it: the corner drag keeps the left edge where it is."""
+        if self._area is None or self._user_sized:
+            return
+        x = self._area.x() + (self._area.width() - self.width()) // 2
+        self.move(x, self._area.y() + Sizes.BUBBLE_TOP_GAP - TOP_MARGIN)
 
     def _on_user_resize(self) -> None:
         """First time the user drags the corner, switch to manual sizing.

@@ -27,9 +27,13 @@ from .design import MODE_COLORS, Colors, Fonts, Radius, Sizes
 from .effects import DEFAULT_SHADOW_MARGIN, apply_drop_shadow, fade_in
 from .listening import ListeningPill
 from .response_bubble import ResponseBubble
+from .unhide_pill import UnhidePill
 
 
 CARD_INNER_WIDTH = 640
+BAR_TOP_MARGIN = Sizes.BUBBLE_TOP_GAP  # the bar window's shadow room above the card (see `_InputCard`)
+# How long the compositor may take to drop a window that just closed, before a screenshot.
+CLEAR_S = 0.15
 
 _PLACEHOLDERS = {
     "vision": "ask clicky anything…",
@@ -334,11 +338,12 @@ class _InputCard(QWidget):
         self._mode = "vision"
         self._workspace = ""
         self._allow_shell = False
+        self.closed_at = 0.0  # when it was last hidden (see `Overlay.wait_before_shot_s`)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(
-            DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN
-        )
+        # Above the card only the top gap: at the top centre the window starts right at the top
+        # of the usable area, so it never covers a top panel.
+        outer.setContentsMargins(DEFAULT_SHADOW_MARGIN, BAR_TOP_MARGIN, DEFAULT_SHADOW_MARGIN, DEFAULT_SHADOW_MARGIN)
 
         self._card = QFrame(self)
         self._card.setObjectName("inputCard")
@@ -650,16 +655,36 @@ class _InputCard(QWidget):
     # --- public API --------------------------------------------------------
 
     def show_at_global(self, global_x: int, global_y: int) -> None:
+        """The card's top-left at this screen point (kept on the screen)."""
         x = global_x - DEFAULT_SHADOW_MARGIN
-        y = global_y - DEFAULT_SHADOW_MARGIN
+        y = global_y - BAR_TOP_MARGIN
         self.adjustSize()
         x, y = self._clamp_to_screen(x, y)
+        self._open_at(x, y)
+
+    def show_at_top_centre(self, area: QRect) -> None:
+        """Centred on `area` (a screen's usable area), the card's top Sizes.BUBBLE_TOP_GAP below its top.
+
+        It grows downward from there (more lines in the prompt box); it never follows the mouse."""
+        self.adjustSize()
+        x = area.x() + (area.width() - self.width()) // 2
+        self._open_at(x, area.y() + Sizes.BUBBLE_TOP_GAP - BAR_TOP_MARGIN)
+
+    def card_rect(self) -> QRect:
+        """Where the card is on screen (global coordinates), without the shadow margin."""
+        return QRect(self.mapToGlobal(self._card.pos()), self._card.size())
+
+    def _open_at(self, x: int, y: int) -> None:
         self.move(x, y)
         self.show()
         self.raise_()
         self.activateWindow()
         self._line_edit.setFocus()
         fade_in(self)
+
+    def hideEvent(self, event) -> None:
+        self.closed_at = time.monotonic()  # a screenshot waits for the compositor to drop it
+        super().hideEvent(event)
 
     def reset_prompt_text(self) -> None:
         """A fresh bar: no text, no one-question picks, no note."""
@@ -774,7 +799,7 @@ class _InputCard(QWidget):
         w = self.sizeHint().width() or self.width()
         h = self.sizeHint().height() or self.height()
         x = min(max(gx, avail.left() - DEFAULT_SHADOW_MARGIN), avail.right() - w + DEFAULT_SHADOW_MARGIN)
-        y = min(max(gy, avail.top() - DEFAULT_SHADOW_MARGIN), avail.bottom() - h + DEFAULT_SHADOW_MARGIN)
+        y = min(max(gy, avail.top() - BAR_TOP_MARGIN), avail.bottom() - h + DEFAULT_SHADOW_MARGIN)
         return x, y
 
     def _on_return(self) -> None:
@@ -801,11 +826,18 @@ class _InputCard(QWidget):
         super().keyPressEvent(event)
 
 
+def _usable_area_at_cursor() -> QRect:
+    """The usable area (without panels) of the screen with the mouse, else the primary screen's."""
+    screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+    return screen.availableGeometry() if screen is not None else QRect(0, 0, 1920, 1080)
+
+
 class Overlay(QObject):
     """Coordinator for the floating UI pieces:
       • BlueCursor — the always-on "buddy" that follows the mouse
       • _InputCard — the prompt input bar opened by the hotkey
-      • ResponseBubble — the streaming response shown next to the cursor
+      • ResponseBubble — the streaming response, fixed at the top centre of the screen
+      • UnhidePill — the small "Unhide" pill while the user has hidden the bubble ("–")
       • AreaSelectorOverlay — the dim-and-drag region picker
     """
 
@@ -823,6 +855,12 @@ class Overlay(QObject):
         self._cursor = BlueCursor()
         self._input_card = _InputCard()
         self._bubble = ResponseBubble()
+        self._pill = UnhidePill()
+        # Hidden with "–": stays hidden (new content only lights the pill's dot) until Unhide,
+        # × or Esc, or Clicky needs the user (`bring_back`).
+        self._hidden_by_user = False
+        # What a screenshot hide took off the screen: (bubble was open, pill was shown).
+        self._hidden_for_shot: tuple[bool, bool] | None = None
         self._listening = ListeningPill()
         self._area_selector = AreaSelectorOverlay()
 
@@ -841,6 +879,10 @@ class Overlay(QObject):
         self._input_card.workspace_changed.connect(self.workspace_changed.emit)
         self._input_card.speak_changed.connect(self.speak_changed.emit)
         self._bubble.stop_requested.connect(self.dismiss)
+        self._bubble.hide_requested.connect(self.user_hide)
+        self._bubble.rolled_up.connect(self._on_bubble_rolled_up)
+        self._pill.clicked.connect(self.unhide)
+        self._pill.close_requested.connect(self.dismiss)
         self._bubble.link_clicked.connect(self.bubble_link_clicked.emit)
         self._area_selector.area_selected.connect(self._on_area_selected)
         self._area_selector.cancelled.connect(self._on_area_selection_cancelled)
@@ -849,12 +891,14 @@ class Overlay(QObject):
 
     # --- public API used by the state machine ---------------------------------
 
-    def show_input_near_cursor(self) -> None:
-        cursor_pos = QCursor.pos()
-        self._bubble.hide()
+    def show_input(self) -> None:
+        """The input bar at the top centre of the screen with the mouse (the same spot as the bubble).
+
+        An answer on screen rolls up underneath while the bar fades in on top."""
+        self._bubble.roll_up()
         self._input_card.reset_prompt_text()
         self._input_card.set_selected_area(self._selected_area)
-        self._input_card.show_at_global(cursor_pos.x() + 28, cursor_pos.y() + 4)
+        self._input_card.show_at_top_centre(_usable_area_at_cursor())
 
     def show_input_with_text(self, text: str, length: str | None = None, note: str = "") -> None:
         """Open the input bar with `text` already typed (a voice transcript to edit).
@@ -862,32 +906,107 @@ class Overlay(QObject):
         `length` lights that length button and `note` shows in the hint line; both are set after the
         fresh-bar reset so it doesn't clear them.
         """
-        self.show_input_near_cursor()
+        self.show_input()
         self._input_card.set_prompt_text(text)
         self._input_card.set_length(length)
         self._input_card.set_note(note)
 
     def hide_bubble(self) -> None:
-        self._bubble.hide()
+        """Instantly off the screen, the Unhide pill too (screenshots, the backup click).
 
-    def show_bubble_near_cursor(self) -> None:
-        cursor_pos = QCursor.pos()
+        `restore_bubble` puts back whatever was showing, without rolling."""
+        self._hidden_for_shot = (self._bubble.is_open(), self._pill.isVisible())
+        self._bubble.hide()
+        self._pill.hide()
+
+    def restore_bubble(self) -> None:
+        """After `hide_bubble`: the bubble back fully open if it was open, the pill if it was shown."""
+        shown = self._hidden_for_shot
+        self._hidden_for_shot = None
+        if shown is None:
+            return
+        bubble_was_open, _pill_was_shown = shown
+        if bubble_was_open and not self._hidden_by_user:
+            self._bubble.restore_now()
+        if self._hidden_by_user:
+            self._show_pill()  # also when the shot cut a "–" roll-up short
+
+    def show_bubble(self) -> None:
+        """The answer bubble at the top centre of the screen with the mouse (it never follows the mouse).
+
+        Hidden by the user: it stays hidden (what changes lights the pill's dot)."""
         self._input_card.hide()
-        self._bubble.show_at_global(cursor_pos.x() + 32, cursor_pos.y() + 28)
+        if self._hidden_by_user:
+            return
+        self._bubble.show_at_top_centre(_usable_area_at_cursor())
+
+    def user_hide(self) -> None:
+        """ "–": roll the bubble up out of the way; the Unhide pill shows when the roll ends."""
+        if not self._bubble.isVisible():
+            return
+        self._hidden_by_user = True
+        self._bubble.roll_up()
+
+    def unhide(self) -> None:
+        """The pill was clicked: it goes, and the bubble rolls back down at the top centre."""
+        if not self._hidden_by_user:
+            return
+        self._hidden_by_user = False
+        self._pill.hide()
+        self._pill.set_dot(False)
+        self._bubble.show_at_top_centre(self._bubble.area() or _usable_area_at_cursor())
+
+    def bring_back(self) -> None:
+        """Clicky needs the user (click the box, the name question, "Not typed"): unhide if hidden."""
+        self.unhide()
+
+    def wait_before_shot_s(self) -> float:
+        """How long a screenshot should still wait so a just-closed input bar or listening pill
+        is gone from the screen (CLEAR_S after it closed; 0 when that's past)."""
+        closed = max(self._input_card.closed_at, self._listening.closed_at)
+        return max(0.0, CLEAR_S - (time.monotonic() - closed)) if closed else 0.0
+
+    def answer_on_screen(self) -> bool:
+        """Is the bubble (even mid-roll) or the Unhide pill on the screen right now?"""
+        return self._bubble.isVisible() or self._pill.isVisible()
+
+    def bubble_hidden_by_user(self) -> bool:
+        return self._hidden_by_user
+
+    def covers(self, global_x: int, global_y: int) -> bool:
+        """Is this screen point under the bubble's card or the Unhide pill (as they are now)?"""
+        if self._bubble.isVisible() and self._bubble.card_rect().contains(global_x, global_y):
+            return True
+        return self._pill.isVisible() and self._pill.button_rect().contains(global_x, global_y)
+
+    def _show_pill(self) -> None:
+        self._pill.show_in_corner(self._bubble.area() or _usable_area_at_cursor())
+
+    def _on_bubble_rolled_up(self) -> None:
+        if self._hidden_by_user:
+            self._show_pill()
+
+    def _note_change(self, changed: bool) -> None:
+        """Something in the bubble changed while the user has it hidden: light the pill's dot."""
+        if changed and self._hidden_by_user:
+            self._pill.set_dot(True)
 
     def update_bubble_text(self, text: str) -> None:
+        self._note_change(text != self._bubble.text())
         self._bubble.set_text(text)
 
     def update_bubble_footer(self, html: str) -> None:
+        self._note_change(html != self._bubble.footer())
         self._bubble.set_footer(html)
 
     def show_listening(self, seconds: int) -> None:
-        """The listening pill near the cursor (talk key held); hides the input bar and bubble."""
-        cursor_pos = QCursor.pos()
+        """The listening pill at the top centre (talk key held); hides the input bar and bubble."""
         self._input_card.hide()
         self._bubble.hide()
+        if self._hidden_by_user and not self._pill.isVisible():
+            self._show_pill()  # a "–" roll-up cut short by the talk key
         self._listening.set_seconds(seconds)
-        self._listening.show_near(cursor_pos.x() + 32, cursor_pos.y() + 28)
+        self._listening.show_at_top_centre(_usable_area_at_cursor())
 
     def update_listening(self, seconds: int) -> None:
         self._listening.set_seconds(seconds)
@@ -902,6 +1021,7 @@ class Overlay(QObject):
         self._bubble.set_said(text)
 
     def set_bubble_explanation(self, text: str) -> None:
+        self._note_change(text != self._bubble.explanation())
         self._bubble.set_explanation(text)
 
     def show_cursor_at(self, global_x: int, global_y: int) -> None:
@@ -941,7 +1061,10 @@ class Overlay(QObject):
 
     def dismiss(self) -> None:
         self._input_card.hide()
-        self._bubble.hide()
+        self._hidden_by_user = False
+        self._pill.hide()
+        self._pill.set_dot(False)
+        self._bubble.roll_up()
         self._listening.hide()
         self._area_selector.hide()
         self._cursor.start_tracking_mouse()
@@ -955,10 +1078,10 @@ class Overlay(QObject):
 
     def _on_area_selected(self, rect: QRect) -> None:
         self._selected_area = rect
-        self.show_input_near_cursor()
+        self.show_input()
 
     def _on_area_selection_cancelled(self) -> None:
-        self.show_input_near_cursor()
+        self.show_input()
 
     def _clear_selected_area(self) -> None:
         self._selected_area = None

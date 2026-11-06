@@ -69,7 +69,17 @@ class Radius:
 
 class Sizes:
     PANEL_WIDTH = 340
-    BUBBLE_MAX_WIDTH = 560  # drafts and long answers need room
-    BUBBLE_MAX_HEIGHT = 360
+    BUBBLE_MAX_WIDTH = 560  # drafts and long answers need room (the widest a line of text may be)
+    BUBBLE_MAX_HEIGHT = 520  # the answer area grows to this, then scrolls
+    BUBBLE_WIDTH = 600  # the bubble's card: always this wide, fixed at the top centre of the screen
+    BUBBLE_TOP_GAP = 8  # from the top of the usable area (under a top panel) to the card
+    PILL_GAP = 8  # the Unhide pill: from the bottom and right edges of the usable area
     PROMPT_MAX_LINES = 8  # input box grows to this many lines, then scrolls
     CURSOR_SIZE = 48
+
+
+class Motion:
+    """How long the bubble takes to roll down (open) and back up (close), each from fully one way."""
+
+    BUBBLE_OPEN_MS = 260
+    BUBBLE_CLOSE_MS = 260

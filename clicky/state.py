@@ -59,6 +59,8 @@ from .writing.fields import (
     UNSURE,
     CheckResult,
     Earlier,
+    Field,
+    Place,
     Step,
     check_plan,
     focused_field,
@@ -290,14 +292,14 @@ class CompanionStateMachine(QObject):
             # A speak-switch answer keeps being written and spoken, and a waiting draft keeps
             # waiting (the bar is how the user replies); only sending cuts them off.
             self._set_state(CompanionState.AWAITING_PROMPT)
-            self._overlay.show_input_near_cursor()  # also hides the answer bubble
+            self._overlay.show_input()  # also hides the answer bubble
             return
         self._stop_voice_processes()
         if self._state in (CompanionState.PROCESSING, CompanionState.RESPONDING, CompanionState.LISTENING):
             self._cancel_current_task()
             self._overlay.dismiss()
         self._set_state(CompanionState.AWAITING_PROMPT)
-        self._overlay.show_input_near_cursor()
+        self._overlay.show_input()
 
     def talk_pressed(self) -> None:
         """The talk key went down: stop whatever is running or speaking, and listen."""
@@ -446,9 +448,9 @@ class CompanionStateMachine(QObject):
         self._overlay.set_bubble_mode(self._persisted.agent_mode)
         self._overlay.set_bubble_said("")
         self._explain("")
-        self._overlay.show_bubble_near_cursor()
 
         if self._persisted.agent_mode == "code":
+            self._overlay.show_bubble()
             workspace, stripped = self._parse_workspace_prefix(prompt)
             self._current_task = asyncio.ensure_future(
                 self._run_claude_code(stripped, workspace, speak=speak, length=options.length)
@@ -465,10 +467,12 @@ class CompanionStateMachine(QObject):
             length=options.length,
         )
         if self._persisted.agent_mode == "writing" or parsed.write:
+            self._overlay.show_bubble()
             self._current_task = asyncio.ensure_future(self._run_writing(parsed))
             self._speak_task = self._current_task if speak else None
             return
 
+        # Vision: the "…" bubble is shown once the screenshot is taken (`_run_vision`), so it's never in it.
         primary_index = _monitor_index_at_cursor()
         self._current_task = asyncio.ensure_future(
             self._run_vision(parsed, primary_index, region)
@@ -542,14 +546,19 @@ class CompanionStateMachine(QObject):
             if not code_mode and not writing_mode:
                 # The screenshot is taken when the key is let go, without the bubble in it.
                 self._overlay.hide_bubble()
-                screens = await asyncio.to_thread(capture_all_screens, primary_index)
+                try:
+                    # The listening pill just closed: let the compositor drop it first.
+                    await asyncio.sleep(self._overlay.wait_before_shot_s())
+                    screens = await asyncio.to_thread(capture_all_screens, primary_index)
+                finally:
+                    self._overlay.restore_bubble()
             self._set_state(CompanionState.PROCESSING)
             self._overlay.update_bubble_footer("")
             self._overlay.set_bubble_mode(self._persisted.agent_mode)
             self._overlay.set_bubble_said("")
             self._explain("")
             self._overlay.update_bubble_text("transcribing…")
-            self._overlay.show_bubble_near_cursor()
+            self._overlay.show_bubble()
 
             transcript = known if known is not None else await listener.finish()
             if note:
@@ -789,6 +798,8 @@ class CompanionStateMachine(QObject):
         try:
             setup_problem = _gemini_setup_problem()
             if setup_problem is not None:
+                if voice is None:
+                    self._overlay.show_bubble()
                 show(setup_problem)
                 self._end_speech(speech, None, error=voice is not None)
                 if speak:
@@ -803,17 +814,11 @@ class CompanionStateMachine(QObject):
 
             if voice is not None:
                 screens = voice.screens
-            elif region is not None and not region.isEmpty():
-                screen = await asyncio.to_thread(
-                    capture_region,
-                    region.x(),
-                    region.y(),
-                    region.width(),
-                    region.height(),
-                )
-                screens = [screen]
             else:
-                screens = await asyncio.to_thread(capture_all_screens, primary_index)
+                try:
+                    screens = await self._capture_without_clicky(region, primary_index)
+                finally:
+                    self._overlay.show_bubble()  # typed: the "…" bubble comes after the screenshot
 
             if parsed_prompt.search:
                 query = question
@@ -1096,8 +1101,43 @@ class CompanionStateMachine(QObject):
         finally:
             if bar_open:
                 self._overlay.restore_input()
-            else:
-                self._overlay.show_bubble_near_cursor()
+            self._overlay.restore_bubble()  # what was showing comes back without rolling
+
+    async def _capture_without_clicky(self, region: QRect | None, primary_index: int | None) -> list[CapturedScreen]:
+        """A typed Vision question's screenshot (the picked area, or every screen), never with the
+        answer bubble or the Unhide pill in it. Usually neither is on screen (the bubble is shown
+        after the shot), so it's taken at once; otherwise they're hidden first and come back after."""
+
+        async def shot() -> list[CapturedScreen]:
+            if region is not None and not region.isEmpty():
+                screen = await asyncio.to_thread(
+                    capture_region, region.x(), region.y(), region.width(), region.height()
+                )
+                return [screen]
+            return await asyncio.to_thread(capture_all_screens, primary_index)
+
+        if not self._overlay.answer_on_screen():
+            # The input bar just closed (Enter): let the compositor drop it first.
+            await asyncio.sleep(self._overlay.wait_before_shot_s())
+            return await shot()
+        self._overlay.hide_bubble()
+        try:
+            await asyncio.sleep(0.15)  # let the compositor drop Clicky's windows
+            return await shot()
+        finally:
+            self._overlay.restore_bubble()
+
+    async def _move_to_clear(self, target: WritingTarget, place: Place) -> tuple[bool, str, Field | None]:
+        """`move_to`, but a backup click on a point under the bubble or the Unhide pill gets them
+        out of the way first (instantly), and they come back without rolling."""
+        if place.point is None or not self._overlay.covers(*place.point):
+            return await move_to(target, place)
+        self._overlay.hide_bubble()
+        try:
+            await asyncio.sleep(0.15)  # let the compositor drop Clicky's windows
+            return await move_to(target, place)
+        finally:
+            self._overlay.restore_bubble()
 
     async def _type_draft(self, draft: str, target: WritingTarget | None = None) -> TypeResult:
         """Type the draft into the remembered window; explain the outcome in the bubble."""
@@ -1185,7 +1225,7 @@ class CompanionStateMachine(QObject):
             if task is not None and task.cancelling():
                 raise  # the whole run was cancelled (bubble closed, a new question)
             self._memory.add(request, draft)
-            return await self._nothing_typed(draft, "Stopped before typing.", draft)
+            return await self._nothing_typed(draft, "Stopped before typing.", draft, needs_user=False)
         finally:
             self._check_task = None
 
@@ -1221,7 +1261,7 @@ class CompanionStateMachine(QObject):
             outcome = await self._with_esc_grab(
                 "\n".join(s.text for s in steps),
                 lambda cancel: run_steps(
-                    target, steps, self._typer.type_draft, cancel, self._typer.activate, move_to,
+                    target, steps, self._typer.type_draft, cancel, self._typer.activate, self._move_to_clear,
                     earlier, self._typer.rewrite_part,
                 ),
                 refused=lambda why: FillOutcome(rest=list(steps), why=why),
@@ -1241,14 +1281,17 @@ class CompanionStateMachine(QObject):
         pieces = remember_typed(earlier, typed)
         self._last_fill = (window_id, pieces) if pieces else None
 
-    async def _nothing_typed(self, copy_text: str, line: str, bubble: str) -> str:
+    async def _nothing_typed(self, copy_text: str, line: str, bubble: str, needs_user: bool = True) -> str:
         """Nothing was typed: the bubble shows why and the text, which is copied to the clipboard.
 
-        What Clicky typed before (in `_last_fill`) is still there, so it stays remembered."""
+        What Clicky typed before (in `_last_fill`) is still there, so it stays remembered.
+        A hidden bubble comes back for it (not when the user stopped it with Esc: `needs_user`)."""
         copied = await set_clipboard_text(copy_text)
         self._draft_copied, self._last_draft = copied, None
         self._overlay.update_bubble_text(bubble)
         self._explain(line + (" It's copied to your clipboard." if copied else ""))
+        if needs_user:
+            self._overlay.bring_back()
         return f"Couldn't type the draft, so it's {'on your clipboard' if copied else 'in the bubble'}."
 
     async def _report_fill(
@@ -1262,6 +1305,8 @@ class CompanionStateMachine(QObject):
             self._overlay.update_bubble_text(rest)
         self._draft_copied = copied
         self._explain(outcome_line(outcome, result.focused, copied))
+        if not outcome.complete and not outcome.stopped:
+            self._overlay.bring_back()  # something wasn't typed: a hidden bubble comes back to say so
         self._last_draft = None
         self._remember_fill(target.window_id, earlier, outcome.typed)
         if outcome.complete:
@@ -1297,11 +1342,11 @@ class CompanionStateMachine(QObject):
         finally:
             if bar_open:
                 self._overlay.restore_input()
-            else:
-                self._overlay.show_bubble_near_cursor()
+            self._overlay.restore_bubble()  # what was showing comes back without rolling
 
     async def _click_wait(self, steps: list[Step], result: CheckResult) -> str | None:
         """Unsure: nothing is typed until the user clicks the box(es) (fill.py `click_wait`)."""
+        self._overlay.bring_back()  # the user has to see what to click
         if result.no_plan:
             self._explain(TOO_SLOW_TEXT)
         elif len(steps) == 1:
@@ -1371,6 +1416,7 @@ class CompanionStateMachine(QObject):
 
         A reply that is a new question runs once the draft is typed (with no name).
         """
+        self._overlay.bring_back()  # the question has to be seen
         self._explain(my_name.ASK_TEXT)
         replies: asyncio.Queue = asyncio.Queue()
         self._waiting = _Waiting("name", replies, asyncio.current_task())
@@ -1412,7 +1458,7 @@ class CompanionStateMachine(QObject):
         else:
             waiting.replies.put_nowait((text, spoken))
         self._set_state(CompanionState.RESPONDING)
-        self._overlay.show_bubble_near_cursor()
+        self._overlay.show_bubble()
         return True
 
     def _end_wait(self) -> None:
