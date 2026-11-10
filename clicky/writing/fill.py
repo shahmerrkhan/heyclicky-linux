@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 
+from .blank import holds_only_objects, is_empty
 from .fields import (
     ADD_END,
     ADD_START,
@@ -100,10 +101,24 @@ def made_up_contacts(texts: list[str], sources: list[str]) -> list[str]:
     return missing
 
 
+def is_password_box(box: Field | None) -> bool:
+    """A password box (accessibility role "password text"): Clicky never types a password."""
+    return box is not None and "password" in (box.role or "").lower()
+
+
 def quote_in_request(quote: str, request: str) -> bool:
     """A "replace" is allowed only when its quote is really in the user's words (whitespace and case aside)."""
     q = _squash(quote).strip(" \"'“”.,!?")
     return len(q.split()) >= QUOTE_MIN_WORDS and q in _squash(request)
+
+
+def _not_empty_why(name: str, box: Field) -> str:
+    """Why a plain "type" into this box isn't allowed (it isn't empty: blank.is_empty)."""
+    if box.text is None:
+        return f"Clicky can't read what's in {name}, so it won't type there"
+    if holds_only_objects(box):
+        return f"{name} already holds an image, attachment or other content"
+    return f"{name} already has text in it"
 
 
 def vet(
@@ -119,8 +134,8 @@ def vet(
                 return f"Clicky can't tell which part of {name} is the text it typed last time"
         if step.do == REPLACE and not quote_in_request(step.quote, request):
             return f"it would change the text already in {name}, and your request doesn't clearly ask for that"
-        if step.do == TYPE and box is not None and box.length > 0:
-            return f"{name} already has text in it"
+        if step.do == TYPE and box is not None and not is_empty(box):
+            return _not_empty_why(name, box)
     sources = [request, draft] + [f.text for f in fields if f.text]
     missing = made_up_contacts([s.text for s in steps], sources)
     if missing:
@@ -131,7 +146,7 @@ def vet(
 def with_gap(step: Step, box: Field | None) -> str:
     """The text to add, kept apart from what is already in the box (a blank line, or a space on one line)."""
     existing = box.text if box is not None else None
-    if step.do not in (ADD_START, ADD_END) or (existing is not None and not existing.strip()):
+    if step.do not in (ADD_START, ADD_END) or (box is not None and is_empty(box)):
         return step.text
     multi = box.multi_line if box is not None else True
     if not multi:
@@ -218,7 +233,13 @@ async def run_steps(
         if not ok:
             return stop(f"couldn't reach {label} ({why})")
         label = place_label(step.place, box)
-        if step.do == TYPE and box is not None and box.length > 0:
+        if is_password_box(box):
+            return stop(f"{label} is a password box, and Clicky never types into one")
+        if step.do == TYPE and box is not None and not is_empty(box):
+            if box.text is None:
+                return stop(f"Clicky can't read what's in {label} now, so nothing was typed there")
+            if holds_only_objects(box):
+                return stop(f"{label} holds an image or attachment now, so nothing was typed there")
             return stop(f"{label} has text in it now, so nothing was typed there")
         if cancel.is_set():
             return stop("", stopped=True)
@@ -400,4 +421,6 @@ async def type_into_clicked(
     now = await focused_field(target.pid) if target.pid is not None else None
     if now is None or not now.same_box(box):
         return TypeResult(False, why_not="focus isn't in the box you clicked any more")
+    if is_password_box(now):
+        return TypeResult(False, why_not="that's a password box, and Clicky never types into one")
     return await type_text(target, text, cancel, "caret")

@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..acting.guard import LINE_BREAK_KEY, key_allowed, text_safe_for_keys
 from .target import WritingTarget, active_window_target, refresh_target
 
 if TYPE_CHECKING:
@@ -113,6 +114,19 @@ async def _run(*cmd: str, stdin: str | None = None, timeout: float = 5.0) -> tup
             await proc.wait()
         raise
     return proc.returncode or 0, out.decode(errors="replace")
+
+
+class KeyRefused(OSError):
+    """A key the acting guard never allows (Enter, Ctrl+Enter, Delete, …). An OSError, so
+    every caller treats it like a key that couldn't be sent: nothing more is typed."""
+
+
+async def _key(key: str, line_break: bool = False) -> None:
+    """Send one key with xdotool, only if the guard allows it (guard.key_allowed)."""
+    if not key_allowed(key, line_break_ok=line_break):
+        logger.error("refused to send the key %s", key)
+        raise KeyRefused(f"the key {key} is never sent")
+    await _run("xdotool", "key", "--clearmodifiers", key, timeout=3)
 
 
 async def atspi(command: str, pid: int, *args: str, text: str = "") -> dict:
@@ -330,12 +344,29 @@ class DraftTyper:
         if where in ("start", "end"):
             key = "ctrl+Home" if where == "start" else "ctrl+End"
             try:
-                await _run("xdotool", "key", "--clearmodifiers", key, timeout=3)
+                await _key(key)
             except (TimeoutError, OSError):
                 return TypeResult(False, why_not=f"couldn't move to the {where} of the box")
         if await self._paste(current, text):
             return TypeResult(True, Method.PASTE, text, len(text))
-        return await self._keys(current, text, cancel)
+        if not text_safe_for_keys(text):
+            return TypeResult(False, why_not="couldn't paste, and the text has characters Clicky never types key by key")
+        line_breaks = "\n" in text
+        if line_breaks and not await self._box_is_multi_line(current):
+            return TypeResult(
+                False,
+                why_not="couldn't paste, and Clicky only types line breaks key by key into a box "
+                "accessibility confirms has several lines",
+            )
+        return await self._keys(current, text, cancel, line_breaks)
+
+    async def _box_is_multi_line(self, target: WritingTarget) -> bool:
+        """Accessibility confirms the focused box takes several lines (Shift+Enter is a line break there)."""
+        if target.pid is None or target.is_terminal:
+            return False
+        result = await atspi("focused", target.pid)
+        field = result.get("field") if result.get("ok") else None
+        return isinstance(field, dict) and field.get("multi_line") is True
 
     async def _replace_box(self, target: WritingTarget, text: str) -> TypeResult:
         """The box's whole text swapped for `text` (the user asked for it). Confirmed afterwards when readable."""
@@ -349,7 +380,7 @@ class DraftTyper:
             method = Method.REPLACE_BOX
         else:
             try:
-                await _run("xdotool", "key", "--clearmodifiers", "ctrl+a", timeout=3)
+                await _key("ctrl+a")
             except (TimeoutError, OSError):
                 return TypeResult(False, why_not="couldn't select the text in that box, so it was left alone")
             if not await self._paste(target, text):
@@ -388,7 +419,7 @@ class DraftTyper:
         await asyncio.sleep(0.1)
         key = "ctrl+shift+v" if target.is_terminal else "ctrl+v"
         try:
-            await _run("xdotool", "key", "--clearmodifiers", key, timeout=3)
+            await _key(key)
         except (TimeoutError, OSError):
             return False
         if previous:
@@ -399,16 +430,23 @@ class DraftTyper:
         await asyncio.sleep(CLIPBOARD_RESTORE_DELAY_S)
         await set_clipboard_text(previous)
 
-    async def _keys(self, target: WritingTarget, text: str, cancel: asyncio.Event) -> TypeResult:
+    async def _keys(self, target: WritingTarget, text: str, cancel: asyncio.Event, line_breaks: bool = False) -> TypeResult:
         # Spare keycodes xdotool may borrow; any it leaves bound (a stop, kill
         # or crash mid-character) are unbound again when typing ends.
         empty = empty_keycodes()
         try:
-            return await self._keys_inner(target, text, cancel)
+            return await self._keys_inner(target, text, cancel, line_breaks)
         finally:
             restore_borrowed_keycodes(empty)
 
-    async def _keys_inner(self, target: WritingTarget, text: str, cancel: asyncio.Event) -> TypeResult:
+    async def _keys_inner(
+        self, target: WritingTarget, text: str, cancel: asyncio.Event, line_breaks: bool = False
+    ) -> TypeResult:
+        """Key by key. `line_breaks`: the box is confirmed multi-line, so Shift+Enter may go between lines."""
+        if "\n" in text and not line_breaks:
+            return TypeResult(False, why_not="that box can't safely take line breaks key by key")
+        if not text_safe_for_keys(text):
+            return TypeResult(False, why_not="the text has characters Clicky never types key by key")
         typed = 0
         lines = text.split("\n")
         for line_number, line in enumerate(lines):
@@ -427,8 +465,12 @@ class DraftTyper:
                 if cancel.is_set():
                     return TypeResult(typed > 0, Method.KEYS, text[:typed], typed, "stopped", stopped=True)
                 # Never in terminals (their text has no line breaks): Shift+Enter adds a
-                # line in chat apps instead of sending the message.
-                await _run("xdotool", "key", "--clearmodifiers", "shift+Return", timeout=3)
+                # line in chat apps instead of sending the message. Only in a box
+                # accessibility confirmed is multi-line (`line_breaks`).
+                try:
+                    await _key(LINE_BREAK_KEY, line_break=line_breaks)
+                except (TimeoutError, OSError) as exc:
+                    return TypeResult(typed > 0, Method.KEYS, text[:typed], typed, f"couldn't add a line break ({exc})")
                 typed += 1
         return TypeResult(True, Method.KEYS, text, typed)
 
@@ -492,7 +534,7 @@ class DraftTyper:
                 return TypeResult(False, why_not="the box has other text besides the old draft, so it was left alone")
             return TypeResult(False, why_not="the old draft was edited or isn't in that box any more")
         try:
-            await _run("xdotool", "key", "--clearmodifiers", "ctrl+a", timeout=3)
+            await _key("ctrl+a")
         except (TimeoutError, OSError):
             return TypeResult(False, why_not="couldn't select the old draft, so it was left alone")
         if not await self._paste(target, new_text):
@@ -536,7 +578,7 @@ class DraftTyper:
         if not selected.get("ok") or _squash(selected.get("text", "")) != _squash(old):
             return TypeResult(False, why_not="couldn't select the earlier text, so it was left alone")
         try:
-            await _run("xdotool", "key", "--clearmodifiers", "BackSpace", timeout=3)
+            await _key("BackSpace")
         except (TimeoutError, OSError):
             return TypeResult(False, why_not="couldn't remove the earlier text, so it was left alone")
         await asyncio.sleep(0.3)
@@ -544,7 +586,7 @@ class DraftTyper:
         if not after.get("ok") or _squash(after.get("text", "")) != _squash(before[:start] + before[end:]):
             # Something other than the earlier text changed: undo it and stop.
             try:
-                await _run("xdotool", "key", "--clearmodifiers", "ctrl+z", timeout=3)
+                await _key("ctrl+z")
             except (TimeoutError, OSError):
                 logger.warning("couldn't undo an unexpected change")
             return TypeResult(False, why_not="the box didn't change as expected, so the change was undone")

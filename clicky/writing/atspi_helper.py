@@ -23,6 +23,8 @@ Commands (each prints one JSON line):
                  "description", "multi_line", "focused", "x", "y", "w", "h",
                  "readable", "text", "length"}, ...]}; "text" is the field's text
                  (long text: its start and end), null when it can't be read.
+                 A box with no visible text and a count above 0 also gets "placeholders",
+                 "blocks_empty", "objects" (roles) and "codes" (character codes, never text).
                  A field inside another editable field (the paragraphs of a
                  rich-text box) is left out: the outer box is the field.
   focus <pid> <id>
@@ -31,6 +33,19 @@ Commands (each prints one JSON line):
   focused <pid>  the editable field that has focus (after a click), described
                  like one entry of `fields` (its "id" is empty)
                  → {"ok": true, "field": {...}}
+  buttons <pid>  the buttons (links, menu items, tabs, …) showing in the app's active window,
+                 at most BUTTON_LIMIT, in reading order → {"ok": true, "buttons": [{"id", "role",
+                 "name", "description", "extra", "x", "y", "w", "h"}, ...]}; "extra" is other
+                 accessibility text (attributes), for Clicky's forbidden-word check only
+  press <pid> <id> <name>
+                 press that button (an id from `buttons`) through its accessibility action,
+                 only if it is still there, still has exactly that name and isn't a text box
+                 → {"ok": true}
+  at <pid> <x> <y>
+                 what is at that screen point in the app: {"ok": true, "found": false} or
+                 {"ok": true, "found": true, "kind": "text" | "control" | "other", "role",
+                 "name", "description", "extra"}; "text" is an editable box, "control" a
+                 button, link or anything else that can be pressed (or a part of one)
 
 Failures print {"ok": false, "why": "..."} and exit 0, so Clicky can move on
 to the next method.
@@ -44,6 +59,16 @@ WALK_LIMIT_S = 5.0  # the fallback walk only; the built-in search is much faster
 FIELD_LIMIT = 60  # at most this many fields are listed
 TEXT_HEAD, TEXT_TAIL = 1200, 800  # a long field's text: its start and its end (signatures sit at the end)
 FOCUS_WAIT_S = 1.0
+BUTTON_LIMIT = 60  # at most this many buttons are listed
+BUTTON_SCAN_LIMIT = 400  # objects looked at for them
+BUTTON_WALK_LIMIT_S = 2.0
+# Role names (get_role_name) of things that can be pressed.
+PRESSABLE_ROLES = {
+    "push button", "toggle button", "split button", "button", "link", "menu item", "check menu item",
+    "radio menu item", "menu", "page tab", "check box", "radio button", "combo box", "list item", "tree item",
+    "icon", "image map", "switch",
+}
+PRESS_ACTIONS = ("press", "click", "activate", "jump", "open", "toggle", "select")
 PLACEHOLDER = "\ufffc"  # stands in for a child object (e.g. one line of a rich-text box)
 
 
@@ -176,7 +201,8 @@ def _path(node, window):
     return list(reversed(path)) if node == window else None
 
 
-def _field_text(node, Atspi):
+def _raw_text(node, Atspi):
+    """(text with placeholders, character count); text None when it can't be read."""
     if node.get_text_iface() is None:
         return None, 0
     length = Atspi.Text.get_character_count(node)
@@ -184,7 +210,80 @@ def _field_text(node, Atspi):
         text = Atspi.Text.get_text(node, 0, length)
     else:
         text = Atspi.Text.get_text(node, 0, TEXT_HEAD) + "\n…\n" + Atspi.Text.get_text(node, length - TEXT_TAIL, length)
-    return text.replace(PLACEHOLDER, " "), length
+    return text, length
+
+
+# --- blank boxes ----------------------------------------------------------------------
+# A copy of clicky/writing/blank.py's `invisible` (this program can't import Clicky's code;
+# a test keeps the two the same).
+INVISIBLE_CATEGORIES = frozenset({"Zs", "Zl", "Zp", "Cc", "Cf", "Mn", "Me"})
+BLANK_LETTERS = frozenset({"ᅟ", "ᅠ", "ㅤ", "ﾠ", "⠀", "᠎"})
+# Objects behind a placeholder that may be an empty block (an empty line or paragraph of a
+# rich-text box). Anything else (an image, link, button, list item, …) is content.
+EMPTY_BLOCK_ROLES = frozenset({"section", "paragraph", "panel", "static", "text"})
+OBJECT_DEPTH, OBJECT_LIMIT = 4, 40
+CODES_LIMIT, ROLES_LIMIT = 32, 8
+
+
+def invisible(ch):
+    import unicodedata
+
+    return ch.isspace() or ch in BLANK_LETTERS or unicodedata.category(ch) in INVISIBLE_CATEGORIES
+
+
+def _blank(text):
+    """No visible character (placeholders aside)."""
+    return all(invisible(ch) for ch in text if ch != PLACEHOLDER)
+
+
+def _embedded(node, Atspi):
+    """The objects behind `node`'s placeholders, in order (None: they can't be told)."""
+    try:
+        if node.get_hypertext_iface() is not None:
+            links = [Atspi.Hypertext.get_link(node, i) for i in range(Atspi.Hypertext.get_n_links(node))]
+            return [link.get_object(0) if link is not None else None for link in links]
+        return [node.get_child_at_index(i) for i in range(node.get_child_count())]
+    except Exception:  # noqa: BLE001 - can't be told: content
+        return None
+
+
+def _blocks_empty(node, raw, Atspi, roles, budget, depth=0):
+    """Every placeholder in `raw` (the text of `node`) stands for an empty block, checked down
+    to OBJECT_DEPTH levels and OBJECT_LIMIT objects. Anything unclear is content (False)."""
+    objects = _embedded(node, Atspi)
+    if objects is None or len(objects) != raw.count(PLACEHOLDER):
+        return False
+    for obj in objects:
+        budget[0] -= 1
+        if obj is None or budget[0] < 0 or depth >= OBJECT_DEPTH:
+            return False
+        try:
+            role = obj.get_role_name() or "unknown"
+            text, length = _raw_text(obj, Atspi)
+        except Exception:  # noqa: BLE001
+            return False
+        roles.append(role)
+        if role not in EMPTY_BLOCK_ROLES or text is None or length > TEXT_HEAD + TEXT_TAIL or not _blank(text):
+            return False
+        if PLACEHOLDER in text and not _blocks_empty(obj, text, Atspi, roles, budget, depth + 1):
+            return False
+    return True
+
+
+def blank_details(node, raw, length, Atspi):
+    """For a box with no visible text and a count above 0: its placeholders, whether they are all
+    empty blocks, the object roles and the character codes (never text). {} for any other box."""
+    if raw is None or length <= 0 or length > TEXT_HEAD + TEXT_TAIL or not _blank(raw):
+        return {}
+    placeholders = raw.count(PLACEHOLDER)
+    roles = []
+    ok = placeholders == 0 or _blocks_empty(node, raw, Atspi, roles, [OBJECT_LIMIT])
+    return {
+        "placeholders": placeholders,
+        "blocks_empty": bool(ok),
+        "objects": roles[:ROLES_LIMIT],
+        "codes": [ord(ch) for ch in raw[:CODES_LIMIT]],
+    }
 
 
 def _describe(node, Atspi, field_id):
@@ -194,8 +293,9 @@ def _describe(node, Atspi, field_id):
         x, y, w, h = box.x, box.y, box.width, box.height
     except Exception:  # noqa: BLE001 - no position: still listed
         x = y = w = h = -1
-    text, length = _field_text(node, Atspi)
-    return {
+    raw, length = _raw_text(node, Atspi)
+    text = raw.replace(PLACEHOLDER, " ") if raw is not None else None
+    described = {
         "id": field_id,
         "role": node.get_role_name(),
         "name": node.get_name() or "",
@@ -207,6 +307,8 @@ def _describe(node, Atspi, field_id):
         "text": text,
         "length": length,
     }
+    described.update(blank_details(node, raw, length, Atspi))
+    return described
 
 
 def list_fields(pid):
@@ -271,10 +373,203 @@ def focus_field(pid, field_id):
     return {"ok": False, "why": "focus didn't move to that field"}
 
 
+def _action_names(node, Atspi):
+    try:
+        if node.get_action_iface() is None:
+            return []
+        return [(Atspi.Action.get_action_name(node, i) or "").lower() for i in range(Atspi.Action.get_n_actions(node))]
+    except Exception:  # noqa: BLE001 - no actions
+        return []
+
+
+def _extra_text(node):
+    """Other accessibility text of an object (its attributes), for the forbidden-word check."""
+    try:
+        attributes = node.get_attributes() or {}
+    except Exception:  # noqa: BLE001
+        return ""
+    return " ".join(f"{k}: {v}" for k, v in attributes.items() if isinstance(v, str))[:300]
+
+
+def kind_of(node, Atspi):
+    """"text" (an editable box), "control" (something that can be pressed) or "other"."""
+    states = node.get_state_set()
+    if states.contains(Atspi.StateType.EDITABLE):
+        return "text"
+    if node.get_role_name() in PRESSABLE_ROLES:
+        return "control"
+    if any(name in PRESS_ACTIONS for name in _action_names(node, Atspi)):
+        return "control"
+    return "other"
+
+
+def describe_button(node, Atspi, button_id):
+    try:
+        box = Atspi.Component.get_extents(node, Atspi.CoordType.SCREEN)
+        x, y, w, h = box.x, box.y, box.width, box.height
+    except Exception:  # noqa: BLE001
+        x = y = w = h = -1
+    return {
+        "id": button_id, "role": node.get_role_name(), "name": node.get_name() or "",
+        "description": node.get_description() or "", "extra": _extra_text(node),
+        "x": x, "y": y, "w": w, "h": h,
+    }
+
+
+def _pressables_under(window, Atspi):
+    """Objects under the window that could be pressed (showing), the app's search first, else a walk."""
+    found, started = [], time.monotonic()
+
+    def walk(node, depth):
+        if node is None or depth > 40 or len(found) >= BUTTON_SCAN_LIMIT:
+            return
+        if time.monotonic() - started > BUTTON_WALK_LIMIT_S:
+            return
+        states = node.get_state_set()
+        if not states.contains(Atspi.StateType.SHOWING) and depth > 0:
+            return
+        if depth > 0 and kind_of(node, Atspi) == "control":
+            found.append(node)
+        for i in range(min(node.get_child_count(), 200)):
+            walk(node.get_child_at_index(i), depth + 1)
+
+    walk(window, 0)
+    return found
+
+
+def list_buttons(pid):
+    Atspi = _atspi()
+    found, why = _active_window(pid)
+    if found is None:
+        return {"ok": False, "why": why}
+    window_index, window = found
+    try:
+        frame = Atspi.Component.get_extents(window, Atspi.CoordType.SCREEN)
+        bounds = (frame.x, frame.y, frame.x + frame.width, frame.y + frame.height)
+    except Exception:  # noqa: BLE001 - no frame: positions aren't filtered
+        bounds = None
+    buttons = []
+    for node in _pressables_under(window, Atspi):
+        states = node.get_state_set()
+        if not states.contains(Atspi.StateType.VISIBLE) or not states.contains(Atspi.StateType.SENSITIVE):
+            continue
+        path = _path(node, window)
+        if path is None:
+            continue
+        item = describe_button(node, Atspi, f"{window_index}:" + ".".join(str(i) for i in path))
+        if item["w"] <= 0 or item["h"] <= 0:
+            continue
+        if bounds is not None and not (bounds[0] <= item["x"] + item["w"] // 2 < bounds[2]
+                                       and bounds[1] <= item["y"] + item["h"] // 2 < bounds[3]):
+            continue  # scrolled out of the window
+        buttons.append(item)
+    buttons.sort(key=lambda b: (b["y"], b["x"]))
+    return {"ok": True, "buttons": buttons[:BUTTON_LIMIT]}
+
+
+def _node_at_path(pid, node_id):
+    """The object with that id in the app's active window (any kind), or (None, why)."""
+    found, why = _active_window(pid)
+    if found is None:
+        return None, why
+    window_index, window = found
+    wanted_window, _, path = node_id.partition(":")
+    if wanted_window != str(window_index):
+        return None, "that window isn't the active one any more"
+    node = window
+    for part in [p for p in path.split(".") if p]:
+        node = node.get_child_at_index(int(part)) if node is not None else None
+    if node is None:
+        return None, "that button isn't there any more"
+    return node, ""
+
+
+def press(pid, node_id, expected_name, Atspi=None, node=None):
+    """Press one button, re-checked first: same name, showing, enabled, not a text box."""
+    Atspi = Atspi or _atspi()
+    if node is None:
+        node, why = _node_at_path(pid, node_id)
+        if node is None:
+            return {"ok": False, "why": why}
+    name = node.get_name() or ""
+    if not name or name != expected_name:
+        return {"ok": False, "why": "that button changed, so it wasn't pressed"}
+    states = node.get_state_set()
+    if not states.contains(Atspi.StateType.SHOWING) or not states.contains(Atspi.StateType.SENSITIVE):
+        return {"ok": False, "why": "that button can't be pressed right now"}
+    if states.contains(Atspi.StateType.EDITABLE):
+        return {"ok": False, "why": "that's a text box, not a button"}
+    names = _action_names(node, Atspi)
+    index = next((i for i, n in enumerate(names) if n in PRESS_ACTIONS), 0 if names else None)
+    if index is None:
+        return {"ok": False, "why": "that button has no action to press"}
+    try:
+        done = Atspi.Action.do_action(node, index)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "why": f"press refused ({exc.__class__.__name__})"}
+    return {"ok": bool(done), "why": "" if done else "press refused"}
+
+
+def spot(node, Atspi):
+    """What a point shows: the deepest object there, or the first text box or control above it
+    (a label inside a button counts as the button)."""
+    current, depth = node, 0
+    while current is not None and depth < 12:
+        kind = kind_of(current, Atspi)
+        if kind != "other":
+            break
+        parent = current.get_parent()
+        if parent is None or parent.get_role_name() in ("frame", "window", "application"):
+            break
+        current, depth = parent, depth + 1
+    target = current if current is not None and kind_of(current, Atspi) != "other" else node
+    return {
+        "ok": True, "found": True, "kind": kind_of(target, Atspi), "role": target.get_role_name(),
+        "name": target.get_name() or "", "description": target.get_description() or "", "extra": _extra_text(target),
+    }
+
+
+def what_is_at(pid, x, y):
+    Atspi = _atspi()
+    desktop = Atspi.get_desktop(0)
+    apps = [desktop.get_child_at_index(i) for i in range(desktop.get_child_count())]
+    app = next((a for a in apps if a is not None and a.get_process_id() == pid), None)
+    if app is None:
+        return {"ok": True, "found": False, "why": "the app isn't visible to accessibility"}
+    windows = [w for w in (app.get_child_at_index(i) for i in range(app.get_child_count())) if w is not None]
+    active = [w for w in windows if w.get_state_set().contains(Atspi.StateType.ACTIVE)]
+    for window in active + [w for w in windows if w not in active]:
+        try:
+            node = Atspi.Component.get_accessible_at_point(window, x, y, Atspi.CoordType.SCREEN)
+        except Exception:  # noqa: BLE001
+            node = None
+        if node is None:
+            continue
+        for _ in range(40):
+            try:
+                child = Atspi.Component.get_accessible_at_point(node, x, y, Atspi.CoordType.SCREEN)
+            except Exception:  # noqa: BLE001
+                child = None
+            if child is None or child == node:
+                break
+            node = child
+        return spot(node, Atspi)
+    return {"ok": True, "found": False}
+
+
 def main():
     command, pid = sys.argv[1], int(sys.argv[2])
     if command == "fields":
         print(json.dumps(list_fields(pid)))
+        return
+    if command == "buttons":
+        print(json.dumps(list_buttons(pid)))
+        return
+    if command == "press":
+        print(json.dumps(press(pid, sys.argv[3], sys.argv[4])))
+        return
+    if command == "at":
+        print(json.dumps(what_is_at(pid, int(sys.argv[3]), int(sys.argv[4]))))
         return
     if command == "focus":
         print(json.dumps(focus_field(pid, sys.argv[3])))
