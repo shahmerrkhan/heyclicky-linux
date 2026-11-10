@@ -1,0 +1,32 @@
+# Window titles that mean a sign-in, password, two-factor, captcha or payment page.
+# During an acting task, a target window whose title matches stops the task and
+# Clicky asks the user to deal with it. Same format as forbidden_words.txt.
+
+en: sign in | signin | log in | login | sign up | create account | password | passcode | verify it's you | verification | 2-step | two-step | two-factor | 2fa | authenticator | authentication | captcha | recaptcha | hcaptcha | are you a robot | not a robot | security check | checkout | check out | payment | billing | pay now
+es: iniciar sesión | inicia sesión | contraseña | verificación | pago | finalizar compra
+pt: iniciar sessão | fazer login | senha | palavra-passe | verificação | pagamento | finalizar compra
+fr: se connecter | connexion | mot de passe | vérification | paiement
+de: anmelden | anmeldung | einloggen | passwort | kennwort | bestätigung | verifizierung | zahlung | kasse
+it: accedi | accesso | password | verifica | pagamento
+nl: inloggen | aanmelden | wachtwoord | verificatie | betalen | afrekenen
+sv: logga in | lösenord | verifiering | betalning
+no/da: logg inn | log ind | passord | adgangskode | betaling
+fi: kirjaudu | salasana | vahvistus | maksu
+pl: zaloguj | logowanie | hasło | weryfikacja | płatność
+cs: přihlášení | přihlásit | heslo | ověření | platba
+hu: bejelentkezés | jelszó | ellenőrzés | fizetés
+ro: autentificare | conectare | parolă | verificare | plată
+tr: giriş yap | oturum aç | şifre | parola | doğrulama | ödeme
+el: σύνδεση | κωδικός | επαλήθευση | πληρωμή
+ru: вход | войти | пароль | подтверждение | проверка | оплата
+uk: вхід | увійти | пароль | підтвердження | оплата
+ar: تسجيل الدخول | كلمة المرور | التحقق | الدفع
+he: התחברות | סיסמה | אימות | תשלום
+fa: ورود | رمز عبور | تایید هویت | پرداخت
+hi: साइन इन | लॉग इन | पासवर्ड | सत्यापन | भुगतान
+id/ms: masuk | log masuk | kata sandi | kata laluan | verifikasi | pembayaran
+vi: đăng nhập | mật khẩu | xác minh | thanh toán
+th: เข้าสู่ระบบ | รหัสผ่าน | ยืนยันตัวตน | ชำระเงิน
+zh: 登录 | 登錄 | 登入 | 密码 | 密碼 | 验证 | 驗證 | 支付 | 付款 | 结账 | 結帳
+ja: ログイン | サインイン | パスワード | 認証 | お支払い
+ko: 로그인 | 비밀번호 | 인증 | 결제

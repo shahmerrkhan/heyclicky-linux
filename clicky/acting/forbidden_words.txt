@@ -1,0 +1,200 @@
+# Buttons Clicky never presses. Checked by Clicky itself on the button's name,
+# description, tooltip and other accessibility text, and on Gemini's note of what
+# the button does. A match always wins: no setting and no Gemini answer can allow it.
+#
+# Format (see clicky/acting/words.py): entries separated by "|", an optional
+# language tag before ":" (ignored). Words match on word starts ("send" also
+# matches "Sending"); "=word" must match the whole word; Chinese, Japanese, Korean,
+# Thai, Arabic, Hebrew and similar match anywhere; symbols match anywhere.
+# Add entries freely. Removing one makes Clicky less safe.
+
+# --- Send, post, publish, share -------------------------------------------------
+en: send | send now | schedule send | resend | post | repost | publish | tweet | retweet | toot | share | reshare | reply all | reply to all | submit | upload | transmit | deliver | broadcast | dispatch
+es: enviar | envía | envia | mandar | publicar | compartir | responder a todos | programar envío | subir
+pt: enviar | envie | publicar | postar | compartilhar | partilhar | responder a todos | agendar envio | carregar
+fr: envoyer | envoie | expédier | publier | poster | partager | répondre à tous | planifier l'envoi | téléverser
+de: senden | absenden | jetzt senden | versenden | abschicken | schicken | veröffentlichen | posten | teilen | allen antworten | senden planen | hochladen
+it: invia | inviare | spedisci | pubblica | pubblicare | condividi | rispondi a tutti | programma invio | carica
+nl: verzenden | verzend | verstuur | versturen | sturen | publiceren | plaatsen | delen | allen beantwoorden | uploaden
+sv: skicka | publicera | dela | svara alla | ladda upp
+no: send | publiser | =del | svar alle | last opp
+da: send | udgiv | publicer | =del | svar alle | upload
+fi: lähetä | julkaise | =jaa | vastaa kaikille | lataa
+pl: wyślij | wyslij | wysłać | opublikuj | publikuj | udostępnij | odpowiedz wszystkim | prześlij
+cs: odeslat | odešli | poslat | publikovat | sdílet | odpovědět všem | nahrát
+sk: odoslať | poslať | publikovať | zdieľať | odpovedať všetkým
+hu: küldés | küld | elküld | közzététel | közzétesz | megosztás | megoszt | válasz mindenkinek | feltöltés
+ro: trimite | trimiteți | publică | publicare | distribuie | răspunde tuturor | încarcă
+tr: gönder | yayınla | paylaş | tümünü yanıtla | yükle
+el: αποστολή | στείλε | δημοσίευση | δημοσίευσε | κοινοποίηση | απάντηση σε όλους | μεταφόρτωση
+ru: отправить | отправка | отправь | послать | опубликовать | публиковать | поделиться | ответить всем | загрузить
+uk: надіслати | відправити | опублікувати | поділитися | відповісти всім | завантажити
+bg: изпрати | изпращане | публикувай | сподели | отговор до всички | качи
+sr/hr: pošalji | posalji | objavi | podijeli | podeli | odgovori svima | пошаљи | објави | подели
+sl: pošlji | objavi | =deli
+ar: إرسال | ارسال | أرسل | ارسل | نشر | انشر | مشاركة | شارك | الرد على الكل | رفع | تحميل
+he: שלח | שליחה | פרסם | פרסום | שתף | השב לכולם
+fa: ارسال | بفرست | انتشار | منتشر | اشتراک گذاری | پاسخ به همه | بارگذاری
+hi: भेजें | भेजे | भेजना | प्रकाशित करें | पोस्ट करें | साझा करें | सभी को जवाब दें | अपलोड
+bn: পাঠান | প্রকাশ করুন | শেয়ার করুন | সবাইকে উত্তর
+ur: بھیجیں | شائع کریں | شیئر کریں
+id/ms: kirim | hantar | terbitkan | bagikan | kongsi | balas semua | unggah | muat naik
+vi: gửi | đăng | chia sẻ | trả lời tất cả | tải lên
+th: ส่ง | โพสต์ | เผยแพร่ | แชร์ | ตอบกลับทั้งหมด | อัปโหลด
+zh: 发送 | 發送 | 传送 | 傳送 | 寄出 | 发布 | 發布 | 發佈 | 分享 | 回复全部 | 全部回复 | 回覆全部 | 全部回覆 | 发帖 | 發帖 | 提交 | 上传 | 上傳 | 转发 | 轉發
+ja: 送信 | 送る | 投稿 | 公開 | 共有 | 全員に返信 | ツイート | ポスト | アップロード
+ko: 보내기 | 전송 | 게시 | 공유 | 전체 답장 | 전체답장 | 올리기 | 업로드
+tl: ipadala | magpadala | i-post | ibahagi
+sw: tuma | chapisha | shiriki | pakia
+
+# --- Submit, confirm, accept, agree, allow, OK, yes, save, apply, continue -------
+en: confirm | accept | accept all | agree | i agree | allow | approve | authorize | authorise | grant | =ok | okay | =yes | continue | proceed | =done | finish | complete | apply | save | enter | =go | go ahead | =got it | verify | join | =like | vote | invite | =book | reserve | rsvp | sign | accept invitation | follow
+es: aceptar | acepto | confirmar | de acuerdo | estoy de acuerdo | permitir | aprobar | autorizar | =sí | =si | continuar | guardar | aplicar | finalizar | unirse | votar | seguir
+pt: aceitar | aceito | confirmar | concordo | permitir | aprovar | autorizar | =sim | continuar | salvar | guardar | aplicar | concluir | finalizar | participar | seguir
+fr: soumettre | valider | confirmer | accepter | j'accepte | tout accepter | autoriser | approuver | d'accord | =oui | continuer | enregistrer | appliquer | terminer | rejoindre | voter | suivre
+de: bestätigen | akzeptieren | annehmen | zustimmen | einverstanden | erlauben | zulassen | genehmigen | =ja | weiter | fortfahren | speichern | übernehmen | anwenden | fertig | beitreten | abstimmen | alle akzeptieren | folgen
+it: conferma | confermare | accetta | accetto | acconsento | consenti | autorizza | approva | =sì | continua | salva | applica | fine | partecipa | segui
+nl: bevestigen | bevestig | accepteren | accepteer | akkoord | toestaan | goedkeuren | =ja | doorgaan | verder | opslaan | toepassen | klaar | volgen
+sv: bekräfta | acceptera | godkänn | godkänna | tillåt | =ja | fortsätt | spara | verkställ | =klar | följ
+no/da: bekreft | bekræft | aksepter | accepter | godta | godkend | godkjenn | tillat | tillad | =ja | fortsett | fortsæt | lagre | =gem | følg
+fi: vahvista | hyväksy | salli | =kyllä | jatka | tallenna | valmis | seuraa
+pl: zatwierdź | potwierdź | akceptuj | zaakceptuj | zgadzam się | zezwól | zezwalaj | =tak | dalej | kontynuuj | zapisz | zastosuj | gotowe | obserwuj
+cs: potvrdit | přijmout | souhlasím | povolit | schválit | =ano | pokračovat | uložit | použít | hotovo | sledovat
+sk: potvrdiť | prijať | súhlasím | povoliť | schváliť | =áno | pokračovať | uložiť | použiť | sledovať
+hu: megerősít | megerősítés | elfogad | elfogadom | engedélyez | jóváhagy | =igen | tovább | folytatás | mentés | alkalmaz | kész | követés
+ro: confirmă | confirm | acceptă | accept | sunt de acord | permite | aprobă | =da | continuă | salvează | aplică | =gata | urmărește
+tr: onayla | kabul et | kabul ediyorum | izin ver | =evet | devam | kaydet | uygula | tamam | takip et
+el: επιβεβαίωση | αποδοχή | αποδέχομαι | συμφωνώ | να επιτρέπεται | επιτρέπεται | =ναι | συνέχεια | αποθήκευση | εφαρμογή | ακολούθησε
+ru: подтвердить | подтверждаю | принять | согласен | согласна | разрешить | одобрить | =да | продолжить | далее | сохранить | применить | готово | подписаться | вступить
+uk: підтвердити | прийняти | погоджуюсь | погоджуюся | дозволити | схвалити | =так | продовжити | далі | зберегти | застосувати | готово | стежити
+bg: потвърди | приеми | съгласен | разреши | =да | продължи | запази | приложи
+sr/hr: potvrdi | prihvati | slažem se | dozvoli | dopusti | odobri | =da | nastavi | spremi | sačuvaj | primijeni | потврди | прихвати
+ar: تأكيد | أكد | موافق | أوافق | قبول | اقبل | السماح | سماح | نعم | متابعة | استمرار | حفظ | تطبيق | انضمام
+he: אישור | אשר | אני מסכים | מסכים | קבל | אפשר | כן | המשך | שמור | החל | הצטרף
+fa: تایید | تأیید | قبول | موافقم | اجازه | بله | ادامه | ذخیره | اعمال | پیوستن
+hi: पुष्टि करें | पुष्टि | स्वीकार करें | स्वीकार | सहमत | अनुमति दें | हाँ | जारी रखें | सहेजें | लागू करें | सबमिट करें | जमा करें
+bn: নিশ্চিত করুন | গ্রহণ করুন | সম্মত | অনুমতি দিন | হ্যাঁ | চালিয়ে যান | সংরক্ষণ | জমা দিন
+ur: تصدیق | قبول کریں | اجازت دیں | ہاں | جاری رکھیں | محفوظ کریں | جمع کرائیں
+id/ms: kirimkan | konfirmasi | sahkan | terima | setuju | saya setuju | izinkan | benarkan | =ya | lanjutkan | teruskan | simpan | terapkan | selesai | ikuti | gabung | sertai
+vi: xác nhận | chấp nhận | đồng ý | cho phép | =có | tiếp tục | lưu | áp dụng | xong | theo dõi | tham gia
+th: ยืนยัน | ยอมรับ | ตกลง | อนุญาต | ใช่ | ดำเนินการต่อ | บันทึก | ติดตาม | เข้าร่วม
+zh: 确认 | 確認 | 确定 | 確定 | 接受 | 同意 | 允许 | 允許 | 继续 | 繼續 | 保存 | 儲存 | 应用 | 套用 | 完成 | 好的 | 关注 | 關注 | 加入
+ja: 確認 | 確定 | 承認 | 同意 | 許可 | はい | 続行 | 次へ | 保存 | 適用 | 完了 | 参加 | フォロー
+ko: 확인 | 승인 | 동의 | 수락 | 허용 | 예 | 계속 | 저장 | 적용 | 완료 | 제출 | 팔로우 | 참여
+tl: kumpirmahin | tanggapin | sang-ayon | payagan | =oo | magpatuloy | i-save | sumali
+sw: thibitisha | kubali | ruhusu | =ndiyo | endelea | hifadhi | jiunge
+
+# --- Pay, buy, order, checkout, donate, subscribe, money -------------------------
+en: pay | payment | buy | buy now | purchase | order | place order | checkout | check out | add to cart | add to basket | add to bag | donate | subscribe | unsubscribe | upgrade | renew | transfer | withdraw | deposit | top up | bid | rent | book now | tip | send money | request money | cash out | trade | sell | invest | redeem | claim | start trial | free trial | billing | cancel order | cancel subscription | cancel booking | cancel membership
+es: pagar | pago | comprar | compra | pedir | pedido | realizar pedido | tramitar pedido | finalizar compra | añadir al carrito | agregar al carrito | donar | suscribirse | suscribir | cancelar suscripción | darse de baja | transferir | transferencia | retirar | depositar | recargar | vender | reservar
+pt: pagar | pagamento | comprar | compra | encomendar | finalizar compra | fazer pedido | adicionar ao carrinho | doar | assinar | inscrever | cancelar inscrição | cancelar assinatura | transferir | transferência | sacar | depositar | recarregar | vender | reservar
+fr: payer | paiement | acheter | achat | commander | passer commande | valider la commande | ajouter au panier | faire un don | s'abonner | abonner | se désabonner | désabonner | désinscrire | transférer | virement | retirer | déposer | recharger | vendre | réserver
+de: bezahlen | zahlen | zahlung | kaufen | jetzt kaufen | kauf | bestellen | zahlungspflichtig bestellen | bestellung | zur kasse | kasse | in den warenkorb | warenkorb | spenden | abonnieren | abbestellen | abmelden | überweisen | überweisung | abheben | einzahlen | aufladen | verkaufen | buchen | reservieren
+it: paga | pagare | pagamento | acquista | compra | ordina | effettua ordine | procedi all'acquisto | aggiungi al carrello | dona | iscriviti | abbonati | annulla iscrizione | disiscriviti | trasferisci | bonifico | preleva | deposita | ricarica | vendi | prenota
+nl: betalen | betaal | kopen | koop | bestellen | bestel | afrekenen | in winkelwagen | winkelwagen | doneren | abonneren | afmelden | uitschrijven | overmaken | overschrijven | opnemen | storten | opwaarderen | verkopen | boeken | reserveren
+sv: betala | köp | köpa | beställ | beställa | till kassan | kassa | lägg i varukorg | donera | prenumerera | avsluta prenumeration | avregistrera | överför | ta ut | sätt in | sälj | boka
+no/da: betal | kjøp | køb | bestill | bestil | kasse | legg i handlekurv | læg i kurv | doner | abonner | avslutt abonnement | afmeld | overfør | ta ut | hæv | sett inn | selg | sælg | book
+fi: maksa | osta | tilaa | kassalle | lisää ostoskoriin | lahjoita | peruuta tilaus | siirrä | nosta | talleta | myy | varaa
+pl: zapłać | zaplac | płatność | kup | kup teraz | zamów | złóż zamówienie | do kasy | dodaj do koszyka | przekaż darowiznę | subskrybuj | wypisz | anuluj subskrypcję | przelew | przelej | wypłać | wpłać | doładuj | sprzedaj | zarezerwuj
+cs: zaplatit | platba | koupit | objednat | k pokladně | do košíku | darovat | odebírat | odhlásit | převést | vybrat | vložit | prodat | rezervovat
+sk: zaplatiť | kúpiť | objednať | do košíka | darovať | odhlásiť | previesť | vybrať | vložiť | predať
+hu: fizetés | fizet | vásárlás | vásárol | megrendel | rendelés | pénztár | kosárba | adományoz | feliratkozás | leiratkozás | átutalás | utal | kivét | befizet | elad | foglalás
+ro: plătește | plată | cumpără | comandă | plasează comanda | finalizează comanda | adaugă în coș | donează | abonează | dezabonare | transferă | retrage | depune | vinde | rezervă
+tr: öde | ödeme | satın al | sipariş ver | siparişi tamamla | sepete ekle | bağış yap | abone ol | abonelikten çık | para çek | yatır | =sat | rezervasyon
+el: πληρωμή | πλήρωσε | αγορά | αγόρασε | παραγγελία | ολοκλήρωση παραγγελίας | ταμείο | στο καλάθι | δωρεά | εγγραφή | απεγγραφή | μεταφορά | ανάληψη | κατάθεση | πώληση | κράτηση
+ru: оплатить | оплата | заплатить | купить | покупка | заказать | оформить заказ | оформить | в корзину | пожертвовать | отписаться | перевести | перевод | вывести | снять | пополнить | внести | продать | забронировать
+uk: оплатити | сплатити | купити | замовити | оформити замовлення | у кошик | пожертвувати | підписатися | відписатися | переказати | переказ | вивести | зняти | поповнити | продати | забронювати
+bg: плати | плащане | купи | поръчай | към касата | в количката | дари | абонирай | отпиши | преведи | изтегли | внеси | продай | резервирай
+sr/hr: plati | plaćanje | kupi | naruči | na blagajnu | u košaricu | u korpu | doniraj | pretplati | odjavi | prenesi | isplati | uplati | prodaj | rezerviraj | rezerviši | плати | купи | наручи
+ar: ادفع | دفع | الدفع | شراء | اشتر | اشتري | اطلب | طلب | إتمام الطلب | اتمام الشراء | أضف إلى السلة | تبرع | اشترك | إلغاء الاشتراك | تحويل | سحب | إيداع | شحن | بيع | حجز
+he: שלם | תשלום | קנה | רכישה | הזמן | הזמנה | לקופה | הוסף לסל | תרום | הירשם | הסר מרשימה | בטל מנוי | העבר | העברה | משיכה | הפקדה | מכור
+fa: پرداخت | خرید | بخر | سفارش | ثبت سفارش | افزودن به سبد | اهدا | اشتراک | لغو اشتراک | انتقال | برداشت | واریز | فروش | رزرو
+hi: भुगतान करें | भुगतान | खरीदें | अभी खरीदें | ऑर्डर करें | चेकआउट | कार्ट में जोड़ें | दान करें | सदस्यता लें | सदस्यता रद्द करें | ट्रांसफर | निकालें | बेचें | बुक करें
+bn: পরিশোধ | অর্থপ্রদান | কিনুন | অর্ডার করুন | কার্টে যোগ করুন | দান করুন | সাবস্ক্রাইব | স্থানান্তর | তুলুন | বিক্রি
+ur: ادائیگی | خریدیں | آرڈر کریں | عطیہ | سبسکرائب | منتقل کریں | نکالیں | فروخت
+id/ms: bayar | pembayaran | beli | beli sekarang | pesan | buat pesanan | tambah ke keranjang | tambah ke troli | donasi | derma | berlangganan | langgan | berhenti berlangganan | pindahkan | tarik | setor | isi ulang | jual | tempah
+vi: thanh toán | mua | mua ngay | đặt hàng | đặt mua | thêm vào giỏ | quyên góp | đăng ký | hủy đăng ký | chuyển tiền | chuyển khoản | rút tiền | nạp tiền | bán | đặt chỗ
+th: ชำระเงิน | จ่าย | ซื้อ | ซื้อเลย | สั่งซื้อ | ชำระ | เพิ่มลงตะกร้า | บริจาค | สมัครสมาชิก | ยกเลิกการสมัคร | โอน | ถอน | ฝาก | เติมเงิน | ขาย | จอง
+zh: 支付 | 付款 | 购买 | 購買 | 立即购买 | 下单 | 下單 | 结算 | 結帳 | 结账 | 去结算 | 加入购物车 | 加入購物車 | 捐赠 | 捐款 | 订阅 | 訂閱 | 取消订阅 | 取消訂閱 | 退订 | 转账 | 轉帳 | 提现 | 提款 | 充值 | 储值 | 出售 | 卖出 | 预订 | 預訂
+ja: 支払う | 支払い | お支払い | 購入 | 今すぐ購入 | 注文 | 注文する | 注文を確定 | レジに進む | カートに入れる | 寄付 | 購読 | 登録解除 | 配信停止 | 振込 | 送金 | 出金 | 入金 | チャージ | 売る | 予約
+ko: 결제 | 지불 | 구매 | 바로 구매 | 주문 | 주문하기 | 장바구니 담기 | 장바구니에 추가 | 기부 | 구독 | 구독 취소 | 송금 | 이체 | 출금 | 입금 | 충전 | 판매 | 예약
+tl: magbayad | bilhin | bumili | mag-order | idagdag sa cart | mag-donate | mag-subscribe | ilipat | mag-withdraw
+sw: lipa | nunua | agiza | ongeza kwenye kikapu | changia | jisajili | hamisha | toa pesa
+
+# --- Delete, remove, discard, trash, archive, block, report, leave ---------------
+en: delete | remove | discard | trash | move to trash | bin | archive | erase | clear | clear all | wipe | purge | empty trash | destroy | uninstall | block | report | report spam | mark as spam | spam | leave | leave group | unfriend | unfollow | deactivate | close account | reset | revoke | disconnect | unlink | overwrite | replace all | kick | ban | dismiss
+es: eliminar | borrar | suprimir | quitar | descartar | papelera | mover a la papelera | archivar | vaciar | limpiar | bloquear | denunciar | reportar | marcar como spam | salir | abandonar | dejar de seguir | desactivar | restablecer | revocar | desvincular
+pt: excluir | apagar | eliminar | remover | descartar | lixeira | lixo | mover para a lixeira | arquivar | esvaziar | limpar | bloquear | denunciar | marcar como spam | sair | deixar de seguir | desativar | redefinir | revogar | desvincular
+fr: supprimer | effacer | retirer | enlever | jeter | corbeille | mettre à la corbeille | archiver | vider | bloquer | signaler | quitter | désactiver | réinitialiser | révoquer | dissocier
+de: löschen | entfernen | verwerfen | papierkorb | in den papierkorb | archivieren | leeren | blockieren | sperren | melden | als spam | verlassen | entfolgen | deaktivieren | zurücksetzen | widerrufen | trennen
+it: elimina | eliminare | cancella | rimuovi | scarta | cestino | sposta nel cestino | archivia | svuota | blocca | segnala | abbandona | esci | smetti di seguire | disattiva | reimposta | revoca | scollega
+nl: verwijderen | verwijder | wissen | weggooien | prullenbak | archiveren | legen | blokkeren | rapporteren | melden | verlaten | ontvolgen | deactiveren | opnieuw instellen | intrekken | ontkoppelen
+sv: ta bort | radera | släng | kasta | papperskorg | arkivera | töm | blockera | rapportera | anmäl | lämna | sluta följa | inaktivera | återställ | återkalla
+no/da: slett | slet | fjern | forkast | kast | papirkurv | arkiver | tøm | blokker | bloker | rapporter | anmeld | forlat | forlad | deaktiver | tilbakestill | nulstil
+fi: poista | hylkää | roskakori | arkistoi | tyhjennä | estä | ilmoita | poistu | lopeta seuraaminen | poista käytöstä | nollaa
+pl: usuń | usun | skasuj | odrzuć | kosz | przenieś do kosza | archiwizuj | opróżnij | wyczyść | zablokuj | zgłoś | opuść | wyjdź | przestań obserwować | dezaktywuj | resetuj | cofnij dostęp
+cs: smazat | odstranit | zahodit | koš | archivovat | vyprázdnit | zablokovat | nahlásit | opustit | odejít | přestat sledovat | deaktivovat
+sk: zmazať | odstrániť | zahodiť | kôš | archivovať | vyprázdniť | zablokovať | nahlásiť | opustiť
+hu: törlés | töröl | eltávolít | elvet | kuka | lomtár | archivál | kiürít | letilt | blokkol | jelent | kilép | elhagy | kikapcsol | visszaállít
+ro: șterge | sterge | elimină | renunță | coș | arhivează | golește | blochează | raportează | părăsește | dezactivează | resetează
+tr: =sil | kaldır | çöp | çöp kutusu | arşivle | boşalt | temizle | engelle | bildir | şikayet et | ayrıl | takibi bırak | devre dışı bırak | sıfırla
+el: διαγραφή | διάγραψε | αφαίρεση | απόρριψη | κάδος | αρχειοθέτηση | άδειασμα | αποκλεισμός | αναφορά | αποχώρηση | απενεργοποίηση | επαναφορά
+ru: удалить | удаление | убрать | стереть | сбросить | корзина | архивировать | в архив | очистить | заблокировать | пожаловаться | спам | выйти | покинуть | деактивировать | отозвать
+uk: видалити | вилучити | прибрати | стерти | кошик | архівувати | очистити | заблокувати | поскаржитися | вийти | покинути | деактивувати | скинути
+bg: изтрий | изтриване | премахни | отхвърли | кошче | архивирай | изчисти | блокирай | докладвай | напусни | деактивирай | нулирай
+sr/hr: obriši | izbriši | ukloni | odbaci | smeće | arhiviraj | isprazni | blokiraj | prijavi | napusti | deaktiviraj | resetuj | обриши | уклони | блокирај
+ar: حذف | احذف | إزالة | ازالة | تجاهل | سلة المهملات | المهملات | أرشفة | ارشفة | إفراغ | مسح | حظر | إبلاغ | الإبلاغ | مغادرة | غادر | إلغاء المتابعة | إلغاء التنشيط | إعادة تعيين
+he: מחק | מחיקה | הסר | הסרה | השלך | אשפה | העבר לאשפה | ארכיון | רוקן | נקה | חסום | דווח | עזוב | צא מהקבוצה | הפסק לעקוב | השבת | אפס
+fa: حذف | پاک کردن | پاک | دور انداختن | سطل زباله | بایگانی | خالی کردن | مسدود | گزارش | ترک | خروج | غیرفعال | بازنشانی
+hi: हटाएं | हटाएँ | मिटाएं | डिलीट | खारिज करें | ट्रैश | संग्रहित करें | आर्काइव | खाली करें | ब्लॉक करें | रिपोर्ट करें | छोड़ें | अनफ़ॉलो | निष्क्रिय करें | रीसेट
+bn: মুছুন | মুছে ফেলুন | সরান | ট্র্যাশ | আর্কাইভ | ব্লক | রিপোর্ট | ছেড়ে যান
+ur: حذف کریں | ہٹائیں | مٹائیں | بلاک | رپورٹ | چھوڑیں
+id/ms: hapus | padam | buang | singkirkan | tempat sampah | sampah | arsipkan | arkib | kosongkan | bersihkan | blokir | sekat | laporkan | keluar | tinggalkan | berhenti mengikuti | nonaktifkan | setel ulang
+vi: xóa | xoá | loại bỏ | =gỡ | thùng rác | lưu trữ | dọn sạch | chặn | báo cáo | rời | bỏ theo dõi | vô hiệu hóa | đặt lại
+th: ลบ | นำออก | ทิ้ง | ถังขยะ | เก็บถาวร | ล้าง | บล็อก | รายงาน | ออกจากกลุ่ม | เลิกติดตาม | ปิดใช้งาน | รีเซ็ต
+zh: 删除 | 刪除 | 移除 | 清除 | 清空 | 舍弃 | 捨棄 | 丢弃 | 丟棄 | 放弃 | 垃圾桶 | 回收站 | 归档 | 封存 | 屏蔽 | 封锁 | 封鎖 | 拉黑 | 举报 | 檢舉 | 舉報 | 退出 | 离开 | 離開 | 取消关注 | 取消追蹤 | 停用 | 重置
+ja: 削除 | 消去 | 除去 | 取り除く | 破棄 | 捨てる | ゴミ箱 | アーカイブ | 空にする | クリア | ブロック | 報告 | 通報 | 退出 | 退会 | フォロー解除 | 無効化 | リセット
+ko: 삭제 | 제거 | 지우기 | 버리기 | 폐기 | 휴지통 | 보관처리 | 보관 | 비우기 | 차단 | 신고 | 나가기 | 탈퇴 | 언팔로우 | 팔로우 취소 | 비활성화 | 초기화
+tl: burahin | tanggalin | alisin | itapon | basurahan | i-archive | i-block | i-report | umalis
+sw: futa | ondoa | tupa | pipa la taka | zuia | ripoti | ondoka
+
+# --- Sign in, sign up, log out, password, verification ---------------------------
+en: sign in | signin | log in | login | log on | sign up | signup | register | create account | join now | sign out | log out | logout | forgot password | reset password | change password | password | verification | authenticate | continue with | use another account | switch account | add account
+es: iniciar sesión | acceder | entrar | ingresar | registrarse | regístrate | crear cuenta | cerrar sesión | contraseña | verificar
+pt: iniciar sessão | fazer login | cadastrar | cadastre-se | registrar | criar conta | terminar sessão | senha | palavra-passe | verificar
+fr: se connecter | connexion | s'identifier | identifiez-vous | s'inscrire | inscription | créer un compte | se déconnecter | déconnexion | mot de passe | vérifier
+de: anmelden | einloggen | registrieren | konto erstellen | ausloggen | passwort | kennwort | verifizieren
+it: accedi | =entra | registrati | crea account | disconnetti | verifica
+nl: inloggen | aanmelden | registreren | account aanmaken | uitloggen | wachtwoord | verifiëren
+sv: logga in | registrera | skapa konto | logga ut | lösenord | verifiera
+no/da: logg inn | log ind | registrer | opprett konto | opret konto | logg ut | log ud | passord | adgangskode
+fi: kirjaudu | rekisteröidy | luo tili | salasana
+pl: zaloguj | logowanie | zarejestruj | załóż konto | utwórz konto | wyloguj | hasło | zweryfikuj
+cs: přihlásit | registrovat | vytvořit účet | heslo | ověřit
+sk: prihlásiť | registrovať | vytvoriť účet | heslo | overiť
+hu: bejelentkezés | belépés | regisztráció | fiók létrehozása | kijelentkezés | jelszó | ellenőrzés
+ro: conectare | autentificare | conectează-te | înregistrare | creează cont | deconectare | parolă | verifică
+tr: giriş yap | oturum aç | kaydol | üye ol | hesap oluştur | çıkış yap | oturumu kapat | şifre | parola | doğrula
+el: σύνδεση | είσοδος | δημιουργία λογαριασμού | αποσύνδεση | κωδικός | επαλήθευση
+ru: войти | вход | авторизоваться | зарегистрироваться | регистрация | создать аккаунт | выход | пароль
+uk: увійти | вхід | зареєструватися | реєстрація | створити обліковий запис | пароль
+bg: вход | влез | регистрация | създай профил | изход | парола
+sr/hr: prijava | prijavi se | registracija | registriraj | napravi nalog | odjava | lozinka | šifra | пријава | лозинка
+ar: تسجيل الدخول | دخول | تسجيل | إنشاء حساب | تسجيل الخروج | خروج | كلمة المرور | كلمة السر | التحقق | تحقق
+he: התחבר | התחברות | כניסה | הרשמה | צור חשבון | התנתק | יציאה | סיסמה | אימות
+fa: ورود | وارد شوید | ثبت نام | ایجاد حساب | رمز عبور | گذرواژه | احراز هویت
+hi: साइन इन | लॉग इन | प्रवेश करें | साइन अप | पंजीकरण | खाता बनाएं | साइन आउट | लॉग आउट | पासवर्ड | सत्यापित करें
+bn: সাইন ইন | লগ ইন | সাইন আপ | নিবন্ধন | অ্যাকাউন্ট তৈরি | লগ আউট | পাসওয়ার্ড | যাচাই
+ur: سائن ان | لاگ ان | سائن اپ | اکاؤنٹ بنائیں | لاگ آؤٹ | پاس ورڈ
+id/ms: masuk | log masuk | daftar | buat akun | buat akaun | log keluar | kata sandi | kata laluan | verifikasi
+vi: đăng nhập | tạo tài khoản | đăng xuất | mật khẩu | xác minh
+th: เข้าสู่ระบบ | ลงชื่อเข้าใช้ | สมัคร | ลงทะเบียน | สร้างบัญชี | ออกจากระบบ | รหัสผ่าน | ยืนยันตัวตน
+zh: 登录 | 登錄 | 登入 | 注册 | 註冊 | 创建账户 | 建立帳戶 | 退出登录 | 登出 | 注销 | 註銷 | 密码 | 密碼 | 验证 | 驗證
+ja: ログイン | サインイン | 新規登録 | 登録 | アカウント作成 | ログアウト | サインアウト | パスワード | 認証
+ko: 로그인 | 가입 | 회원가입 | 계정 만들기 | 로그아웃 | 비밀번호 | 인증
+tl: mag-sign in | mag-log in | mag-sign up | magparehistro | gumawa ng account | mag-log out
+sw: ingia | unda akaunti | =toka | nenosiri
+
+# --- Icon names and symbols (icon-only buttons with these in their text) ---------
+icons: mail-send | document-send | send-symbolic | paper plane | paperplane | edit-delete | user-trash | garbage | trash-can | trashcan | shopping cart | shopping-cart | credit card | credit-card | thumbs up | thumbs-up
+symbols: ✓ | ✔ | ✅ | ☑ | ➤ | ➢ | ➣ | ➥ | ➦ | ⮕ | 📤 | 📨 | 📩 | 🗑 | 🛒 | 💳 | 💰 | 💸 | 💵 | 👍 | ❤ | ♥
