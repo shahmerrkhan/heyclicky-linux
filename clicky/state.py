@@ -93,8 +93,9 @@ from .writing.fill import (
     remember_typed,
     run_steps,
     shown_text,
+    soften,
     type_into_clicked,
-    vet,
+    vet_rule,
 )
 from .writing import my_name
 from .writing.screen_request import (
@@ -1399,14 +1400,20 @@ class CompanionStateMachine(QObject):
         """One "open" or "focus" answer carried out. Returns the window to check next, or (None, why not)."""
         if self._act_grab is None and not self._acquire_act_grab(act):
             return None, "Clicky couldn't hold the Esc key (another program has it), so it didn't open or press anything"
+        started = time.monotonic()
         if result.status == OPEN:
             option = cheapest(result.open_option, acting.options)
             new_target, why = await actor.open(option)
+            logger.info("acting: task %s: open %s %s after %.1f s (%s)", act.id, option.kind,
+                        "worked" if new_target is not None else "failed", time.monotonic() - started,
+                        actor.last_code or "ok")
             if new_target is None:
                 return None, why
             act.next_step()
             return new_target, ""
         why = await actor.press(target, result.press, result.safe, result.does)
+        logger.info("acting: task %s: press %s after %.1f s (%s)", act.id, "worked" if why is None else "failed",
+                    time.monotonic() - started, actor.last_code or "ok")
         if why is not None:
             return None, why
         act.next_step()
@@ -1502,12 +1509,18 @@ class CompanionStateMachine(QObject):
         earlier = self._earlier_in(target)
         if result.status == FAILED:
             logger.info("where-to-type check failed: %s", result.why)
+            logger.info("fill: nothing typed: check_failed")
             self._memory.add(request, draft)
             return await self._nothing_typed(draft, f"Not typed: {result.why}.", f"{FAILED_TEXT}\n\n{draft}")
-        steps = result.steps
+        steps = soften(result.steps, earlier) if result.status == GO else result.steps
         why = (result.why or "it couldn't be done in that window") if result.status == STOP else None
-        why = why or vet(steps, request, draft, result.fields, earlier)
+        rule = "model_said_stop" if why is not None else ""
+        if why is None:
+            refused = vet_rule(steps, request, draft, result.fields, earlier)
+            if refused is not None:
+                rule, why = refused
         if why is not None:
+            logger.info("fill: nothing typed: plan of %d step(s) refused by rule %s", len(steps), rule)
             known, _ = my_name.pick_name(settings.my_name, result.name_on_screen, self._persisted.my_name)
             shown = shown_text([replace(s, text=my_name.fill_name(s.text, known)) for s in steps]) if steps else draft
             self._memory.add(request, draft)
@@ -1535,13 +1548,21 @@ class CompanionStateMachine(QObject):
             status = await self._click_wait(steps, result)
         else:
             assert target is not None
+            fill_started = time.monotonic()
             outcome = await self._with_esc_grab(
                 "\n".join(s.text for s in steps),
                 lambda cancel: run_steps(
                     target, steps, self._typer.type_draft, cancel, self._typer.activate, self._move_to_clear,
                     earlier, self._typer.rewrite_part,
                 ),
-                refused=lambda why: FillOutcome(rest=list(steps), why=why),
+                refused=lambda why: FillOutcome(rest=list(steps), why=why, code="esc_grab_refused"),
+            )
+            methods = sorted({t.result.method for t in outcome.typed if t.result.method})
+            logger.info(
+                "fill: %d of %d piece(s) typed (%s; %d characters) in %.1f s, outcome: %s",
+                len([t for t in outcome.typed if not t.result.why_not and not t.result.stopped]), len(steps),
+                ", ".join(methods) or "no method", sum(t.result.typed_chars for t in outcome.typed),
+                time.monotonic() - fill_started, "complete" if outcome.complete else outcome.code or "stopped",
             )
             status = await self._report_fill(outcome, result, target, earlier)
         if name_note:
@@ -1655,6 +1676,9 @@ class CompanionStateMachine(QObject):
             outcome = await click_wait(steps, self._poll_focus, replies, match, type_into, self._explain, WAIT_S)
         finally:
             self._waiting = None
+        logger.info("click wait (%s): ended %s, %d of %d piece(s) typed",
+                    "no plan in time" if result.no_plan else "unsure", outcome.ended or "?",
+                    len(outcome.typed), len(steps))
         labels = [t.label for t in outcome.typed]
         self._last_draft = None
         window = next((t.target for t in outcome.typed if t.target is not None), None)

@@ -23,7 +23,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dc_field
 
 from .blank import holds_only_objects, is_empty
@@ -121,25 +121,61 @@ def _not_empty_why(name: str, box: Field) -> str:
     return f"{name} already has text in it"
 
 
+def softened(step: Step, box: Field | None, earlier: list[Earlier] = ()) -> Step:
+    """A plain "type" aimed at a multi-line box that has text becomes "add at the start".
+
+    The model sometimes answers "type" for a message box that already holds something (a
+    signature the app added, a quoted reply). Refusing leaves the user with nothing typed;
+    adding before what is there removes nothing (rule 1). Not for a one-line box (a filled
+    recipients or subject box is left alone), not for a box Clicky typed into last time (that
+    is a rewrite), and not for a box that can't be read or holds only objects.
+    """
+    if step.do != TYPE or box is None or box.text is None or not box.multi_line:
+        return step
+    if is_empty(box) or holds_only_objects(box) or earlier_for(box, earlier) is not None:
+        return step
+    return replace(step, do=ADD_START)
+
+
+def soften(steps: list[Step], earlier: list[Earlier] = ()) -> list[Step]:
+    """`softened` for every step of a plan, before it is vetted."""
+    out = [softened(s, s.place.field if s.place else None, earlier) for s in steps]
+    changed = sum(1 for a, b in zip(steps, out, strict=True) if a is not b)
+    if changed:
+        logger.info("fill: %d step(s) changed from type to add at the start (the box has text that stays)", changed)
+    return out
+
+
 def vet(
     steps: list[Step], request: str, draft: str, fields: list[Field], earlier: list[Earlier] = ()
 ) -> str | None:
     """Why the plan can't be typed as it is (rule 1 and the contact check), or None when it can."""
+    found = vet_rule(steps, request, draft, fields, earlier)
+    return found[1] if found is not None else None
+
+
+def vet_rule(
+    steps: list[Step], request: str, draft: str, fields: list[Field], earlier: list[Earlier] = ()
+) -> tuple[str, str] | None:
+    """`vet` with the name of the rule that refused, for the log: (rule, why), or None."""
     for step in steps:
         box = step.place.field if step.place else None
         name = place_label(step.place) if step.place else (step.what or "the box")
         if step.do == REWRITE:
             mine = earlier_for(box, earlier)
             if mine is None or box is None or box.text is None or find_span(box.text, mine.text) is None:
-                return f"Clicky can't tell which part of {name} is the text it typed last time"
+                return "own_text_not_found", f"Clicky can't tell which part of {name} is the text it typed last time"
         if step.do == REPLACE and not quote_in_request(step.quote, request):
-            return f"it would change the text already in {name}, and your request doesn't clearly ask for that"
+            return "replace_not_asked", (
+                f"it would change the text already in {name}, and your request doesn't clearly ask for that")
         if step.do == TYPE and box is not None and not is_empty(box):
-            return _not_empty_why(name, box)
+            rule = "box_unreadable" if box.text is None else (
+                "box_has_objects" if holds_only_objects(box) else "box_not_empty")
+            return rule, _not_empty_why(name, box)
     sources = [request, draft] + [f.text for f in fields if f.text]
     missing = made_up_contacts([s.text for s in steps], sources)
     if missing:
-        return f"it would type {missing[0]}, which isn't in your words, the draft or the window"
+        return "made_up_contact", f"it would type {missing[0]}, which isn't in your words, the draft or the window"
     return None
 
 
@@ -192,6 +228,7 @@ class FillOutcome:
     rest: list[Step] = dc_field(default_factory=list)  # not typed
     why: str = ""  # why it stopped before the end ("" when everything was typed)
     stopped: bool = False  # Esc
+    code: str = ""  # the rule or failure that stopped it, for the log ("" when everything was typed)
 
     @property
     def complete(self) -> bool:
@@ -218,35 +255,41 @@ async def run_steps(
     for index, step in enumerate(steps):
         label = place_label(step.place)
 
-        def stop(why: str, stopped: bool = False, index: int = index) -> FillOutcome:
+        def stop(why: str, stopped: bool = False, index: int = index, code: str = "") -> FillOutcome:
             # A piece typed only partly stays in the rest, so the whole of it is shown and copied.
             outcome.rest, outcome.why, outcome.stopped = list(steps[index:]), why, stopped
+            outcome.code = code or ("esc" if stopped else "")
             return outcome
 
         if cancel.is_set():
             return stop("", stopped=True)
         if step.place is None:
-            return stop(f"no box was chosen for {step.what or 'the text'}")
+            return stop(f"no box was chosen for {step.what or 'the text'}", code="no_box")
         if not await activate(target):
-            return stop(f"couldn't switch back to {target.app_name}")
+            return stop(f"couldn't switch back to {target.app_name}", code="activate_failed")
         ok, why, box = await move(target, step.place)
         if not ok:
-            return stop(f"couldn't reach {label} ({why})")
+            return stop(f"couldn't reach {label} ({why})", code="focus_failed")
         label = place_label(step.place, box)
         if is_password_box(box):
-            return stop(f"{label} is a password box, and Clicky never types into one")
+            return stop(f"{label} is a password box, and Clicky never types into one", code="password_box")
+        # The box as it is now: text that turned up since the check (a signature) stays, ours goes before it.
+        step = softened(step, box, earlier)
         if step.do == TYPE and box is not None and not is_empty(box):
             if box.text is None:
-                return stop(f"Clicky can't read what's in {label} now, so nothing was typed there")
+                return stop(f"Clicky can't read what's in {label} now, so nothing was typed there",
+                            code="box_unreadable")
             if holds_only_objects(box):
-                return stop(f"{label} holds an image or attachment now, so nothing was typed there")
-            return stop(f"{label} has text in it now, so nothing was typed there")
+                return stop(f"{label} holds an image or attachment now, so nothing was typed there",
+                            code="box_has_objects")
+            return stop(f"{label} has text in it now, so nothing was typed there", code="box_not_empty")
         if cancel.is_set():
             return stop("", stopped=True)
         if step.do == REWRITE:
             mine = earlier_for(box or (step.place.field if step.place else None), earlier)
             if mine is None or rewrite is None:
-                return stop(f"Clicky can't tell which part of {label} is the text it typed last time")
+                return stop(f"Clicky can't tell which part of {label} is the text it typed last time",
+                            code="own_text_not_found")
             result = await rewrite(target, mine.text, step.text, cancel)
         else:
             result = await type_text(target, with_gap(step, box), cancel, WHERE[step.do])
@@ -255,7 +298,7 @@ async def run_steps(
                 outcome.typed.append(Typed(step, label, box, result))
             if result.stopped:
                 return stop("", stopped=True)
-            return stop(f"{result.why_not or 'nothing could be typed'} (in {label})")
+            return stop(f"{result.why_not or 'nothing could be typed'} (in {label})", code="typing_failed")
         outcome.typed.append(Typed(step, label, box, result))
     return outcome
 
