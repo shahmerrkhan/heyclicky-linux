@@ -12,6 +12,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
+from ..logsafe import log_name
 from ..writing.browsers import BrowserCheck, listed
 from ..writing.fields import list_fields
 from ..writing.target import WritingTarget
@@ -33,7 +34,7 @@ from .guard import (
 )
 from .links import Link, markers_for, open_link
 from .options import APP, LINK, WINDOW, Button, OpenOption
-from .services import never_press_hits, service_for
+from .services import never_press_hits, services_for
 from .words import blocked_page_hits, forbidden_hits
 
 logger = logging.getLogger(__name__)
@@ -206,10 +207,10 @@ class Actor:
         if refusal is None:
             # This app's own never-press words (services.py), on top of the list.
             now = self.window_now()
-            service = service_for(target.app_class, getattr(now, "title", None) or target.title)
+            service = services_for(target.app_class, getattr(now, "title", None) or target.title)
             extra = never_press_hits(service, button.name, button.description, button.extra, does)
             if extra:
-                refusal = f'in {service.label} Clicky never presses "{extra[0]}" buttons'
+                refusal = f'in {service[0].label} Clicky never presses "{extra[0]}" buttons'
         if refusal is not None:
             logger.info("acting: task %s: button refused (%s)", self.task.id, refusal)
             self.last_code = "button_refused"
@@ -223,8 +224,8 @@ class Actor:
             return why
         boxes_before = _box_shape(await list_fields(target.pid))
         self._show(f'pressing "{button.label[:40]}"…')
-        logger.info("acting: task %s step %d: press a %s named %r", self.task.id, self.task.steps_used,
-                    button.role, button.label[:40])
+        logger.info("acting: task %s step %d: press a %s named %s", self.task.id, self.task.steps_used,
+                    button.role, log_name(button.label))
         ok, why = await press_button(target.pid, button)
         if not ok:
             self.last_code = "press_failed"
@@ -248,14 +249,14 @@ class Actor:
         """
         self.last_code = "click_refused"
         now = self.window_now()
-        service = service_for(target.app_class, getattr(now, "title", None) or target.title)
+        service = services_for(target.app_class, getattr(now, "title", None) or target.title)
 
         def refused(name: str, others: list[str], verdict: object) -> str | None:
             why = button_refusal(name, others, verdict)
             if why is None:
                 extra = never_press_hits(service, name, *others)
                 if extra:
-                    why = f'in {service.label} Clicky never presses "{extra[0]}" buttons'
+                    why = f'in {service[0].label} Clicky never presses "{extra[0]}" buttons'
             return why
 
         shown = label[:40]

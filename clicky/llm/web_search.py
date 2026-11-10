@@ -137,7 +137,7 @@ class WebSearch:
 
 
 def _failed(outcome: SearchOutcome, kind: SearchErrorKind, exc: BaseException) -> SearchOutcome:
-    logger.warning("tavily search failed (%s): %s", kind.name, exc)
+    logger.warning("tavily search failed (%s): %s", kind.name, type(exc).__name__)
     outcome.error_kind = kind
     outcome.error_detail = str(exc)
     return outcome

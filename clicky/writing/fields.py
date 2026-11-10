@@ -34,8 +34,11 @@ With the tray's acting switch on (`acting`), three more answers are possible; Cl
 acts (clicky/acting) and runs the check again on what it opened:
   - "open": the window isn't the right place; open one of the listed places (a link from
     the table in code, an open window, an installed app), by its id only;
-  - "focus": the right window, but the box isn't there yet: press one listed button
-    (only when no box is empty or focused; `needs_buttons`) with Gemini's safe verdict;
+  - "focus": the right window, but the box isn't there yet: press one listed button (the
+    buttons are listed when the window has no box to write in yet, `needs_buttons`, or on the
+    one re-ask) with Gemini's safe verdict; on the re-ask, or when no button can be read at
+    all, it may instead point at a button it sees on the screenshot (`ClickSpot`; the actor
+    looks at that spot again before any click);
   - "blocked": a sign-in, password, two-factor, captcha, payment or permission page.
 "missing" (any answer): what had to be left empty because the user didn't give it.
 
@@ -64,9 +67,10 @@ from ..acting.services import note_for, service_for
 from ..acting.words import forbidden_hits
 from ..llm.gemini import GeminiErrorKind, GeminiRequest, LabeledImage, classify_error
 from ..llm.length import DailyLimits, TextModel
+from ..logsafe import log_name
 from ..screen.capture import CapturedScreen
 from .blank import CODES_LIMIT, ROLES_LIMIT, blank_note, holds_only_objects, is_empty
-from .browsers import KNOWN_CLASSES, BrowserCheck, listed
+from .browsers import BrowserCheck, listed
 from .target import WritingTarget, active_window_target
 from .typer import _run, atspi
 
@@ -83,8 +87,6 @@ TEXT_ONLY_TIMEOUT_S = 1.5  # the easy case: the fast model without the screensho
 TOTAL_S = FAST_TIMEOUT_S + STRONG_TIMEOUT_S + RETRY_TIMEOUT_S  # the most all requests together may take
 MIN_STAGE_SHARE = 0.25  # a stage with less than this share of its own timer left isn't started
 NEED_SCREEN = "need_screen"  # the text-only answer "I need to see the screen"
-# Browsers (browsers.py: the class list, name stems, then Gemini): a web page's boxes are never the easy case.
-BROWSER_CLASSES = KNOWN_CLASSES
 
 GO, UNSURE, STOP, FAILED = "go", "unsure", "stop", "failed"
 OPEN, FOCUS, BLOCKED = "open", "focus", "blocked"  # only with the acting switch on
@@ -93,6 +95,7 @@ OPEN, FOCUS, BLOCKED = "open", "focus", "blocked"  # only with the acting switch
 NEED_BUTTONS = "need_buttons"
 BLOCKED_KINDS = ("login", "password", "2fa", "captcha", "payment", "permission")
 BUTTON_LIMIT = 60
+TITLE_LIMIT = 200  # the window title in the prompt (a page can make it as long as it likes)
 TYPE, ADD_START, ADD_END, REPLACE = "type", "add_start", "add_end", "replace"
 REWRITE = "rewrite"  # a follow-up: the text Clicky typed last time in that box, swapped for a new version
 ACTIONS = (TYPE, ADD_START, ADD_END, REPLACE, REWRITE)
@@ -386,7 +389,7 @@ def _prompt(
     buttons: list[Button] = (),
     no_buttons_readable: bool = False,
 ) -> str:
-    lines = [f'window: {window.app_class} — "{window.title}"']
+    lines = [f'window: {window.app_class} — "{(window.title or "")[:TITLE_LIMIT]}"']
     note = note_for(service_for(window.app_class, window.title))
     if note:
         lines.append(f"clicky's own note {note}")
@@ -415,7 +418,8 @@ def _prompt(
 
 
 def fields_summary(fields: list[Field], app_class: str) -> str:
-    """For the log: the boxes' names, kinds and whether each is empty — never their text."""
+    """For the log: the boxes' kinds and whether each is empty, with a name only when it is made
+    of plain interface words (logsafe.py) — never their text, never a tab or page title."""
     if not fields:
         return f"no text boxes listed in {app_class}"
     parts = []
@@ -430,7 +434,7 @@ def fields_summary(fields: list[Field], app_class: str) -> str:
         else:
             filled = "has text"
         focus = ", focused" if f.focused else ""
-        parts.append(f'{i} "{f.label}" ({f.role}, {"multi-line" if f.multi_line else "one line"}, {filled}{focus})')
+        parts.append(f'{i} {log_name(f.label)} ({f.role}, {"multi-line" if f.multi_line else "one line"}, {filled}{focus})')
     return f"{len(fields)} text boxes in {app_class}: " + "; ".join(parts)
 
 
