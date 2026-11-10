@@ -71,11 +71,15 @@ class ActingContext:
 
 
 def needs_buttons(fields: list) -> bool:
-    """Buttons are listed only when no box has focus and no box is empty.
+    """Buttons are listed only when no box has focus, and no box is empty or none is multi-line.
 
-    (A box whose text can't be read doesn't count as empty.)
+    (A box whose text can't be read doesn't count as empty.) A window with only one-line boxes
+    and no focus (a mail inbox: the address bar and a search box) has no place for a message
+    yet, so the buttons go with the first request instead of costing a second one.
     """
-    return not any(f.focused for f in fields) and not any(is_empty(f) for f in fields)
+    if any(f.focused for f in fields):
+        return False
+    return not any(is_empty(f) for f in fields) or not any(f.multi_line for f in fields)
 
 
 def cheapest(choice: OpenOption, options: list[OpenOption]) -> OpenOption:

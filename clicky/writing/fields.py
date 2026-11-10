@@ -574,7 +574,7 @@ Read = Callable[[str], CheckResult | None]
 def describe_error(exc: BaseException, timeout_s: float | None = None) -> str:
     """For the log: a timeout by name ("timed out after 3 s"), an error with no message by its type."""
     if isinstance(exc, TimeoutError):
-        return f"timed out after {timeout_s:g} s" if timeout_s is not None else "timed out"
+        return f"timed out after {round(timeout_s, 1):g} s" if timeout_s is not None else "timed out"
     text = str(exc).strip()
     return text or exc.__class__.__name__
 
@@ -901,7 +901,7 @@ async def _check_plan(
     if not screens:
         return CheckResult(FAILED, why="couldn't take a screenshot")
     if buttons:
-        why_listed = "asked again with the buttons" if with_buttons else "no box is empty or focused"
+        why_listed = "asked again with the buttons" if with_buttons else "no box to write in yet"
         logger.info("where-to-type: %d buttons listed (%s)", len(buttons), why_listed)
     images = [LabeledImage(data=s.image_data, label=s.label_for_model()) for s in screens]
     if with_buttons and acting is not None and not buttons:
