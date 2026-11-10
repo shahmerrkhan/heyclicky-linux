@@ -3,25 +3,38 @@
 Every action is allowed by the task's guard (`ActTask.authorize`) right before it starts,
 and the window it leads to is read again and checked before anything else happens there.
 The pieces that touch the desktop (`open_link`, `start_app`, `windows`, `press_button`,
-`list_fields`) are module attributes so tests can swap in fakes.
+`list_fields`, `what_is_at`, `click_once`) are module attributes so tests can swap in fakes.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from ..writing.browsers import BrowserCheck, listed
 from ..writing.fields import list_fields
 from ..writing.target import WritingTarget
+from ..writing.typer import _run
 from . import windows
 from .apps import start as start_app
-from .buttons import press_button
-from .guard import OPEN_LINK, PRESS_BUTTON, START_APP, SWITCH_WINDOW, ActTask, ExpectedWindow, button_refusal
+from .buttons import press_button, what_is_at
+from .closeup import CLICKABLE_KINDS
+from .guard import (
+    CLICK_POINT,
+    CLOSEUP_LIMIT_S,
+    OPEN_LINK,
+    PRESS_BUTTON,
+    START_APP,
+    SWITCH_WINDOW,
+    ActTask,
+    ExpectedWindow,
+    button_refusal,
+)
 from .links import Link, markers_for, open_link
 from .options import APP, LINK, WINDOW, Button, OpenOption
-from .words import blocked_page_hits
+from .services import never_press_hits, service_for
+from .words import blocked_page_hits, forbidden_hits
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +48,37 @@ POLL_S = 0.25
 
 
 
+async def click_once(point: tuple[int, int]) -> bool:
+    """One left click at a screen point, then the pointer goes back where the user had it."""
+    before = None
+    try:
+        _, out = await _run("xdotool", "getmouselocation", "--shell", timeout=3)
+        values = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        before = int(values["X"]), int(values["Y"])
+    except (TimeoutError, OSError, KeyError, ValueError):
+        before = None
+    try:
+        await _run("xdotool", "mousemove", "--sync", str(point[0]), str(point[1]), "click", "1", timeout=3)
+    except (TimeoutError, OSError):
+        return False
+    finally:
+        if before is not None:
+            try:
+                await _run("xdotool", "mousemove", "--sync", str(before[0]), str(before[1]), timeout=3)
+            except (TimeoutError, OSError):
+                logger.warning("couldn't put the pointer back")
+    return True
+
+
+# The close-up look before a click: (screen point) -> {"kind", "label", "safe"} or None.
+ButtonLook = Callable[[tuple[int, int]], Awaitable[dict | None]]
+
+
 class Actor:
     def __init__(self, task: ActTask, switch_on: Callable[[], bool], browser_command: str,
-                 show: Callable[[str], None], browser_check: BrowserCheck | None = None) -> None:
+                 show: Callable[[str], None], browser_check: BrowserCheck | None = None,
+                 button_look: ButtonLook | None = None) -> None:
+        self._button_look = button_look  # None: no screenshot-guided clicks at all
         self.task = task
         self._browser_check = browser_check  # Gemini's browser-or-not for a class missing from the list
         self._switch_on = switch_on
@@ -162,6 +203,13 @@ class Actor:
         """Press one button in the expected window. Returns why not, or None once it was pressed."""
         self.last_code = ""
         refusal = button_refusal(button.name, [button.description, button.extra, does], safe)
+        if refusal is None:
+            # This app's own never-press words (services.py), on top of the list.
+            now = self.window_now()
+            service = service_for(target.app_class, getattr(now, "title", None) or target.title)
+            extra = never_press_hits(service, button.name, button.description, button.extra, does)
+            if extra:
+                refusal = f'in {service.label} Clicky never presses "{extra[0]}" buttons'
         if refusal is not None:
             logger.info("acting: task %s: button refused (%s)", self.task.id, refusal)
             self.last_code = "button_refused"
@@ -183,6 +231,91 @@ class Actor:
             return f'couldn\'t press "{button.label[:40]}" ({why})'
         changed = await self._wait_for_boxes(target.pid, boxes_before)
         logger.info("acting: task %s: after the press the box list %s", self.task.id,
+                    "changed" if changed else f"was the same for {PRESS_WAIT_S:g} s")
+        return None
+
+    async def click_point(self, target: WritingTarget, point: tuple[int, int], label: str, safe: object,
+                          does: str) -> str | None:
+        """Click one button that only the screenshot shows (accessibility doesn't list it).
+        Returns why not, or None once it was clicked.
+
+        In order, and any failure means no click: the model's own words for it pass the
+        forbidden list, this app's never-press words and its verdict (exactly True); the spot is
+        inside the expected window, which is the active one; the spot is looked at again:
+        accessibility first (a control it names goes through the same checks under that name),
+        else a close-up read by Gemini a second time (what it is, the words on it, safe or not),
+        under CLOSEUP_LIMIT_S. Then the guard's limits, one click, and the pointer goes back.
+        """
+        self.last_code = "click_refused"
+        now = self.window_now()
+        service = service_for(target.app_class, getattr(now, "title", None) or target.title)
+
+        def refused(name: str, others: list[str], verdict: object) -> str | None:
+            why = button_refusal(name, others, verdict)
+            if why is None:
+                extra = never_press_hits(service, name, *others)
+                if extra:
+                    why = f'in {service.label} Clicky never presses "{extra[0]}" buttons'
+            return why
+
+        shown = label[:40]
+        why = refused(label, [does], safe)
+        if why is not None:
+            logger.info("acting: task %s: click refused before looking (%s)", self.task.id, why)
+            return f'Clicky won\'t click "{shown}": {why}'
+        if target.pid is None:
+            return "that window has no process Clicky can reach"
+        if not (target.x <= point[0] < target.x + target.width and target.y <= point[1] < target.y + target.height):
+            return "that spot isn't inside the window, so Clicky didn't click"
+        if windows.active_window_id() != target.window_id:
+            return "that window isn't the active one, so Clicky didn't click"
+        seen = await what_is_at(target.pid, point[0], point[1])
+        named = seen.get("ok") and seen.get("found") and str(seen.get("name", "")).strip()
+        if seen.get("ok") and seen.get("found"):
+            texts = [str(seen.get(k, "")) for k in ("name", "description", "extra")]
+            if forbidden_hits(*texts) or never_press_hits(service, *texts):
+                logger.info("acting: task %s: click refused (accessibility shows a forbidden word there)", self.task.id)
+                return f'Clicky won\'t click "{shown}": that spot has a word Clicky never clicks'
+        if named:
+            why = refused(str(seen.get("name", "")), [str(seen.get("description", "")), str(seen.get("extra", "")), does], safe)
+            if why is not None:
+                return f'Clicky won\'t click "{shown}": {why}'
+            logger.info("acting: task %s: the spot is a %s by accessibility", self.task.id, seen.get("role") or "control")
+        else:
+            if self._button_look is None:
+                return "Clicky couldn't look at that spot again, so it didn't click"
+            try:
+                look = await asyncio.wait_for(self._button_look(point), CLOSEUP_LIMIT_S)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a timeout or error: no click
+                logger.info("acting: task %s: the close-up look gave no answer (%s)", self.task.id, exc.__class__.__name__)
+                return "Clicky couldn't check that spot in time, so it didn't click"
+            if not isinstance(look, dict) or look.get("kind") not in CLICKABLE_KINDS:
+                return "Clicky couldn't tell what is at that spot, so it didn't click"
+            why = refused(str(look.get("label", "")), [does], look.get("safe"))
+            if why is not None:
+                logger.info("acting: task %s: click refused after the close-up look", self.task.id)
+                return f'Clicky won\'t click "{shown}": {why}'
+            if windows.active_window_id() != target.window_id:  # the look took a moment
+                return "that window isn't the active one any more, so Clicky didn't click"
+        why = self._allow(CLICK_POINT)
+        if why is not None:
+            self.last_code = "guard_refused"
+            return why
+        self._show(f'clicking "{shown}"…')
+        logger.info("acting: task %s step %d: click a button seen on the screenshot (%s)", self.task.id,
+                    self.task.steps_used, "accessibility agreed" if named else "close-up agreed")
+        boxes_before = _box_shape(await list_fields(target.pid))
+        if self.task.stopped:  # Esc while the boxes were read
+            self.last_code = "stopped"
+            return self.task.stop_reason or "stopped"
+        if not await click_once(point):
+            self.last_code = "click_failed"
+            return f'couldn\'t click "{shown}"'
+        self.last_code = ""
+        changed = await self._wait_for_boxes(target.pid, boxes_before)
+        logger.info("acting: task %s: after the click the box list %s", self.task.id,
                     "changed" if changed else f"was the same for {PRESS_WAIT_S:g} s")
         return None
 

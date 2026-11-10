@@ -18,6 +18,11 @@ Rules:
     as a line break between lines, in a box accessibility confirms is multi-line.
   - Buttons: never one without a name; never one the forbidden-word list matches
     (words.py); never one Gemini didn't explicitly call safe.
+  - A click on a spot of the screenshot (a button accessibility doesn't list): the words the
+    model read on it and what it says the button does go through the same list and verdict;
+    then the spot is looked at again (accessibility, else a close-up read by Gemini a second
+    time) and whatever is found there goes through them once more. Either look failing, being
+    unsure or running out of time means no click.
 """
 
 from __future__ import annotations
@@ -38,8 +43,8 @@ TASK_LIMIT_S = 60.0
 MAX_OPENED = 2  # new windows or tabs per task
 CLOSEUP_LIMIT_S = 2.0  # the backup click's close-up look: no click when it runs out
 
-# Action kinds. Round 1 allows the first four; a later round can add CLICK_POINT
-# (a screenshot-guided click), which has to pass the same checks to be allowed.
+# Action kinds. CLICK_POINT is a screenshot-guided click on a button accessibility doesn't
+# list: it passes the same checks as a press, plus a second look at the spot (actor.click_point).
 OPEN_LINK = "open link"
 START_APP = "start app"
 SWITCH_WINDOW = "switch window"
@@ -48,7 +53,7 @@ CLICK_POINT = "click point"
 # Not an action on the screen: the check asked once more with the window's buttons listed (after
 # an answer that named a button that wasn't listed). It counts as a step for the limits.
 ASK_WITH_BUTTONS = "ask again with the buttons"
-ALLOWED_KINDS = frozenset({OPEN_LINK, START_APP, SWITCH_WINDOW, PRESS_BUTTON, ASK_WITH_BUTTONS})
+ALLOWED_KINDS = frozenset({OPEN_LINK, START_APP, SWITCH_WINDOW, PRESS_BUTTON, CLICK_POINT, ASK_WITH_BUTTONS})
 OPENS_SOMETHING = frozenset({OPEN_LINK, START_APP})
 
 # --- keys --------------------------------------------------------------------------
