@@ -83,11 +83,13 @@ def needs_buttons(fields: list) -> bool:
 
 
 def cheapest(choice: OpenOption, options: list[OpenOption]) -> OpenOption:
-    """Never a later level when an earlier one does the same: a link for the chosen window's
-    or app's service wins over switching or starting; an open window of the chosen app wins
-    over starting it again."""
+    """Never a later level when an earlier one does the same: a link that opens a ready place
+    to write (a compose page; not a service's front page) for the chosen window's or app's
+    service wins over switching or starting; an open window of the chosen app wins over
+    starting it again."""
     if choice.kind != LINK and choice.service:
-        link = next((o for o in options if o.kind == LINK and o.service == choice.service), None)
+        link = next((o for o in options if o.kind == LINK and o.service == choice.service
+                     and getattr(o.ref, "ready", True)), None)
         if link is not None:
             return link
     if choice.kind == APP and choice.ref is not None:

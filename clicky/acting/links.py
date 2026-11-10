@@ -25,6 +25,7 @@ class Link:
     service: str
     url: str
     markers: tuple[str, ...]
+    ready: bool = True  # opens a ready place to write (a compose page, a blank document)
 
 
 LINKS: tuple[Link, ...] = (
@@ -48,6 +49,16 @@ LINKS: tuple[Link, ...] = (
          "https://web.whatsapp.com/", ("whatsapp",)),
     Link("telegram_web", "Telegram Web: chats", "chat", "telegram",
          "https://web.telegram.org/", ("telegram",)),
+    # Front pages (`ready` False): an open window or the installed app of the same service is
+    # the better place, so these never replace one (options.cheapest).
+    Link("slack_web", "Slack (web): channels and direct messages", "chat", "slack",
+         "https://app.slack.com/client", ("slack",), ready=False),
+    Link("discord_web", "Discord (web): servers and direct messages", "chat", "discord",
+         "https://discord.com/channels/@me", ("discord",), ready=False),
+    Link("github_home", "GitHub: home", "code", "github",
+         "https://github.com/", ("github",), ready=False),
+    Link("notion", "Notion: your pages", "document", "notion",
+         "https://www.notion.so/", ("notion",), ready=False),
 )
 
 
