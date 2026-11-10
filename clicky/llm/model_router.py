@@ -3,6 +3,8 @@
 Default order (no strong button): fast, strong, fast, strong, ... for `rounds` rounds,
 with a short pause between rounds, then an error.
 With the strong button (or "power mode"): strong (long timer), then fast, then an error. No alternating.
+Write drafts without the strong button (`fast_tries`): the fast model that many times, then the
+strong model once (its takeover timer), then an error. No pauses between them.
 
 Each try is one model under one first-word timer that also covers a single
 retry after a "busy" error. A try fails when the model is too slow (no first
@@ -129,13 +131,17 @@ class ModelRouter:
         self._round_pause_s = round_pause_s
         self._retry_wait_s = retry_wait_s
 
-    def _plan(self, prefer_strong: bool, strong_timeout_s: float | None = None) -> list[tuple[int, ModelChoice]]:
+    def _plan(
+        self, prefer_strong: bool, strong_timeout_s: float | None = None, fast_tries: int | None = None
+    ) -> list[tuple[int, ModelChoice]]:
         """(round number, model) pairs in the order they're tried."""
         if prefer_strong:
             strong = self._strong_on_request
             if strong_timeout_s is not None:
                 strong = dataclasses.replace(self._strong, first_word_timeout_s=strong_timeout_s)
             return [(0, strong), (0, self._fast)]
+        if fast_tries is not None:
+            return [(0, self._fast)] * max(1, fast_tries) + [(0, self._strong)]
         plan: list[tuple[int, ModelChoice]] = []
         for round_number in range(self._rounds):
             plan += [(round_number, self._fast), (round_number, self._strong)]
@@ -149,12 +155,15 @@ class ModelRouter:
         on_status: Callable[[str], None],
         prefer_strong: bool = False,
         strong_timeout_s: float | None = None,
+        fast_tries: int | None = None,
     ) -> RoutedAnswer:
         """Stream an answer into `on_text` (cumulative text) and return it.
 
         `on_status` gets short progress notes ("trying <model>…") while no
         answer has started yet. `strong_timeout_s` replaces the strong
         model's first-word timer when it goes first (writing uses 30 s; the strong button 90 s).
+        `fast_tries` (only without `prefer_strong`): the fast model that many times, then the
+        strong model once, instead of the alternating rounds (Write drafts use 2).
         """
         if self._limits.is_daily_limited(self._fast.model) and self._limits.is_daily_limited(
             self._strong.model
@@ -164,7 +173,7 @@ class ModelRouter:
         failures: list[tuple[ModelChoice, _AttemptFailure]] = []
         tries = 0
         last_round: int | None = None
-        for round_number, choice in self._plan(prefer_strong, strong_timeout_s):
+        for round_number, choice in self._plan(prefer_strong, strong_timeout_s, fast_tries):
             if self._limits.is_daily_limited(choice.model):
                 if not any(failed.role == choice.role for failed, _ in failures):
                     failures.append(
