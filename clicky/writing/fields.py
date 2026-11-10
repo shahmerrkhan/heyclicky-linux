@@ -814,11 +814,14 @@ async def check_plan(
     `browser_check`: Gemini's browser-or-not for a window class missing from the list (browsers.py);
     it runs beside the text-only request and never delays the check.
     """
+    started = asyncio.get_running_loop().time()
     result = await _check_plan(
         draft, request, target, client, fast_model, strong_model, limits, capture, fields_of,
         fast_timeout_s, strong_timeout_s, earlier, max_output_tokens, retry_timeout_s, second_request_s,
         name_known, text_only_timeout_s, acting, with_buttons, browser_check,
     )
+    logger.info("where-to-type: the check took %.1f s in all (%s)", asyncio.get_running_loop().time() - started,
+                result.status)
     result.tag = tag
     return result
 
@@ -847,10 +850,12 @@ async def _check_plan(
         return CheckResult(FAILED, why="there was no window to type into")
     if client is None:
         return CheckResult(FAILED, why="Gemini isn't set up")
+    listing_started = asyncio.get_running_loop().time()
     fields = await fields_of(target.pid)
     if fields is None:
         return CheckResult(FAILED, why=f"couldn't list the text boxes in {target.app_name}")
     logger.info("where-to-type: %s", fields_summary(fields, target.app_class))
+    logger.info("where-to-type: the boxes were listed in %.2f s", asyncio.get_running_loop().time() - listing_started)
     if earlier:
         logger.info("where-to-type: a follow-up, Clicky typed into %d box(es) last time", len(earlier))
     focused = next((f for f in fields if f.focused), None)
@@ -897,9 +902,12 @@ async def _check_plan(
             return []
 
     # The buttons (only when no box is empty or focused) are read while the screenshot is taken.
+    shot_started = loop.time()
     screens, buttons = await asyncio.gather(screenshot(), _buttons_for(acting, fields, target.pid, with_buttons))
     if not screens:
         return CheckResult(FAILED, why="couldn't take a screenshot")
+    logger.info("where-to-type: screenshot (%d KB) and buttons ready in %.2f s",
+                sum(len(s.image_data) for s in screens) // 1024, loop.time() - shot_started)
     if buttons:
         why_listed = "asked again with the buttons" if with_buttons else "no box to write in yet"
         logger.info("where-to-type: %d buttons listed (%s)", len(buttons), why_listed)

@@ -117,6 +117,8 @@ logger = logging.getLogger(__name__)
 VOICE_WORK_DIR = Path.home() / ".cache" / "clicky" / "voice"
 _SAME_ESC_S = 0.5  # the bar's Esc and the keyboard reader's Esc arrive within this of each other
 WARM_AGAIN_S = 30.0  # no second Gemini warm-up within this many seconds
+PLACE_SHOT_LONG_SIDE = 1280  # the where-to-type screenshot's longer side, in pixels (Vision: 1600)
+PLACE_SHOT_QUALITY = 75
 WRITING_FAST_TRIES = 2  # Write drafts without the strong button: fast, fast, then strong
 
 
@@ -857,10 +859,13 @@ class CompanionStateMachine(QObject):
             if voice is not None:
                 screens = voice.screens
             else:
+                shot_started = time.monotonic()
                 try:
                     screens = await self._capture_without_clicky(region, primary_index)
                 finally:
                     self._overlay.show_bubble()  # typed: the "…" bubble comes after the screenshot
+                logger.info("vision: %d screenshot(s), %d KB, taken in %.2f s", len(screens),
+                            sum(len(s.image_data) for s in screens) // 1024, time.monotonic() - shot_started)
 
             if parsed_prompt.search:
                 query = question
@@ -1633,7 +1638,11 @@ class CompanionStateMachine(QObject):
             if current is not None:
                 area = clip_to_desktop(current.x, current.y, current.width, current.height, enumerate_monitors())
             if area is not None:
-                shot = await asyncio.to_thread(capture_region, *area)
+                # Smaller than a Vision screenshot: the check reads the layout at medium detail and
+                # gets the boxes' names from accessibility, so the upload can be about 40% lighter.
+                shot = await asyncio.to_thread(
+                    capture_region, *area, jpeg_quality=PLACE_SHOT_QUALITY, max_long_side=PLACE_SHOT_LONG_SIDE
+                )
                 # Not a user-picked area: labelled as screen 1, points map back through the area itself.
                 return [replace(shot, is_user_region=False)]
             if current is not None:
