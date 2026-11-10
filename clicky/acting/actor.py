@@ -26,8 +26,10 @@ from .words import blocked_page_hits
 logger = logging.getLogger(__name__)
 
 OPEN_WAIT_S = 15.0  # for the page or app window to show up (within the task's 60 s)
-SETTLE_S = 4.0  # then for its text boxes to load
-PRESS_SETTLE_S = 0.8  # after a press, for the box to appear
+SETTLE_S = 6.0  # then for its text boxes to load (until the box list is there and has stopped changing)
+BROWSER_MIN_BOXES = 2  # a browser window with only its address bar listed is still loading its page
+PRESS_MIN_S = 0.3  # after a press: the least wait before the boxes are read again
+PRESS_WAIT_S = 3.0  # after a press: the longest wait for the box list to change
 START_GUESS_S = 4.0  # an app whose windows can't be matched: accept its one new focused window after this
 POLL_S = 0.25
 
@@ -41,6 +43,11 @@ class Actor:
         self._switch_on = switch_on
         self._command = browser_command
         self._show = show
+        self.last_code = ""  # why the last open or press failed, for the log ("" when it worked)
+
+    def _fail(self, code: str, why: str):
+        self.last_code = code
+        return None, why
 
     def window_now(self) -> object | None:
         expected = self.task.expected
@@ -51,6 +58,7 @@ class Actor:
 
     async def open(self, option: OpenOption) -> tuple[WritingTarget | None, str]:
         """Open (or switch to) a place. Returns the window to work in next, or (None, why not)."""
+        self.last_code = ""
         if option.kind == LINK:
             return await self._open_link(option)
         if option.kind == WINDOW:
@@ -63,30 +71,39 @@ class Actor:
         link: Link = option.ref
         why = self._allow(OPEN_LINK)
         if why is not None:
-            return None, why
+            return self._fail("guard_refused", why)
         before = {w.window_id: w.title for w in windows.list_windows()}
         self._show(f"opening {link.label}…")
         logger.info("acting: task %s step %d: open link %s", self.task.id, self.task.steps_used, link.key)
         try:
             open_link(link, self._command)
         except Exception as exc:  # noqa: BLE001
-            return None, f"couldn't open {link.label} ({exc.__class__.__name__})"
+            return self._fail("launch_failed", f"couldn't open {link.label} ({exc.__class__.__name__})")
 
         def found(w: windows.WindowInfo, active: int | None) -> bool:
-            # A browser window whose title shows the page (or a sign-in page): a new window,
-            # or the active window whose title just changed (a new tab in it).
+            # A browser window whose title shows the page (or a sign-in page): a new window, or
+            # one whose title just changed (a new tab in it; the browser may not be the active
+            # window when the user was in another app).
             title = (w.title or "").lower()
             if not (any(m in title for m in link.markers) or blocked_page_hits(w.title)):
                 return False
-            if not (w.window_id not in before or (w.window_id == active and before[w.window_id] != w.title)):
+            if not (w.window_id not in before or before[w.window_id] != w.title):
                 return False
             return self._is_browser(w)
 
         window = await self._wait_for(found)
         if window is None:
-            return None, f"{link.label} didn't open in time"
+            now = windows.list_windows()
+            fresh = [w for w in now if w.window_id not in before or before[w.window_id] != w.title]
+            logger.info(
+                "acting: task %s: no page window within %.0f s: %d window(s) new or retitled, %d of them a "
+                "browser, %d with the page's words in the title", self.task.id, OPEN_WAIT_S, len(fresh),
+                sum(1 for w in fresh if self._is_browser(w)),
+                sum(1 for w in fresh if any(m in (w.title or "").lower() for m in link.markers)),
+            )
+            return self._fail("no_window_in_time", f"{link.label} didn't open in time")
         if windows.active_window_id() != window.window_id and not await windows.activate(window.window_id):
-            return None, f"couldn't switch to {link.label}"
+            return self._fail("activate_failed", f"couldn't switch to {link.label}")
         self.task.expected = ExpectedWindow(window.window_id, window.pid, window.app_class, link.markers)
         await self._settle(window)
         return window.as_target(), ""
@@ -95,14 +112,14 @@ class Actor:
         info: windows.WindowInfo = option.ref
         why = self._allow(SWITCH_WINDOW)
         if why is not None:
-            return None, why
+            return self._fail("guard_refused", why)
         now = windows.window_info(info.window_id)
         if now is None or (now.app_class or "").lower() != (info.app_class or "").lower():
-            return None, "that window isn't there any more"
+            return self._fail("window_gone", "that window isn't there any more")
         self._show(f"switching to {now.app_class or 'that window'}…")
         logger.info("acting: task %s step %d: switch to a %s window", self.task.id, self.task.steps_used, now.app_class)
         if not await windows.activate(now.window_id):
-            return None, f"couldn't switch to {now.app_class or 'that window'}"
+            return self._fail("activate_failed", f"couldn't switch to {now.app_class or 'that window'}")
         self.task.expected = ExpectedWindow(now.window_id, now.pid, now.app_class, markers_for(option.service))
         await self._settle(now)
         return now.as_target(), ""
@@ -111,13 +128,13 @@ class Actor:
         app = option.ref
         why = self._allow(START_APP)
         if why is not None:
-            return None, why
+            return self._fail("guard_refused", why)
         before = {w.window_id for w in windows.list_windows()}
         self._show(f"starting {getattr(app, 'name', 'the app')}…")
         logger.info("acting: task %s step %d: start app %s", self.task.id, self.task.steps_used, getattr(app, "id", "?"))
         ok, why = await start_app(app)
         if not ok:
-            return None, why or "couldn't start it"
+            return self._fail("launch_failed", why or "couldn't start it")
         loop = asyncio.get_running_loop()
         started = loop.time()
 
@@ -134,32 +151,55 @@ class Actor:
 
         window = await self._wait_for(found)
         if window is None:
-            return None, f"{getattr(app, 'name', 'the app')} didn't open a window in time"
+            return self._fail("no_window_in_time", f"{getattr(app, 'name', 'the app')} didn't open a window in time")
         if windows.active_window_id() != window.window_id and not await windows.activate(window.window_id):
-            return None, f"couldn't switch to {getattr(app, 'name', 'the app')}"
+            return self._fail("activate_failed", f"couldn't switch to {getattr(app, 'name', 'the app')}")
         self.task.expected = ExpectedWindow(window.window_id, window.pid, window.app_class, ())
         await self._settle(window)
         return window.as_target(), ""
 
     async def press(self, target: WritingTarget, button: Button, safe: object, does: str) -> str | None:
         """Press one button in the expected window. Returns why not, or None once it was pressed."""
+        self.last_code = ""
         refusal = button_refusal(button.name, [button.description, button.extra, does], safe)
         if refusal is not None:
             logger.info("acting: task %s: button refused (%s)", self.task.id, refusal)
+            self.last_code = "button_refused"
             return f'Clicky won\'t press "{button.label[:40]}": {refusal}'
         if target.pid is None:
+            self.last_code = "no_process"
             return "that window has no process Clicky can reach"
         why = self._allow(PRESS_BUTTON)
         if why is not None:
+            self.last_code = "guard_refused"
             return why
+        boxes_before = _box_shape(await list_fields(target.pid))
         self._show(f'pressing "{button.label[:40]}"…')
         logger.info("acting: task %s step %d: press a %s named %r", self.task.id, self.task.steps_used,
                     button.role, button.label[:40])
         ok, why = await press_button(target.pid, button)
         if not ok:
+            self.last_code = "press_failed"
             return f'couldn\'t press "{button.label[:40]}" ({why})'
-        await asyncio.sleep(PRESS_SETTLE_S)
+        changed = await self._wait_for_boxes(target.pid, boxes_before)
+        logger.info("acting: task %s: after the press the box list %s", self.task.id,
+                    "changed" if changed else f"was the same for {PRESS_WAIT_S:g} s")
         return None
+
+    async def _wait_for_boxes(self, pid: int, before: tuple) -> bool:
+        """After a press: wait until the window's box list differs from `before` (a compose box
+        showed up, focus moved into one), at least PRESS_MIN_S and at most PRESS_WAIT_S."""
+        loop = asyncio.get_running_loop()
+        end = loop.time() + min(PRESS_WAIT_S, max(0.0, self.task.time_left()))
+        await asyncio.sleep(PRESS_MIN_S)
+        while not self.task.stopped:
+            if _box_shape(await list_fields(pid)) != before:
+                await asyncio.sleep(POLL_S)  # the rest of the new boxes
+                return True
+            if loop.time() >= end:
+                return False
+            await asyncio.sleep(POLL_S)
+        return False
 
     def _is_browser(self, w: windows.WindowInfo) -> bool:
         """The class list or a name stem; else Gemini's kept answer. A class Gemini hasn't answered
@@ -186,16 +226,38 @@ class Actor:
         return None
 
     async def _settle(self, window: windows.WindowInfo) -> None:
-        """Give the new window's text boxes a moment to load (until one is listed, at most SETTLE_S)."""
+        """Wait for the new window's text boxes to load, at most SETTLE_S: until boxes are listed
+        and the list is the same on two looks in a row. A browser window needs more than its
+        address bar (BROWSER_MIN_BOXES): with only that listed, its page is still loading."""
         if window.pid is None:
             return
         loop = asyncio.get_running_loop()
-        end = loop.time() + min(SETTLE_S, max(0.0, self.task.time_left()))
+        started = loop.time()
+        end = started + min(SETTLE_S, max(0.0, self.task.time_left()))
+        # A sign-in page is the user's to deal with, however few boxes it has: no extra wait for it.
+        signin = bool(blocked_page_hits(window.title))
+        least = 1 if signin or not self._is_browser(window) else BROWSER_MIN_BOXES
+        last: tuple | None = None
+        count = 0
         while loop.time() < end and not self.task.stopped:
             fields = await list_fields(window.pid)
-            if fields:
+            shape = _box_shape(fields)
+            count = len(fields or [])
+            if any("password" in (f.role or "").lower() for f in fields or []):
+                least = 1  # a password page: nothing more to wait for
+            if count >= least and shape == last:
+                logger.info("acting: task %s: %d box(es) ready after %.1f s", self.task.id, count,
+                            loop.time() - started)
                 return
+            last = shape
             await asyncio.sleep(POLL_S)
+        logger.info("acting: task %s: stopped waiting for the boxes after %.1f s (%d listed)", self.task.id,
+                    loop.time() - started, count)
+
+
+def _box_shape(fields: list | None) -> tuple:
+    """What a window's box list looks like, to tell when it changed: ids, focus and whether each is empty."""
+    return tuple((f.id, f.focused, f.text is None, bool(f.text)) for f in fields or [])
 
 
 def blocked_reason(window: object | None, fields: list) -> str:
