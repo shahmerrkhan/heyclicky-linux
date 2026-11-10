@@ -112,6 +112,8 @@ def main() -> int:
     tray.open_panel_requested.connect(panel.show_near_cursor)
     tray.restart_requested.connect(restart.request)
     tray.quit_requested.connect(app.quit)
+    tray.set_acting_state(state_machine.act_on)
+    tray.acting_toggled.connect(state_machine.set_act_on)
     tray.show()
 
     _show_missing_key_notice(tray)

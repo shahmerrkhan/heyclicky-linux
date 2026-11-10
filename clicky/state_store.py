@@ -1,8 +1,8 @@
 """Tiny JSON state store for cross-session preferences.
 
 Holds the active Claude Code workspace, the "allow shell" toggle, the
-tray's voice on/off switch, the speak switch, and the name to sign drafts
-with. The current mode (vision / code / writing) lives here too while
+tray's voice on/off switch, the tray's acting switch (open apps and press buttons),
+the speak switch, and the name to sign drafts with. The current mode (vision / code / writing) lives here too while
 Clicky runs, but it is never saved: Clicky always starts in vision mode. Persisted to `$XDG_STATE_HOME/clicky/state.json`
 (falls back to `~/.local/state/clicky/state.json`).
 
@@ -31,6 +31,7 @@ class PersistedState:
     claude_code_workspace: str | None = None
     claude_code_allow_shell: bool = False
     voice_on: bool = True
+    act_on: bool = True  # the tray's acting switch: open apps, switch windows, press buttons
     speak_on: bool = False  # the input bar's speak switch (typed questions only)
     my_name: str | None = None  # the name the user gave when asked (MY_NAME in .env wins over it)
 
@@ -56,6 +57,7 @@ def load_state() -> PersistedState:
         claude_code_workspace=data.get("claude_code_workspace"),
         claude_code_allow_shell=bool(data.get("claude_code_allow_shell", False)),
         voice_on=bool(data.get("voice_on", True)),
+        act_on=bool(data.get("act_on", True)),
         speak_on=bool(data.get("speak_on", False)),
         my_name=data.get("my_name") if isinstance(data.get("my_name"), str) and data.get("my_name").strip() else None,
     )

@@ -50,6 +50,7 @@ class TrayController(QObject):
     restart_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     voice_toggled = pyqtSignal(bool)
+    acting_toggled = pyqtSignal(bool)
     stop_voice_requested = pyqtSignal()
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -71,6 +72,12 @@ class TrayController(QObject):
         self._stop_voice_action = QAction("Stop listening / speaking", self)
         self._stop_voice_action.triggered.connect(self.stop_voice_requested.emit)
         menu.addAction(self._stop_voice_action)
+
+        self._acting_action = QAction("Open apps and press buttons (Write)", self)
+        self._acting_action.setCheckable(True)
+        self._acting_action.setChecked(True)
+        self._acting_action.toggled.connect(self.acting_toggled.emit)
+        menu.addAction(self._acting_action)
 
         menu.addSeparator()
 
@@ -97,6 +104,12 @@ class TrayController(QObject):
         self._voice_action.blockSignals(False)
         self._voice_action.setVisible(available)
         self._stop_voice_action.setVisible(available)
+
+    def set_acting_state(self, on: bool) -> None:
+        """Reflect the acting switch without re-emitting `acting_toggled`."""
+        self._acting_action.blockSignals(True)
+        self._acting_action.setChecked(on)
+        self._acting_action.blockSignals(False)
 
     def show_notice(self, title: str, message: str) -> None:
         """Desktop notification from the tray icon (stays ~10 s)."""

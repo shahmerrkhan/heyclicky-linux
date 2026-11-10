@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -49,11 +50,25 @@ from .transcription.listener import PART_MISSING, AutoStop, VoiceListener
 from .transcription.whisper import WhisperTranscriber
 from .tts.piper import PiperSpeaker, SpokenAnswer, play_error_sound
 from .writing.target import WritingTarget, active_window_target, refresh_target
-from .writing.esc_guard import SPEECH_MARGIN_S, EscGrab, speaking_time_s, typing_deadline_s
+from .writing.esc_guard import DEADLINE_MARGIN_S, SPEECH_MARGIN_S, EscGrab, speaking_time_s, typing_deadline_s
+from .acting import windows
+from .acting.actor import Actor, blocked_reason
+from .acting.apps import app_options
+from .acting.buttons import list_buttons
+from .acting.closeup import CLOSEUP_H, CLOSEUP_W, mark_spot, spot_is_text_box
+from .acting.guard import ASK_WITH_BUTTONS, TASK_LIMIT_S, ActTask, ExpectedWindow, window_problem
+from .acting.links import LINKS, service_of_title
+from .acting.options import LINK, WINDOW, ActingContext, OpenOption, cheapest
+from .writing.browsers import BrowserCheck
 from .writing.typer import DraftTyper, TypedDraft, TypeResult, explanation, set_clipboard_text
 from .writing.fields import (
+    BLOCKED,
     FAILED,
     FAILED_TEXT,
+    FOCUS,
+    GO,
+    NEED_BUTTONS,
+    OPEN,
     TOO_SLOW_TEXT,
     STOP,
     UNSURE,
@@ -63,7 +78,9 @@ from .writing.fields import (
     Place,
     Step,
     check_plan,
+    click_wait_result,
     focused_field,
+    set_closeup,
     match_piece,
     move_to,
 )
@@ -99,6 +116,7 @@ logger = logging.getLogger(__name__)
 VOICE_WORK_DIR = Path.home() / ".cache" / "clicky" / "voice"
 _SAME_ESC_S = 0.5  # the bar's Esc and the keyboard reader's Esc arrive within this of each other
 WARM_AGAIN_S = 30.0  # no second Gemini warm-up within this many seconds
+WRITING_FAST_TRIES = 2  # Write drafts without the strong button: fast, fast, then strong
 
 
 class CompanionState(Enum):
@@ -186,6 +204,8 @@ class CompanionStateMachine(QObject):
         self._warm_task: asyncio.Future | None = None  # the Gemini warm-up in flight
         self._warmed_at = -WARM_AGAIN_S  # monotonic time of the last warm-up started
         self._usage = UsageTracker()
+        # Browser or not for a window class missing from the list (asked once per class, browsers.py).
+        self._browser_check = BrowserCheck(lambda: self._gemini, settings.gemini_fast_model, self._usage)
         self._claude_code = ClaudeCodeClient(binary_path=settings.claude_code_path)
         self._memory = ChatMemory()
 
@@ -220,6 +240,9 @@ class CompanionStateMachine(QObject):
         # A checked draft: what went into which box, by window id (a follow-up there is checked again).
         self._last_fill: tuple[int, list[Earlier]] | None = None
         self._check_task: asyncio.Task | None = None  # the where-to-type check (Esc stops it)
+        # Acting (opening apps, switching windows, pressing buttons for a Write draft): one task at a time.
+        self._act_task: ActTask | None = None
+        self._act_grab: EscGrab | None = None  # Esc, held from the first action until typing ends
         self._waiting: _Waiting | None = None  # the click wait or the name question
         self._wait_voice_task: asyncio.Task | None = None  # a spoken reply while waiting
         self._pending_question: tuple[str, bool] | None = None  # (text, spoken): runs once the draft is done
@@ -228,6 +251,7 @@ class CompanionStateMachine(QObject):
         self._listen_timer.timeout.connect(self._show_listening)
 
         overlay.input_esc_keeps_answer = self._speak_active
+        set_closeup(self._closeup_says_text_box)  # the backup click's close-up look (fields.click_at)
         overlay.prompt_submitted.connect(self._on_prompt_submitted)
         overlay.overlay_dismissed.connect(self._on_overlay_dismissed)
         overlay.mode_changed.connect(self._on_mode_changed)
@@ -263,6 +287,20 @@ class CompanionStateMachine(QObject):
         logger.info("voice → %s", "on" if on else "off")
         if not on:
             self.stop_voice()
+
+    @property
+    def act_on(self) -> bool:
+        """The tray's acting switch: Write may open apps, switch windows and press buttons."""
+        return self._persisted.act_on
+
+    def set_act_on(self, on: bool) -> None:
+        if on == self._persisted.act_on:
+            return
+        self._persisted.act_on = on
+        save_state(self._persisted)
+        logger.info("acting → %s", "on" if on else "off")
+        if not on:
+            self._stop_acting("acting was switched off in the tray")
 
     @property
     def speak_on(self) -> bool:
@@ -356,6 +394,9 @@ class CompanionStateMachine(QObject):
         Esc is grabbed and handled by the grab instead.
         """
         if self._speech_grab is not None:
+            return
+        if self._act_task is not None and not self._act_task.stopped:
+            self._stop_acting("Esc")  # Esc is the only hard stop: nothing more acts or is typed
             return
         if self._stop_typing():
             return
@@ -921,8 +962,9 @@ class CompanionStateMachine(QObject):
     async def _run_writing(self, parsed: ParsedPrompt, said: str | None = None, note: str | None = None) -> None:
         """Turn messy thoughts into a ready-to-send message (shown in the bubble).
 
-        Strong model first (WRITING_STRONG_TIMEOUT_S to start), the fast model
-        as backup. `said` is the voice transcript (None for typed requests).
+        The fast model first, then the fast model again, then the strong model
+        (WRITING_FAST_TRIES; model_router.py has the timers). With the strong button: the
+        strong model first (WRITING_STRONG_TIMEOUT_S to start), the fast model as backup. `said` is the voice transcript (None for typed requests).
         Typed drafts are read aloud only with the speak switch on (after typing);
         voice drafts stay silent, and a failed voice request plays the error sound.
         """
@@ -1001,8 +1043,9 @@ class CompanionStateMachine(QObject):
                     + answer_length.instruction(parsed.length, "writing"),
                     on_text=show_streaming,
                     on_status=show,
-                    prefer_strong=True,
-                    strong_timeout_s=settings.writing_strong_timeout_s,
+                    prefer_strong=parsed.strong,
+                    strong_timeout_s=settings.writing_strong_timeout_s if parsed.strong else None,
+                    fast_tries=None if parsed.strong else WRITING_FAST_TRIES,
                 )
 
             answer = await draft_once()
@@ -1139,6 +1182,21 @@ class CompanionStateMachine(QObject):
         finally:
             self._overlay.restore_bubble()
 
+    async def _closeup_says_text_box(self, point: tuple[int, int]) -> bool:
+        """The backup click's close-up look (only when accessibility shows nothing at the spot):
+        a small crop around it, the spot ringed, one quick fast-model question. The caller holds
+        the hard time limit (guard.CLOSEUP_LIMIT_S)."""
+        x, y = point
+        box = clip_to_desktop(x - CLOSEUP_W // 2, y - CLOSEUP_H // 2, CLOSEUP_W, CLOSEUP_H, enumerate_monitors())
+        if box is None:
+            return False
+        shot = await asyncio.to_thread(capture_region, *box)
+        m = shot.monitor
+        sx = (x - m.x) * shot.width_pixels / max(1, m.width)
+        sy = (y - m.y) * shot.height_pixels / max(1, m.height)
+        image = await asyncio.to_thread(mark_spot, shot.image_data, sx, sy)
+        return await spot_is_text_box(self._gemini, settings.gemini_fast_model, image)
+
     async def _type_draft(self, draft: str, target: WritingTarget | None = None) -> TypeResult:
         """Type the draft into the remembered window; explain the outcome in the bubble."""
         target = target or self._writing_target
@@ -1181,6 +1239,20 @@ class CompanionStateMachine(QObject):
         a TypeResult by default).
         """
         cancel = asyncio.Event()
+        act = self._act_task
+        if act is not None and self._act_grab is not None:
+            # An acting task already holds Esc: the same grab covers the typing (no gap).
+            if act.stopped:
+                why = "stopped before typing"
+                return refused(why) if refused is not None else TypeResult(False, why_not=why, stopped=True)
+            grab = self._act_grab
+            grab.extend(typing_deadline_s(draft))
+            self._typing_cancel = cancel
+            try:
+                result = await run(cancel)
+            finally:
+                self._typing_cancel = None
+            return self._note_expired(grab, result)
         loop = asyncio.get_running_loop()
         # Esc is held while typing: it stops the typing and never reaches the app.
         esc = EscGrab(lambda: loop.call_soon_threadsafe(cancel.set), typing_deadline_s(draft))
@@ -1193,6 +1265,10 @@ class CompanionStateMachine(QObject):
         finally:
             self._typing_cancel = None
             esc.release()
+        return self._note_expired(esc, result)
+
+    @staticmethod
+    def _note_expired(esc: EscGrab, result):
         if esc.expired and isinstance(result, TypeResult) and not result.why_not:
             result.why_not = "typing took too long"
         if esc.expired and isinstance(result, FillOutcome) and result.stopped:
@@ -1204,31 +1280,226 @@ class CompanionStateMachine(QObject):
     async def _place_and_type(self, draft: str, request: str, target: WritingTarget | None) -> str | None:
         """Work out what goes in which box (fields.py), apply the safety rules (fill.py), then type.
 
-        Returns the spoken status line (None: say nothing, Esc stopped the typing).
+        With the tray's acting switch on, the check may first answer "open" (a link, an open
+        window, an app), "focus" (press a button so the box appears) or "blocked" (a page only
+        the user can deal with). Clicky then acts through the guard (clicky/acting) and checks
+        again on what it opened, until the check says where to type, or a limit, a refusal or
+        Esc ends the task. Returns the spoken status line (None: say nothing, Esc stopped the typing).
         """
         self._explain("checking where to type…")
         self._ensure_clients()
-        earlier = self._earlier_in(target)
-        name_known = my_name.pick_name(settings.my_name, None, self._persisted.my_name)[0] is not None
-        check = asyncio.ensure_future(
-            check_plan(
-                draft, request, target, self._gemini, settings.gemini_fast_model, settings.gemini_model,
-                self._usage, lambda: self._capture_target_window(target), earlier=earlier,
-                max_output_tokens=settings.max_tokens, name_known=name_known,
-            )
-        )
-        self._check_task = check
+        act = self._begin_acting(target)
         try:
-            result: CheckResult = await check
-        except asyncio.CancelledError:
-            task = asyncio.current_task()
-            if task is not None and task.cancelling():
-                raise  # the whole run was cancelled (bubble closed, a new question)
-            self._memory.add(request, draft)
-            return await self._nothing_typed(draft, "Stopped before typing.", draft, needs_user=False)
+            return await self._place_and_type_in(draft, request, target, act)
         finally:
-            self._check_task = None
+            self._end_acting(act)
 
+    async def _place_and_type_in(
+        self, draft: str, request: str, target: WritingTarget | None, act: ActTask | None
+    ) -> str | None:
+        actor = (
+            Actor(act, lambda: self.act_on, settings.link_browser_command, self._explain, self._browser_check)
+            if act else None
+        )
+        with_buttons = False  # the one re-ask of a check, with the window's buttons listed
+        while True:
+            earlier = self._earlier_in(target)
+            name_known = my_name.pick_name(settings.my_name, None, self._persisted.my_name)[0] is not None
+            acting = self._acting_context(target) if act is not None and target is not None else None
+            asked = act.tag() if act is not None else None
+            check = asyncio.ensure_future(
+                check_plan(
+                    draft, request, target, self._gemini, settings.gemini_fast_model, settings.gemini_model,
+                    self._usage, lambda target=target: self._capture_target_window(target), earlier=earlier,
+                    max_output_tokens=settings.max_tokens, name_known=name_known,
+                    acting=acting, tag=asked, with_buttons=with_buttons, browser_check=self._browser_check,
+                )
+            )
+            self._check_task = check
+            try:
+                result: CheckResult = await check
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise  # the whole run was cancelled (bubble closed, a new question)
+                self._memory.add(request, draft)
+                return await self._nothing_typed(draft, "Stopped before typing.", draft, needs_user=False)
+            finally:
+                self._check_task = None
+
+            asked_with_buttons, with_buttons = with_buttons, False
+            if act is None:
+                if result.status in (OPEN, FOCUS, BLOCKED, NEED_BUTTONS):  # never without the acting switch
+                    result = CheckResult(FAILED, why="couldn't work out where the text goes")
+                break
+            # The check carries the tag it was asked with; an answer without one belongs to this request.
+            if not act.accept_answer(result.tag if result.tag is not None else asked):
+                # Esc (or another stop) came first: a late or second answer never acts or types.
+                logger.info("acting: task %s: answer for step %s dropped (%s)", act.id,
+                            result.tag[1] if isinstance(result.tag, tuple) else "?", act.stop_reason or "not current")
+                self._memory.add(request, draft)
+                return await self._nothing_typed(draft, "Stopped before typing.", draft, needs_user=False)
+            # A sign-in (or other) page only the user can deal with comes first: the page Clicky
+            # opened may have turned into one (its title then lacks the expected words).
+            blocked = ""
+            if result.status == BLOCKED:
+                blocked = result.why or "the page needs you"
+            elif act.steps_used > 0:
+                now = windows.window_info(act.expected.window_id)
+                if now is not None and now.window_id == act.expected.window_id:
+                    blocked = blocked_reason(now, result.fields)
+            if not blocked and act.steps_used > 0:
+                problem = window_problem(act.expected, windows.window_info(act.expected.window_id))
+                if problem is not None:
+                    act.stop(problem)
+                    self._memory.add(request, draft)
+                    return await self._nothing_typed(draft, f"Not typed: {problem}.", f"Didn't type anything: {problem}.\n\n{draft}")
+            if blocked:
+                stopped = await self._page_needs_you(act, blocked, draft, request)
+                if stopped is not None:
+                    return stopped
+                act.next_step()
+                continue
+            if result.status == NEED_BUTTONS:
+                # A button that wasn't in the list: ask once more with the buttons listed. The re-ask
+                # counts as a step; a second such answer goes to the click wait.
+                if asked_with_buttons:
+                    logger.info("acting: task %s: still no usable button after asking again, so the user clicks", act.id)
+                    result = click_wait_result(result, draft)
+                    break
+                why = act.authorize(ASK_WITH_BUTTONS, self.act_on, windows.window_info(act.expected.window_id))
+                if why is not None:
+                    act.stop(why)
+                    self._memory.add(request, draft)
+                    return await self._nothing_typed(draft, f"Not typed: {why}.", f"Didn't type anything: {why}.\n\n{draft}")
+                logger.info("acting: task %s: step %d: asking again with the buttons listed", act.id, act.step + 1)
+                act.next_step()
+                with_buttons = True
+                self._explain("looking at the buttons in the window…")
+                continue
+            if result.status not in (OPEN, FOCUS):
+                break
+            target, why = await self._act_step(act, actor, result, target, acting)
+            if target is None:
+                self._memory.add(request, draft)
+                if act.stopped and act.stop_reason == "Esc":
+                    return await self._nothing_typed(draft, "Stopped.", draft, needs_user=False)
+                act.stop(why)
+                return await self._nothing_typed(draft, f"Not typed: {why}.", f"Didn't type anything: {why}.\n\n{draft}")
+            self._explain("checking where to type…")
+
+        if act is not None and result.status != GO:
+            # Unsure, stop, failed: the acting task ends here (the click wait works as always).
+            self._end_acting(act)
+        return await self._type_checked(draft, request, target, result)
+
+    async def _act_step(
+        self, act: ActTask, actor: Actor, result: CheckResult, target: WritingTarget, acting: ActingContext
+    ) -> tuple[WritingTarget | None, str]:
+        """One "open" or "focus" answer carried out. Returns the window to check next, or (None, why not)."""
+        if self._act_grab is None and not self._acquire_act_grab(act):
+            return None, "Clicky couldn't hold the Esc key (another program has it), so it didn't open or press anything"
+        if result.status == OPEN:
+            option = cheapest(result.open_option, acting.options)
+            new_target, why = await actor.open(option)
+            if new_target is None:
+                return None, why
+            act.next_step()
+            return new_target, ""
+        why = await actor.press(target, result.press, result.safe, result.does)
+        if why is not None:
+            return None, why
+        act.next_step()
+        return target, ""
+
+    async def _page_needs_you(self, act: ActTask, why: str, draft: str, request: str) -> str | None:
+        """A sign-in, password, two-factor, captcha, payment or permission page: the user deals with
+        it, then replies "done" (Esc stops). Nothing acts meanwhile, and the time doesn't count.
+
+        Returns None to carry on (check again), or the status line when the task ends here.
+        """
+        self._release_act_grab()  # nothing acts during the wait: Esc goes back to the user's apps
+        act.pause()
+        self._overlay.update_bubble_text(draft)
+        self._overlay.bring_back()
+        self._explain(f'{why}. Please do that yourself (Clicky never types passwords), then reply "done". Esc stops.')
+        logger.info("acting: task %s: waiting for the user (a page only they can deal with)", act.id)
+        replies: asyncio.Queue = asyncio.Queue()
+        self._waiting = _Waiting("page", replies, asyncio.current_task())
+        try:
+            try:
+                reply = await asyncio.wait_for(replies.get(), WAIT_S)
+            except TimeoutError:
+                reply = None
+        finally:
+            self._waiting = None
+            act.resume()
+        if reply is None or act.stopped or not is_done(str(reply)):
+            act.stop(act.stop_reason or "the page needed you")
+            self._memory.add(request, draft)
+            line = "Stopped." if act.stop_reason == "Esc" else "Not typed: the page needed you, so Clicky stopped."
+            return await self._nothing_typed(draft, line, draft, needs_user=act.stop_reason != "Esc")
+        self._explain("checking where to type…")
+        return None
+
+    def _begin_acting(self, target: WritingTarget | None) -> ActTask | None:
+        """A new acting task for this draft (the tray switch on, a window that isn't a terminal)."""
+        if not self.act_on or target is None or target.pid is None or target.is_terminal:
+            return None
+        if self._act_task is not None:
+            self._stop_acting("a new draft started")
+            self._end_acting(self._act_task)
+        task = ActTask()
+        task.expected = ExpectedWindow(target.window_id, target.pid, target.app_class, ())
+        self._act_task = task
+        return task
+
+    def _end_acting(self, task: ActTask | None) -> None:
+        if task is None or self._act_task is not task:
+            return
+        self._release_act_grab()
+        self._act_task = None
+
+    def _acquire_act_grab(self, task: ActTask) -> bool:
+        """Grab Esc for the rest of the task (acting and typing): its thread stops the task at once."""
+        loop = asyncio.get_running_loop()
+        holder: dict[str, EscGrab] = {}
+
+        def on_escape() -> None:
+            grab = holder.get("grab")
+            reason = "it took too long" if grab is not None and grab.expired else "Esc"
+            task.stop(reason)  # straight from the grab's thread: nothing starts after this
+            loop.call_soon_threadsafe(self._stop_acting, reason)
+
+        grab = EscGrab(on_escape, TASK_LIMIT_S + DEADLINE_MARGIN_S, what="acting")
+        holder["grab"] = grab
+        if not grab.acquire():
+            return False
+        self._act_grab = grab
+        return True
+
+    def _release_act_grab(self) -> None:
+        grab, self._act_grab = self._act_grab, None
+        if grab is not None:
+            grab.release()
+
+    def _acting_context(self, target: WritingTarget) -> ActingContext:
+        """What the check may offer: links from the table, open windows, installed apps, and buttons."""
+        options = [OpenOption(f"L{i}", LINK, link.label, link.purpose, link.service, link) for i, link in enumerate(LINKS, 1)]
+        others = [w for w in windows.list_windows() if w.window_id != target.window_id]
+        options += [
+            OpenOption(f"W{i}", WINDOW, f"{w.app_class} — {json.dumps(w.title[:60], ensure_ascii=False)}", "",
+                       service_of_title(w.title), w)
+            for i, w in enumerate(others, 1)
+        ]
+        options += app_options()
+        return ActingContext(options, buttons_of=list_buttons)
+
+    async def _type_checked(
+        self, draft: str, request: str, target: WritingTarget | None, result: CheckResult
+    ) -> str | None:
+        """The check said where to type (or why not): the safety rules (fill.py), then typing."""
+        earlier = self._earlier_in(target)
         if result.status == FAILED:
             logger.info("where-to-type check failed: %s", result.why)
             self._memory.add(request, draft)
@@ -1248,7 +1519,13 @@ class CompanionStateMachine(QObject):
             if name is None:
                 unsigned = [replace(s, text=my_name.fill_name(s.text, None)) for s in steps]
                 self._overlay.update_bubble_text(shown_text(unsigned))
+                act = self._act_task
+                if act is not None:  # nothing acts while Clicky asks: Esc goes back to the user meanwhile
+                    act.pause()
+                    self._release_act_grab()
                 name, name_note = await self._ask_name()
+                if act is not None:
+                    act.resume()
             steps = [replace(s, text=my_name.fill_name(s.text, name)) for s in steps]
         shown = shown_text(steps)
         self._overlay.update_bubble_text(shown)
@@ -1269,6 +1546,8 @@ class CompanionStateMachine(QObject):
             status = await self._report_fill(outcome, result, target, earlier)
         if name_note:
             self._add_note(name_note)
+        if result.missing:
+            self._add_note(f"Left empty: {_join_labels(result.missing)} (you didn't give it, and Clicky never makes it up).")
         return status
 
     def _earlier_in(self, target: WritingTarget | None) -> list[Earlier]:
@@ -1451,7 +1730,7 @@ class CompanionStateMachine(QObject):
         waiting = self._waiting
         if waiting is None:
             return False
-        if waiting.kind == "box":
+        if waiting.kind in ("box", "page"):
             if not is_done(text):
                 return False
             waiting.replies.put_nowait(text)
@@ -1720,6 +1999,24 @@ class CompanionStateMachine(QObject):
         cursor_pos = QCursor.pos()
         self._overlay.show_cursor_at(cursor_pos.x(), cursor_pos.y())
         self._overlay.fly_cursor_to(global_x, global_y)
+
+    def _stop_acting(self, reason: str) -> None:
+        """Stop the acting task for good: nothing more is opened, pressed or typed for it.
+
+        Safe to call from the Esc grab's thread for the flag itself (ActTask.stop); the rest
+        runs on the event loop.
+        """
+        task = self._act_task
+        if task is None:
+            return
+        task.stop(reason)
+        logger.info("acting: task %s stopped (%s)", task.id, reason)
+        if self._check_task is not None and not self._check_task.done():
+            self._check_task.cancel()
+        if self._typing_cancel is not None:
+            self._typing_cancel.set()
+        if self._waiting is not None and self._waiting.kind == "page":
+            self._waiting.replies.put_nowait("")  # the page wait ends: nothing more happens
 
     def _cancel_current_task(self) -> None:
         if self._current_task and not self._current_task.done():
