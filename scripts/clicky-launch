@@ -23,6 +23,8 @@ RESTART_WAIT_S=2
 LOG_MAX_BYTES=1000000
 
 mkdir -p "$STATE_DIR" || exit 1
+chmod 700 "$STATE_DIR" 2>/dev/null
+: >> "$LOG" && chmod 600 "$LOG" 2>/dev/null
 if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$LOG_MAX_BYTES" ]; then
     mv -f "$LOG" "$LOG.1"
 fi

@@ -13,6 +13,7 @@ from __future__ import annotations
 import fcntl
 import itertools
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -35,7 +36,13 @@ class SingleInstance:
 
     def acquire(self) -> bool:
         """True if we now hold the lock; False if another copy does."""
-        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+        # Never through a symbolic link (the fallback path is in the shared temp folder), and
+        # only a plain file of our own: otherwise another user could aim the lock at one of our files.
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            os.close(fd)
+            raise OSError(f"{self._path} is not a plain file owned by this user")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

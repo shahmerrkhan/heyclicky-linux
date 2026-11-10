@@ -102,9 +102,11 @@ class WhisperTranscriber:
 
     async def transcribe(self, pcm: bytes) -> str:
         """Transcribe one piece of 16 kHz mono 16-bit audio. The piece file is always deleted."""
-        self._work_dir.mkdir(parents=True, exist_ok=True)
+        self._work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self._work_dir / f"piece-{uuid.uuid4().hex}.wav"
         try:
+            # The recording is the user's voice: created readable by them only, deleted below.
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             write_wav(path, pcm)
             async with self._slot.hold("whisper"):
                 raw = await self._run(path)

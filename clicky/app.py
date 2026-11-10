@@ -53,10 +53,17 @@ def _log_file_handler() -> logging.Handler | None:
     base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
     try:
         log_dir = Path(base) / "clicky"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        return RotatingFileHandler(
+        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handler = RotatingFileHandler(
             log_dir / "clicky.log", maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUPS, encoding="utf-8"
         )
+        # Only the user reads Clicky's state folder and log (window classes, box kinds, timings).
+        for path in (log_dir, log_dir / "clicky.log"):
+            try:
+                os.chmod(path, 0o700 if path.is_dir() else 0o600)
+            except OSError:
+                pass
+        return handler
     except OSError:
         return None
 
