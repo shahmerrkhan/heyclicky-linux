@@ -4,7 +4,9 @@ Default order (no strong button): fast, strong, fast, strong, ... for `rounds` r
 with a short pause between rounds, then an error.
 With the strong button (or "power mode"): strong (long timer), then fast, then an error. No alternating.
 Write drafts without the strong button (`fast_tries`): the fast model that many times, then the
-strong model once (its takeover timer), then an error. No pauses between them.
+strong model once (its takeover timer), then an error. No pauses between them. For these the
+fast model thinks at DRAFT_THINKING_LEVEL: turning notes into a message needs no long thinking,
+and the thinking was most of the wait before a draft's first word.
 
 Each try is one model under one first-word timer that also covers a single
 retry after a "busy" error. A try fails when the model is too slow (no first
@@ -38,6 +40,8 @@ from .gemini import (
 )
 
 logger = logging.getLogger(__name__)
+
+DRAFT_THINKING_LEVEL = "low"  # the fast model's thinking for Write drafts (`fast_tries`)
 
 
 class FailureKind(Enum):
@@ -82,6 +86,8 @@ class RoutedAnswer:
     reply: GeminiReply
     choice: ModelChoice
     tries: int = 1
+    first_word_s: float | None = None  # from the request to the first word (None: no text came)
+    total_s: float | None = None  # from the request to the end of the answer
     # Why the first choice didn't answer (None when it did).
     first_failure_reason: str | None = None
     # Set when the connection broke after the answer had started streaming.
@@ -141,7 +147,8 @@ class ModelRouter:
                 strong = dataclasses.replace(self._strong, first_word_timeout_s=strong_timeout_s)
             return [(0, strong), (0, self._fast)]
         if fast_tries is not None:
-            return [(0, self._fast)] * max(1, fast_tries) + [(0, self._strong)]
+            fast = dataclasses.replace(self._fast, thinking_level=DRAFT_THINKING_LEVEL)
+            return [(0, fast)] * max(1, fast_tries) + [(0, self._strong)]
         plan: list[tuple[int, ModelChoice]] = []
         for round_number in range(self._rounds):
             plan += [(round_number, self._fast), (round_number, self._strong)]
@@ -203,6 +210,12 @@ class ModelRouter:
                 continue
 
             answer.tries = tries
+            logger.info(
+                "%s (%s, thinking %s) answered: first word after %s, done after %s, %d characters, %d image(s), "
+                "%d earlier turn(s), try %d", choice.model, choice.role, choice.thinking_level,
+                _seconds(answer.first_word_s), _seconds(answer.total_s), len(answer.reply.text),
+                len(request.images), len(request.history), tries,
+            )
             if failures:
                 first_choice, first_failure = failures[0]
                 answer.first_failure_reason = _failure_reason(first_choice, first_failure)
@@ -253,6 +266,8 @@ class ModelRouter:
             thinking_level=choice.thinking_level,
         )
         reply = GeminiReply()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         try:
             # Phase 1: wait for the first word, bounded by the timer.
             try:
@@ -279,16 +294,22 @@ class ModelRouter:
                 raise _AttemptFailed(_AttemptFailure(kind, short_error_message(exc))) from exc
 
             # Phase 2: the answer has started — stream it to the end, never cut off.
+            first_word_s = loop.time() - started
             on_text(reply.text)
             try:
                 async for reply in stream:
                     on_text(reply.text)
             except Exception as exc:  # noqa: BLE001 - keep what we have
                 logger.warning("%s stream broke mid-answer: %s", choice.model, exc)
-                return RoutedAnswer(reply=reply, choice=choice, interrupted_error=short_error_message(exc))
-            return RoutedAnswer(reply=reply, choice=choice)
+                return RoutedAnswer(reply=reply, choice=choice, interrupted_error=short_error_message(exc),
+                                    first_word_s=first_word_s, total_s=loop.time() - started)
+            return RoutedAnswer(reply=reply, choice=choice, first_word_s=first_word_s, total_s=loop.time() - started)
         finally:
             await stream.aclose()
+
+
+def _seconds(value: float | None) -> str:
+    return "?" if value is None else f"{value:.1f} s"
 
 
 def _failure_reason(choice: ModelChoice, failure: _AttemptFailure) -> str:
