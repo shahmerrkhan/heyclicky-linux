@@ -25,7 +25,6 @@ import json
 import logging
 import os
 import re
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator
@@ -101,7 +100,9 @@ class ClaudeCodeClient:
             )
 
         cmd = self._build_command(request)
-        logger.info("spawn: %s (cwd=%s)", shlex.join(cmd), request.cwd)
+        # Never the prompt itself: its length only.
+        logger.info("spawn: %s with %d options, a prompt of %d characters (cwd=%s)", self._binary, len(cmd) - 3,
+                    len(request.prompt), request.cwd)
 
         env = dict(os.environ)
         # Stop Claude Code from probing for a TTY-friendly UI.
@@ -133,7 +134,7 @@ class ClaudeCodeClient:
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
-                    logger.debug("non-json output: %r", line)
+                    logger.debug("non-json output (%d characters)", len(line))
                     continue
 
                 fragment = parser.handle(event)
@@ -163,7 +164,8 @@ class ClaudeCodeClient:
         cmd: list[str] = [
             self._binary,
             "-p",
-            request.prompt,
+            # A prompt starting with "-" would be read as an option of the program: a space in front stops that.
+            " " + request.prompt if request.prompt.startswith("-") else request.prompt,
             "--output-format",
             "stream-json",
             "--include-partial-messages",

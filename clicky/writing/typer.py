@@ -188,7 +188,7 @@ async def _type_chunk(chunk: str, cancel: asyncio.Event) -> bool:
     caller (`_keys`).
     """
     proc = await asyncio.create_subprocess_exec(
-        "xdotool", "type", "--delay", str(KEY_DELAY_MS), "--clearmodifiers", chunk,
+        "xdotool", "type", "--delay", str(KEY_DELAY_MS), "--clearmodifiers", "--", chunk,  # "--": the text is never an option
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
     finished = asyncio.ensure_future(proc.wait())
