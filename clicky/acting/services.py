@@ -119,11 +119,23 @@ def _entries(key: str) -> tuple[Entry, ...]:
     return tuple(parse(["|".join(service.never_press)])) if service and service.never_press else ()
 
 
-def never_press_hits(service: Service | None, *texts: str) -> list[str]:
-    """This app's extra forbidden button words found in these texts ([] for an app with none)."""
+def services_for(app_class: str | None, title: str | None) -> list[Service]:
+    """Every table entry this window matches, by class or by title. The never-press words of all
+    of them apply: a page whose title names two apps ("Slack integration · GitHub") must not lose
+    the stricter app's words by also naming the other."""
+    cls = (app_class or "").strip().lower()
+    lowered = (title or "").lower()
+    return [s for s in SERVICES if (cls and cls in s.classes) or any(word in lowered for word in s.title_words)]
+
+
+def never_press_hits(service: Service | list[Service] | None, *texts: str) -> list[str]:
+    """Extra forbidden button words of this app (or of every app in the list) found in these texts."""
     if service is None:
         return []
-    return hits(list(texts), _entries(service.key))
+    found: list[str] = []
+    for one in service if isinstance(service, list) else [service]:
+        found += [h for h in hits(list(texts), _entries(one.key)) if h not in found]
+    return found
 
 
 def note_for(service: Service | None) -> str:
