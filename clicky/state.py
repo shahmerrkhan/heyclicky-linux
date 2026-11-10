@@ -55,9 +55,10 @@ from .acting import windows
 from .acting.actor import Actor, blocked_reason
 from .acting.apps import app_options
 from .acting.buttons import list_buttons
-from .acting.closeup import CLOSEUP_H, CLOSEUP_W, mark_spot, spot_is_text_box
+from .acting.closeup import CLOSEUP_H, CLOSEUP_W, look_at_button, mark_spot, spot_is_text_box
 from .acting.guard import ASK_WITH_BUTTONS, TASK_LIMIT_S, ActTask, ExpectedWindow, window_problem
 from .acting.links import LINKS, service_of_title
+from .acting.services import CHAT, CODE, EMAIL, service_for
 from .acting.options import LINK, WINDOW, ActingContext, OpenOption, cheapest
 from .writing.browsers import BrowserCheck
 from .writing.typer import DraftTyper, TypedDraft, TypeResult, explanation, set_clipboard_text
@@ -119,6 +120,7 @@ _SAME_ESC_S = 0.5  # the bar's Esc and the keyboard reader's Esc arrive within t
 WARM_AGAIN_S = 30.0  # no second Gemini warm-up within this many seconds
 PLACE_SHOT_LONG_SIDE = 1280  # the where-to-type screenshot's longer side, in pixels (Vision: 1600)
 PLACE_SHOT_QUALITY = 75
+SENDING_KINDS = (EMAIL, CHAT, CODE)  # apps where typed text still has to be sent by the user
 WRITING_FAST_TRIES = 2  # Write drafts without the strong button: fast, fast, then strong
 
 
@@ -1203,6 +1205,20 @@ class CompanionStateMachine(QObject):
         image = await asyncio.to_thread(mark_spot, shot.image_data, sx, sy)
         return await spot_is_text_box(self._gemini, settings.gemini_fast_model, image)
 
+    async def _closeup_look_at_button(self, point: tuple[int, int]) -> dict | None:
+        """The second look before a screenshot-guided click (actor.click_point): the same small
+        ringed crop, and the fast model says what is there and whether one click is safe."""
+        x, y = point
+        box = clip_to_desktop(x - CLOSEUP_W // 2, y - CLOSEUP_H // 2, CLOSEUP_W, CLOSEUP_H, enumerate_monitors())
+        if box is None:
+            return None
+        shot = await asyncio.to_thread(capture_region, *box)
+        m = shot.monitor
+        sx = (x - m.x) * shot.width_pixels / max(1, m.width)
+        sy = (y - m.y) * shot.height_pixels / max(1, m.height)
+        image = await asyncio.to_thread(mark_spot, shot.image_data, sx, sy)
+        return await look_at_button(self._gemini, settings.gemini_fast_model, image)
+
     async def _type_draft(self, draft: str, target: WritingTarget | None = None) -> TypeResult:
         """Type the draft into the remembered window; explain the outcome in the bubble."""
         target = target or self._writing_target
@@ -1304,7 +1320,8 @@ class CompanionStateMachine(QObject):
         self, draft: str, request: str, target: WritingTarget | None, act: ActTask | None
     ) -> str | None:
         actor = (
-            Actor(act, lambda: self.act_on, settings.link_browser_command, self._explain, self._browser_check)
+            Actor(act, lambda: self.act_on, settings.link_browser_command, self._explain, self._browser_check,
+                  self._closeup_look_at_button)
             if act else None
         )
         with_buttons = False  # the one re-ask of a check, with the window's buttons listed
@@ -1416,8 +1433,14 @@ class CompanionStateMachine(QObject):
                 return None, why
             act.next_step()
             return new_target, ""
-        why = await actor.press(target, result.press, result.safe, result.does)
-        logger.info("acting: task %s: press %s after %.1f s (%s)", act.id, "worked" if why is None else "failed",
+        if result.press is not None:
+            path = "accessibility press"
+            why = await actor.press(target, result.press, result.safe, result.does)
+        else:
+            path = "screenshot click"
+            current = refresh_target(target) or target  # where the window is now
+            why = await actor.click_point(current, result.click.point, result.click.label, result.safe, result.does)
+        logger.info("acting: task %s: %s %s after %.1f s (%s)", act.id, path, "worked" if why is None else "failed",
                     time.monotonic() - started, actor.last_code or "ok")
         if why is not None:
             return None, why
@@ -1570,6 +1593,11 @@ class CompanionStateMachine(QObject):
                 time.monotonic() - fill_started, "complete" if outcome.complete else outcome.code or "stopped",
             )
             status = await self._report_fill(outcome, result, target, earlier)
+            acted = self._act_task is not None and self._act_task.steps_used > 0
+            service = service_for(target.app_class, target.title)
+            if outcome.typed and (acted or (service is not None and service.kind in SENDING_KINDS)):
+                # Clicky only ever fills boxes: sending is the user's own click.
+                self._add_note("Nothing was sent: check it and press Send yourself.")
         if name_note:
             self._add_note(name_note)
         if result.missing:
