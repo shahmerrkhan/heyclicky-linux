@@ -22,6 +22,11 @@ from google.genai import errors, types
 
 logger = logging.getLogger(__name__)
 
+# How long an idle connection to Gemini is kept open. httpx's default is 5 s, so the connection
+# warmed when the input bar opens was gone again by the time the question was typed, and every
+# request paid for a new one (about 0.15 s measured). Google closes idle connections itself later.
+KEEPALIVE_S = 120.0
+
 # Finish reasons that mean "Gemini stopped on purpose and withheld the answer".
 # MAX_TOKENS is handled separately (the answer was cut off, not blocked).
 _BLOCKED_FINISH_REASONS = {
@@ -156,7 +161,12 @@ def _build_contents(request: GeminiRequest) -> list[types.Content]:
 class GeminiClient:
     def __init__(self, api_key: str, max_tokens: int = 8192) -> None:
         self._max_tokens = max_tokens
-        self._client = genai.Client(api_key=api_key)
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                async_client_args={"limits": httpx.Limits(keepalive_expiry=KEEPALIVE_S)},
+            ),
+        )
 
     async def aclose(self) -> None:
         await self._client.aio.aclose()
