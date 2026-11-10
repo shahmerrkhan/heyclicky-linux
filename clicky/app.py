@@ -114,6 +114,8 @@ def main() -> int:
     tray.quit_requested.connect(app.quit)
     tray.set_acting_state(state_machine.act_on)
     tray.acting_toggled.connect(state_machine.set_act_on)
+    state_machine.background_changed.connect(tray.set_background_count)
+    tray.cancel_background_requested.connect(state_machine.cancel_background)
     tray.show()
 
     _show_missing_key_notice(tray)

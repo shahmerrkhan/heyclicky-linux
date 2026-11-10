@@ -51,6 +51,7 @@ class TrayController(QObject):
     quit_requested = pyqtSignal()
     voice_toggled = pyqtSignal(bool)
     acting_toggled = pyqtSignal(bool)
+    cancel_background_requested = pyqtSignal()
     stop_voice_requested = pyqtSignal()
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -78,6 +79,12 @@ class TrayController(QObject):
         self._acting_action.setChecked(True)
         self._acting_action.toggled.connect(self.acting_toggled.emit)
         menu.addAction(self._acting_action)
+
+        # Long drafts being written in the background: how many, and a way to cancel them.
+        self._background_action = QAction("No background tasks", self)
+        self._background_action.setEnabled(False)
+        self._background_action.triggered.connect(self.cancel_background_requested.emit)
+        menu.addAction(self._background_action)
 
         menu.addSeparator()
 
@@ -110,6 +117,16 @@ class TrayController(QObject):
         self._acting_action.blockSignals(True)
         self._acting_action.setChecked(on)
         self._acting_action.blockSignals(False)
+
+    def set_background_count(self, count: int) -> None:
+        """How many background tasks are running; the menu entry cancels them all."""
+        if count <= 0:
+            self._background_action.setText("No background tasks")
+        else:
+            self._background_action.setText(
+                f"Cancel {count} background task{'s' if count != 1 else ''} (nothing more is typed)"
+            )
+        self._background_action.setEnabled(count > 0)
 
     def show_notice(self, title: str, message: str) -> None:
         """Desktop notification from the tray icon (stays ~10 s)."""
