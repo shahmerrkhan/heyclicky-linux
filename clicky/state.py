@@ -18,6 +18,8 @@ from PyQt6.QtGui import QCursor
 from .audio.heavy_slot import HeavySlot
 from .audio.voice_files import VoiceFiles
 from .browser import open_with_command
+from .input.idle import idle_seconds
+from .tasks import FINAL, GIVE_UP, IDLE_BEFORE_FOCUS_S, RETRY, TYPED, BackgroundTasks, BgTask, Delivery
 from .config import ENV_FILE, settings
 from .llm.claude_code import (
     ClaudeCodeClient,
@@ -122,6 +124,19 @@ PLACE_SHOT_LONG_SIDE = 1280  # the where-to-type screenshot's longer side, in pi
 PLACE_SHOT_QUALITY = 75
 SENDING_KINDS = (EMAIL, CHAT, CODE)  # apps where typed text still has to be sent by the user
 WRITING_FAST_TRIES = 2  # Write drafts without the strong button: fast, fast, then strong
+# A Write request with one of these runs as a background task (tasks.py): Clicky says it will
+# come back, the input bar stays free, and the finished draft is typed once the user pauses.
+BACKGROUND_CUES = re.compile(
+    r"\b(in the background|take your time|come back (to me )?(when|once)|while i (work|do|finish|keep)"
+    r"|(very|really|extremely|super) long|long and detailed|detailed and long)\b",
+    re.IGNORECASE,
+)
+BACKGROUND_STARTED_TEXT = (
+    "On it. This one will take a bit, so I'll work on it in the background and come back when it's ready. "
+    "Keep working, or ask me something else."
+)
+BACKGROUND_READY_LINE = "Your draft is ready."
+TYPED_STATUS = "Draft typed into your window."  # the spoken status line of a draft typed in full
 
 
 class CompanionState(Enum):
@@ -197,6 +212,7 @@ class CompanionStateMachine(QObject):
     """
 
     state_changed = pyqtSignal(CompanionState)
+    background_changed = pyqtSignal(int)  # how many background tasks are running (for the tray)
 
     def __init__(self, overlay: Overlay, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -251,6 +267,13 @@ class CompanionStateMachine(QObject):
         self._waiting: _Waiting | None = None  # the click wait or the name question
         self._wait_voice_task: asyncio.Task | None = None  # a spoken reply while waiting
         self._pending_question: tuple[str, bool] | None = None  # (text, spoken): runs once the draft is done
+        # Background tasks (tasks.py): long drafts written while the user works, typed once they pause.
+        self._tasks = BackgroundTasks(
+            self._write_background, self._deliver_background, self._foreground_free, self._announce_background,
+            self._show_untyped_background, self._background_changed, idle_seconds,
+        )
+        self._delivering: BgTask | None = None  # the background draft being typed right now
+        self._queued_prompt: tuple | None = None  # a question sent during those few seconds: runs right after
         self._listen_timer = QTimer(self)
         self._listen_timer.setInterval(1000)
         self._listen_timer.timeout.connect(self._show_listening)
@@ -455,6 +478,7 @@ class CompanionStateMachine(QObject):
         self._warm_task = asyncio.ensure_future(self._gemini.warm_up(settings.gemini_fast_model))
 
     async def aclose(self) -> None:
+        await self._tasks.aclose()  # quitting: background tasks stop and type nothing
         task = self._current_task
         if self._warm_task is not None and not self._warm_task.done():
             self._warm_task.cancel()
@@ -479,6 +503,11 @@ class CompanionStateMachine(QObject):
 
     def _on_prompt_submitted(self, prompt: str, region: QRect | None, options: AskOptions | None = None) -> None:
         options = options or AskOptions()
+        if self._delivering is not None and self._waiting is None:
+            # A background draft is being typed this very moment (a few seconds): the question
+            # runs right after, so the two never share the bubble or the keyboard.
+            self._queued_prompt = (prompt, region, options)
+            return
         if self._waiting is not None:
             if self._offer_reply(prompt, spoken=False):
                 return
@@ -1005,6 +1034,11 @@ class CompanionStateMachine(QObject):
                 self._finish_question()
                 return
             router = self._ensure_clients()
+            if self._start_background(parsed, target):
+                show(BACKGROUND_STARTED_TEXT)
+                self._end_speech(None, None, error=False)
+                self._finish_question()  # the input bar is free again; the task carries on by itself
+                return
             if voice and answer_length.find_triggers(question):
                 # Runs alongside the voice search query (both use the fast model).
                 length_check = asyncio.ensure_future(self._voice_length(question, "writing"))
@@ -1126,6 +1160,159 @@ class CompanionStateMachine(QObject):
         finally:
             if length_check is not None and not length_check.done():
                 length_check.cancel()
+
+    # --- background tasks (tasks.py) --------------------------------------------------
+
+    def background_count(self) -> int:
+        return self._tasks.count()
+
+    def cancel_background(self) -> None:
+        """The tray's "cancel background tasks": every running one stops; nothing more is typed."""
+        cancelled = self._tasks.cancel_all("cancelled from the tray")
+        if cancelled and self._foreground_free():
+            self._explain(f"Cancelled {cancelled} background task{'s' if cancelled != 1 else ''}. Nothing was typed.")
+
+    def _background_changed(self) -> None:
+        self.background_changed.emit(self._tasks.count())
+
+    def _foreground_free(self) -> bool:
+        """No question is being asked, answered, waited on or typed, and the input bar is closed."""
+        if self._state != CompanionState.IDLE or self._waiting is not None or self._delivering is not None:
+            return False
+        if self._current_task is not None and not self._current_task.done():
+            return False
+        return not self._overlay.input_visible()
+
+    def _start_background(self, parsed: ParsedPrompt, target: WritingTarget | None) -> bool:
+        """Run this Write request as a background task? Only when the user's own words ask for a
+        long job (BACKGROUND_CUES), there is a window to type into, and it isn't a terminal."""
+        if target is None or target.pid is None or target.is_terminal or parsed.strong:
+            return False
+        if not BACKGROUND_CUES.search(parsed.question):
+            return False
+        task = self._tasks.start(parsed.question, target, payload=parsed)
+        if task is None:
+            return False  # too many running: this one is written the normal way
+        asyncio.ensure_future(self._note_background_box(task))
+        return True
+
+    async def _note_background_box(self, task: BgTask) -> None:
+        """Remember which box had focus in the window when the user asked (for "two tasks, one box")."""
+        try:
+            task.box = await focused_field(task.target.pid)
+        except Exception:  # noqa: BLE001 - unknown box: the window alone is the key
+            task.box = None
+
+    async def _write_background(self, task: BgTask) -> str:
+        """The draft, written without touching the bubble (a question may be using it)."""
+        parsed: ParsedPrompt = task.payload
+        router = self._ensure_clients()
+        request = GeminiRequest(user_prompt=task.request, history=list(self._memory.recent))
+        answer = await router.answer(
+            request=request,
+            system_prompt=WRITING_SYSTEM_PROMPT
+            + summary_for_system_prompt(self._memory.summary)
+            + answer_length.instruction(parsed.length or "long", "writing"),
+            on_text=lambda _text: None,
+            on_status=lambda _status: None,
+            fast_tries=WRITING_FAST_TRIES,
+        )
+        reply = answer.reply
+        draft = _clean_draft(reply.text)
+        if not draft or reply.was_blocked or reply.was_cut_off or answer.interrupted_error is not None:
+            raise RuntimeError("Gemini didn't finish the draft")
+        self._usage.record_question(used_search=False)
+        return draft
+
+    def _announce_background(self, task: BgTask) -> None:
+        """The draft is ready: the bubble shows it (it never takes focus), and one short spoken
+        line with the speak switch on. Typing follows once the user pauses."""
+        self._overlay.set_bubble_mode("writing")
+        self._overlay.set_bubble_said("")
+        self._overlay.update_bubble_footer("")
+        self._overlay.update_bubble_text(task.draft)
+        self._explain(
+            f"{BACKGROUND_READY_LINE} Clicky will type it into {task.target.app_name} once you pause "
+            f"for {IDLE_BEFORE_FOCUS_S:g} seconds. Esc stops the typing."
+        )
+        self._overlay.show_bubble()
+        self._overlay.bring_back()
+        if self._persisted.speak_on:
+            self._say(BACKGROUND_READY_LINE)
+
+    async def _show_untyped_background(self, task: BgTask, why: str) -> None:
+        """A background draft that couldn't be typed: the bubble keeps it, with the exact reason,
+        and it is copied to the clipboard. A task with no draft just says why."""
+        self._overlay.set_bubble_mode("writing")
+        self._overlay.show_bubble()
+        if not task.draft:
+            self._overlay.update_bubble_text(f"The background draft couldn't be written: {why}.")
+            self._overlay.bring_back()
+            return
+        self._memory.add(task.request, task.draft)
+        await self._nothing_typed(task.draft, f"Not typed: {why}.", task.draft)
+
+    async def _deliver_background(self, task: BgTask) -> Delivery:
+        """One try at typing a finished background draft into the window it was asked from.
+
+        The where-to-type check runs again on the screen as it is now (things may have moved);
+        nothing is opened or pressed here (no acting), text only, never Enter. Focus moves to
+        the remembered window and one box in it, and goes back to where the user was afterwards.
+        """
+        target = refresh_target(task.target)
+        now = windows.window_info(task.target.window_id) if target is not None else None
+        if target is None or now is None:
+            return Delivery(RETRY, f"the {task.target.app_name} window it was for is closed or hidden", "window_gone")
+        if (now.app_class or "").lower() != (task.target.app_class or "").lower():
+            return Delivery(GIVE_UP, "the window it was for shows a different app now", "window_changed")
+        target = replace(target, title=now.title or target.title)
+        was_in = active_window_target()
+        self._delivering = task
+        self._set_state(CompanionState.RESPONDING)
+        self._overlay.set_bubble_mode("writing")
+        self._overlay.update_bubble_text(task.draft)
+        self._explain("typing your background draft…")
+        try:
+            name_known = my_name.pick_name(settings.my_name, None, self._persisted.my_name)[0] is not None
+            check = asyncio.ensure_future(
+                check_plan(
+                    task.draft, task.request, target, self._gemini, settings.gemini_fast_model, settings.gemini_model,
+                    self._usage, lambda: self._capture_target_window(target), earlier=self._earlier_in(target),
+                    max_output_tokens=settings.max_tokens, name_known=name_known, browser_check=self._browser_check,
+                )
+            )
+            self._check_task = check
+            try:
+                result: CheckResult = await check
+            except asyncio.CancelledError:
+                job = asyncio.current_task()
+                if job is not None and job.cancelling():
+                    raise  # the task itself was cancelled (the tray, quitting)
+                task.typing_started = True  # Esc: never tried again
+                self._memory.add(task.request, task.draft)
+                await self._nothing_typed(task.draft, "Stopped before typing.", task.draft, needs_user=False)
+                return Delivery(FINAL, "stopped with Esc", "esc")
+            finally:
+                self._check_task = None
+            if result.status in (FAILED, UNSURE, OPEN, FOCUS, BLOCKED, NEED_BUTTONS):
+                # No box for it right now: nothing was typed, so it can be tried again later.
+                return Delivery(RETRY, result.why or "the box for it couldn't be found", f"check_{result.status}")
+            task.typing_started = True  # from here on this draft is never delivered a second time
+            status = await self._type_checked(task.draft, task.request, target, result)
+            typed = status == TYPED_STATUS
+            return Delivery(TYPED if typed else FINAL, "" if typed else "it wasn't typed in full", "typed" if typed else "not_typed")
+        finally:
+            self._delivering = None
+            # Back to where the user was (never one of Clicky's own windows).
+            if was_in is not None and was_in.window_id != target.window_id:
+                try:
+                    await self._typer.activate(was_in)
+                except Exception:  # noqa: BLE001 - the draft is typed; focus stays where it is
+                    logger.info("background: couldn't switch back to the window the user was in")
+            self._finish_question()
+            queued, self._queued_prompt = self._queued_prompt, None
+            if queued is not None:
+                asyncio.get_running_loop().call_soon(self._on_prompt_submitted, *queued)
 
     async def _capture_for_writing(self, target: WritingTarget | None = None) -> list[LabeledImage]:
         """Screenshot for a writing request, with Clicky's own windows hidden.
@@ -1643,7 +1830,7 @@ class CompanionStateMachine(QObject):
         self._last_draft = None
         self._remember_fill(target.window_id, earlier, outcome.typed)
         if outcome.complete:
-            return "Draft typed into your window."
+            return TYPED_STATUS
         if outcome.stopped:
             return None
         where = "on your clipboard" if copied else "in the bubble"
