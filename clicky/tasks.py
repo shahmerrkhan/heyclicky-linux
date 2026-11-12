@@ -66,6 +66,12 @@ class BgTask:
     target: object  # the WritingTarget of the window the user was in when they asked
     box: object = None  # the box that had focus there then (a Field), None when unknown
     payload: object = None  # whatever the writer needs (the parsed prompt)
+    # A follow-up to what Clicky typed before? Decided once, when the user asks, and kept here with
+    # those earlier pieces: never re-read from whatever Clicky last typed in that window by the
+    # time the draft is delivered (the window may show another tab by then).
+    follow_up: bool = False
+    earlier: list = field(default_factory=list)
+    setup: asyncio.Future | None = None  # the look at the window when the user asked (state.py)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     state: str = WRITING
     draft: str = ""
@@ -175,6 +181,8 @@ class BackgroundTasks:
         started = self._clock()
         try:
             try:
+                if task.setup is not None:
+                    await task.setup  # what the window held when the user asked (never raises)
                 task.draft = (await self._write(task) or "").strip()
             except asyncio.CancelledError:
                 raise

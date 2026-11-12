@@ -63,7 +63,7 @@ from .acting.links import LINKS, service_of_title
 from .acting.services import CHAT, CODE, EMAIL, service_for
 from .acting.options import LINK, WINDOW, ActingContext, OpenOption, cheapest
 from .writing.browsers import BrowserCheck
-from .writing.typer import DraftTyper, TypedDraft, TypeResult, explanation, set_clipboard_text
+from .writing.typer import DraftTyper, TypedDraft, TypeResult, explanation, find_span, set_clipboard_text
 from .writing.fields import (
     BLOCKED,
     FAILED,
@@ -82,7 +82,9 @@ from .writing.fields import (
     Step,
     check_plan,
     click_wait_result,
+    earlier_for,
     focused_field,
+    list_fields,
     set_closeup,
     match_piece,
     move_to,
@@ -1199,15 +1201,36 @@ class CompanionStateMachine(QObject):
         task = self._tasks.start(parsed.question, target, payload=parsed)
         if task is None:
             return False  # too many running: this one is written the normal way
-        asyncio.ensure_future(self._note_background_box(task))
+        task.setup = asyncio.ensure_future(self._note_background_window(task, self._earlier_in(target)))
         return True
 
-    async def _note_background_box(self, task: BgTask) -> None:
-        """Remember which box had focus in the window when the user asked (for "two tasks, one box")."""
+    async def _note_background_window(self, task: BgTask, typed_before: list[Earlier]) -> None:
+        """What the window held when the user asked: which box had focus (for "two tasks, one box"),
+        and whether this request is a follow-up to what Clicky typed there before.
+
+        It is a follow-up only when that earlier text is still in one of the window's boxes right
+        now. A browser window is one window for all its tabs, so "Clicky typed in this window last
+        time" alone doesn't say the text is on the page the user is asking from. The answer is
+        kept on the task (`follow_up`, `earlier`) and never worked out again at delivery.
+        """
         try:
             task.box = await focused_field(task.target.pid)
         except Exception:  # noqa: BLE001 - unknown box: the window alone is the key
             task.box = None
+        found = False
+        if typed_before:
+            try:
+                boxes = await list_fields(task.target.pid) or []
+            except Exception:  # noqa: BLE001 - can't be read: not a follow-up (nothing is overwritten either way)
+                boxes = []
+            for box in boxes:
+                mine = earlier_for(box, typed_before)
+                if mine is not None and box.text and find_span(box.text, mine.text) is not None:
+                    found = True
+                    break
+        task.follow_up, task.earlier = found, list(typed_before) if found else []
+        logger.info("background: task %s: %s", task.id,
+                    f"a follow-up to {len(task.earlier)} earlier piece(s)" if found else "not a follow-up")
 
     async def _write_background(self, task: BgTask) -> str:
         """The draft, written without touching the bubble (a question may be using it)."""
@@ -1285,7 +1308,7 @@ class CompanionStateMachine(QObject):
             check = asyncio.ensure_future(
                 check_plan(
                     task.draft, task.request, target, self._gemini, settings.gemini_fast_model, settings.gemini_model,
-                    self._usage, lambda: self._capture_target_window(target), earlier=self._earlier_in(target),
+                    self._usage, lambda: self._capture_target_window(target), earlier=task.earlier,
                     max_output_tokens=settings.max_tokens, name_known=name_known, browser_check=self._browser_check,
                 )
             )
@@ -1306,7 +1329,7 @@ class CompanionStateMachine(QObject):
                 # No box for it right now: nothing was typed, so it can be tried again later.
                 return Delivery(RETRY, result.why or "the box for it couldn't be found", f"check_{result.status}")
             task.typing_started = True  # from here on this draft is never delivered a second time
-            status = await self._type_checked(task.draft, task.request, target, result)
+            status = await self._type_checked(task.draft, task.request, target, result, earlier=task.earlier)
             typed = status == TYPED_STATUS
             return Delivery(TYPED if typed else FINAL, "" if typed else "it wasn't typed in full", "typed" if typed else "not_typed")
         finally:
@@ -1726,10 +1749,15 @@ class CompanionStateMachine(QObject):
         return ActingContext(options, buttons_of=list_buttons)
 
     async def _type_checked(
-        self, draft: str, request: str, target: WritingTarget | None, result: CheckResult
+        self, draft: str, request: str, target: WritingTarget | None, result: CheckResult,
+        earlier: list[Earlier] | None = None,
     ) -> str | None:
-        """The check said where to type (or why not): the safety rules (fill.py), then typing."""
-        earlier = self._earlier_in(target)
+        """The check said where to type (or why not): the safety rules (fill.py), then typing.
+
+        `earlier`: what this request is a follow-up to. None: whatever Clicky typed last in that
+        window (the foreground); a background task hands in what it noted when the user asked."""
+        if earlier is None:
+            earlier = self._earlier_in(target)
         if result.status == FAILED:
             logger.info("where-to-type check failed: %s", result.why)
             logger.info("fill: nothing typed: check_failed")
