@@ -1298,7 +1298,7 @@ class CompanionStateMachine(QObject):
         self._overlay.set_bubble_mode("writing")
         self._overlay.show_bubble()
         if not task.draft:
-            self._overlay.update_bubble_text(f"The background draft couldn't be written: {why}.")
+            self._overlay.update_bubble_text(f"The draft couldn't be written: {why}.")
             self._overlay.bring_back()
             self._bubble_code("background_no_draft")
             return

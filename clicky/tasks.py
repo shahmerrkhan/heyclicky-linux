@@ -23,6 +23,8 @@ Rules, all in this file so they can be tested with fakes:
   - After the last failed try, or DELIVERY_CAP_S of real time after the draft was ready, the
     draft goes to the bubble and the clipboard with the last reason. A finished draft is never
     dropped, and nothing is spoken for failed tries.
+  - Gemini failing to write the draft is tried again up to len(DRAFT_GAPS_S) times, with those
+    pauses. These are not delivery tries. If every one fails, the bubble says so.
   - Two tasks never type into the same box: the second one's draft goes to the bubble instead.
   - Cancelled or quit: nothing more is typed.
 The pieces that touch Gemini, the screen and the keyboard are handed in by state.py.
@@ -43,6 +45,7 @@ IDLE_BEFORE_FOCUS_S = 3.0  # the user must have left keyboard and mouse alone th
 MAX_TRIES = 10  # failed tries before the draft goes to the bubble and the clipboard
 TRY_GAPS_S = (5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0)  # the pauses between the tries (5 min)
 DELIVERY_CAP_S = 600.0  # real time after the draft is ready: then the failure bubble, whatever happened
+DRAFT_GAPS_S = (5.0, 10.0, 20.0, 30.0, 60.0)  # Gemini couldn't write the draft: written again after these pauses
 NO_ANSWER_GAP_S = 5.0  # Gemini gave no plan: looked at again after this long (not a try)
 BUSY_POLL_S = 0.5  # how often "is the user idle, is Clicky free?" is looked at
 SHOW_WAIT_S = 600.0  # a draft that couldn't be typed waits this long at most for the bubble to be free
@@ -124,6 +127,7 @@ class BackgroundTasks:
         cap_s: float = DELIVERY_CAP_S,
         no_answer_gap_s: float = NO_ANSWER_GAP_S,
         max_tries: int = MAX_TRIES,
+        draft_gaps_s: tuple[float, ...] = DRAFT_GAPS_S,
         idle_before_focus_s: float = IDLE_BEFORE_FOCUS_S,
         show_wait_s: float = SHOW_WAIT_S,
         wall: Callable[[], float] = time.time,  # real clock time, for the cap
@@ -132,7 +136,7 @@ class BackgroundTasks:
         self._announce, self._show_untyped, self._on_change = announce, show_untyped, on_change
         self._idle_seconds, self._clock, self._sleep, self._wall = idle_seconds, clock, sleep, wall
         self._gaps_s, self._cap_s, self._no_answer_gap_s = try_gaps_s, cap_s, no_answer_gap_s
-        self._max_tries = max_tries
+        self._max_tries, self._draft_gaps_s = max_tries, draft_gaps_s
         self._idle_needed_s, self._show_wait_s = idle_before_focus_s, show_wait_s
         self._tasks: list[BgTask] = []
         self._typed_boxes: set[tuple] = set()  # boxes a background draft went into
@@ -206,18 +210,26 @@ class BackgroundTasks:
     async def _run(self, task: BgTask) -> None:
         started = self._clock()
         try:
-            try:
-                if task.setup is not None:
-                    await task.setup  # what the window held when the user asked (never raises)
-                task.draft = (await self._write(task) or "").strip()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - the user is told; nothing is typed
-                logger.warning("background: task %s: no draft (%s)", task.id, exc.__class__.__name__)
-                await self._end_untyped(task, str(exc).strip() or "the draft couldn't be written", "no_draft")
-                return
+            if task.setup is not None:
+                await task.setup  # what the window held when the user asked (never raises)
+            why = "the draft came back empty"
+            for retry in range(len(self._draft_gaps_s) + 1):
+                try:
+                    task.draft = (await self._write(task) or "").strip()
+                    why = "the draft came back empty"
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - written again; in the end the user is told
+                    task.draft, why = "", str(exc).strip() or "the draft couldn't be written"
+                    logger.warning("background: task %s: no draft (%s)", task.id, exc.__class__.__name__)
+                if task.draft:
+                    break
+                if retry < len(self._draft_gaps_s):
+                    logger.info("background: task %s: writing the draft again in %.0f s (retry %d of %d)", task.id,
+                                self._draft_gaps_s[retry], retry + 1, len(self._draft_gaps_s))
+                    await self._sleep(self._draft_gaps_s[retry])
             if not task.draft:
-                await self._end_untyped(task, "the draft came back empty", "no_draft")
+                await self._end_untyped(task, why, "no_draft")
                 return
             logger.info("background: task %s: draft ready after %.1f s (%d characters)", task.id,
                         self._clock() - started, len(task.draft))
