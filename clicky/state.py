@@ -106,6 +106,12 @@ from .writing.fields import (
     earlier_for,
     focused_field,
     task_label,
+    replies_for,
+    DEFAULT_REPLIES,
+    DONE,
+    NOT_NOW,
+    SKIP_NAME,
+    USE_SCREEN_NAME,
     list_fields,
     set_closeup,
     match_piece,
@@ -166,6 +172,8 @@ HANDOFF_TEXT = (
     "This is taking a while, so I'll finish it in the background. Keep working; I'll put it in once you pause."
 )
 # Before a new request, when a background task is still unfinished (once per task):
+LATER = "\x00later"  # the click wait's "Not now": put into the wait's replies, never shown or typed
+_NOT_NOW = re.compile(r"^(not now|later|not now,? later|maybe later)[.!]?$")
 REMINDER_BUTTONS = ("Finish it", "Wait", "Drop it")
 REMINDER_HINT = "Finish it first, let it wait, or drop it? Your new request runs right after."
 FINISH_WAIT_S = 30.0  # "Finish it": how long the new request waits for the task's try to start
@@ -338,6 +346,7 @@ class CompanionStateMachine(QObject):
         )
         self._delivering: BgTask | None = None  # the background draft being typed right now
         self._job: _WriteJob | None = None  # the Write request running in the foreground (for the handoff)
+        self._reply_means: dict[str, str] = {}  # the quick-reply buttons shown now: label (lower case) -> meaning
         self._reminder: _Reminder | None = None  # an unfinished task was pointed out; a new request is held
         self._store_frozen = False  # shutting down: the saved task list is left exactly as it is
         self._drop_tasks = False  # the user chose Quit: pending tasks are dropped, not resumed
@@ -2192,6 +2201,7 @@ class CompanionStateMachine(QObject):
         self._overlay.update_bubble_text(draft)
         self._overlay.bring_back()
         self._explain(f'{why}. Please do that yourself (Clicky never types passwords), then reply "done". Esc stops.')
+        self._show_replies(DEFAULT_REPLIES)
         logger.info("acting: task %s: waiting for the user (a page only they can deal with)", act.id)
         replies: asyncio.Queue = asyncio.Queue()
         self._waiting = _Waiting("page", replies, asyncio.current_task())
@@ -2203,6 +2213,7 @@ class CompanionStateMachine(QObject):
                 reply = None
         finally:
             self._waiting = None
+            self._show_replies([])
             act.resume()
         if reply is None or act.stopped or not is_done(str(reply)):
             act.stop(act.stop_reason or "the page needed you")
@@ -2307,7 +2318,7 @@ class CompanionStateMachine(QObject):
                 if act is not None:  # nothing acts while Clicky asks: Esc goes back to the user meanwhile
                     act.pause()
                     self._release_act_grab()
-                name, name_note = await self._ask_name()
+                name, name_note = await self._ask_name(result)
                 if act is not None:
                     act.resume()
             steps = [replace(s, text=my_name.fill_name(s.text, name)) for s in steps]
@@ -2461,6 +2472,8 @@ class CompanionStateMachine(QObject):
             )
 
         self._bubble_code("click_the_box_no_plan" if result.no_plan else "click_the_box")
+        # Buttons for the answer: Gemini's own (from the check's reply), else a plain Done / Not now.
+        self._show_replies(replies_for(result.replies, (DONE, NOT_NOW), DEFAULT_REPLIES))
 
         async def match(pieces: list[Step], box, window: WritingTarget):
             return await match_piece(
@@ -2482,6 +2495,16 @@ class CompanionStateMachine(QObject):
                 outcome = await click_wait(steps, self._poll_focus, replies, match, type_into, self._explain, WAIT_S)
         finally:
             self._waiting = None
+            self._show_replies([])
+        if outcome.ended == "message" and outcome.message == LATER:
+            # "Not now": with nothing typed yet the draft goes to the background (tried again there);
+            # otherwise the rest stays in the bubble, as after "done".
+            job = self._job
+            if not outcome.typed and job is not None and job.eligible and self._tasks.has_room():
+                logger.info("click wait: ended with \"not now\", handed to the background")
+                job.handoff = True
+                raise _Handoff
+            outcome.ended = "done"
         logger.info("click wait (%s): ended %s, %d of %d piece(s) typed",
                     "no plan in time" if result.no_plan else "unsure", outcome.ended or "?",
                     len(outcome.typed), len(steps))
@@ -2520,13 +2543,16 @@ class CompanionStateMachine(QObject):
         box = await focused_field(active.pid)
         return (active, box) if box is not None else None
 
-    async def _ask_name(self) -> tuple[str | None, str]:
+    async def _ask_name(self, result: CheckResult | None = None) -> tuple[str | None, str]:
         """Ask once for the name to sign with. Returns (name or None, a note for the bubble).
 
         A reply that is a new question runs once the draft is typed (with no name).
         """
         self._overlay.bring_back()  # the question has to be seen
         self._explain(my_name.ASK_TEXT)
+        on_screen = (result.name_on_screen or "").strip() if result is not None else ""
+        allowed = (SKIP_NAME, USE_SCREEN_NAME) if on_screen else (SKIP_NAME,)
+        self._show_replies(replies_for(result.replies if result is not None else [], allowed, [("Not now", SKIP_NAME)]))
         replies: asyncio.Queue = asyncio.Queue()
         self._waiting = _Waiting("name", replies, asyncio.current_task())
         try:
@@ -2535,8 +2561,16 @@ class CompanionStateMachine(QObject):
                     text, spoken = await asyncio.wait_for(replies.get(), WAIT_S)
             except TimeoutError:
                 return None, "No name came back, so it's signed without one."
+            means = self._reply_means.get(" ".join(text.lower().split()), "")
         finally:
             self._waiting = None
+            self._show_replies([])
+        if means == SKIP_NAME:  # a button: no need to ask Gemini what it means
+            return None, "Signed without a name."
+        if means == USE_SCREEN_NAME and on_screen:
+            self._persisted.my_name = on_screen
+            save_state(self._persisted)
+            return on_screen, ""
         self._explain("reading your reply…")
         reply = await my_name.read_name_reply(
             text, list(self._memory.recent), self._gemini, settings.gemini_fast_model, settings.gemini_model,
@@ -2553,18 +2587,41 @@ class CompanionStateMachine(QObject):
             return None, "Couldn't make sense of the reply, so it's signed without a name."
         return None, ""
 
+    def _show_replies(self, replies: list[tuple[str, str]]) -> None:
+        """Quick-reply buttons for the question Clicky is asking now (an empty list removes them).
+        Pressing one sends its label as the user's answer; `_reply_means` says what it stands for."""
+        self._reply_means = {label.lower(): means for label, means in replies}
+        self._overlay.set_bubble_replies([label for label, _ in replies])
+
+    def _reply_meaning(self, text: str) -> str:
+        """What the user's answer means when it is one of the buttons shown (or the same plain
+        words typed): DONE, NOT_NOW, SKIP_NAME, USE_SCREEN_NAME, or "" for anything else."""
+        said = " ".join((text or "").lower().split())
+        means = self._reply_means.get(said, "")
+        if means:
+            return means
+        if is_done(text):
+            return DONE
+        return NOT_NOW if _NOT_NOW.match(said) else ""
+
     def _offer_reply(self, text: str, spoken: bool) -> bool:
         """Something the user sent while Clicky waits. True when the wait takes it.
 
-        The click wait takes only "done"; the name question takes any reply.
+        The click wait and the page wait take "done" and "not now" (typed, spoken, or a button);
+        the name question takes any reply.
         """
         waiting = self._waiting
         if waiting is None:
             return False
         if waiting.kind in ("box", "page"):
-            if not is_done(text):
+            means = self._reply_meaning(text)
+            if means == DONE:
+                waiting.replies.put_nowait("done")
+            elif means == NOT_NOW:
+                # The click wait hands the draft to the background; the page wait just ends.
+                waiting.replies.put_nowait(LATER if waiting.kind == "box" else "")
+            else:
                 return False
-            waiting.replies.put_nowait(text)
         else:
             waiting.replies.put_nowait((text, spoken))
         self._set_state(CompanionState.RESPONDING)

@@ -163,6 +163,8 @@ status:
 
 "label" (optional): 2 to 4 words that name this task for the user, like "email to Sam" or "reply to Priya". clicky only shows it to the user as a reminder of an unfinished task. it is its own field: never put it in any "text", and it is never typed anywhere.
 
+"replies" (optional): clicky may have to ask the user something about this (to click the box they mean, or for their name). give 2 to 4 short buttons they could press instead of typing an answer, like [{"label": "Done", "means": "done"}, {"label": "Not now, later", "means": "not now"}]. "label": at most 24 characters, in the user's language. "means" must be exactly one of "done", "not now", "skip name", "use the name on screen". a button only answers clicky; it never presses anything on the page.
+
 reply with json only, like:
 {"status": "go", "why": "", "name_on_screen": null, "missing": [], "steps": [{"box": 2, "do": "type", "what": "recipient address", "text": "sam@example.com"}, {"box": 4, "do": "add_start", "what": "message", "main": true, "text": "Hey Sam,\\n\\nI'll be there by 5.\\n\\nBest regards,\\n{MY_NAME}"}], "leave": [{"box": 1, "why": "already has text"}]}
 """
@@ -307,6 +309,9 @@ class CheckResult:
     # A few words naming the task for the user (the reminder of an unfinished task). Shown only:
     # it is never typed, never logged, and never part of a step.
     label: str = ""
+    # Quick-reply buttons for when Clicky asks the user something: (label, what it means). Pressing
+    # one only sends its label as the user's answer; nothing on the page is ever pressed.
+    replies: list[tuple[str, str]] = dc_field(default_factory=list)
 
 
 Capture = Callable[[], Awaitable[list[CapturedScreen]]]
@@ -588,7 +593,7 @@ def read_reply(
     """The model's answer as a result, or None when it's unreadable (the next model is asked).
 
     "open", "focus" and "blocked" count only with `acting` (the tray switch on); without it
-    they are unreadable, as before. The optional extras (`steps_left`, `label`) never make an answer
+    they are unreadable, as before. The optional extras (`steps_left`, `label`, `replies`) never make an answer
     unreadable: one that isn't exactly as asked is dropped and the rest of the answer stands.
     """
     data = _json_object(reply)
@@ -598,7 +603,45 @@ def read_reply(
     if result is not None:
         result.steps_left = valid_hints(data.get("steps_left"))
         result.label = task_label(data.get("label"))
+        result.replies = quick_replies(data.get("replies"))
     return result
+
+
+DONE, NOT_NOW, SKIP_NAME, USE_SCREEN_NAME = "done", "not now", "skip name", "use the name on screen"
+REPLY_MEANS = (DONE, NOT_NOW, SKIP_NAME, USE_SCREEN_NAME)  # the only things a quick-reply button can mean
+REPLY_LABEL_LIMIT = 24  # characters
+MAX_REPLIES = 4
+DEFAULT_REPLIES = [("Done", DONE), ("Not now", NOT_NOW)]  # when Gemini gave none (or no usable ones)
+
+
+def quick_replies(value: object) -> list[tuple[str, str]]:
+    """The reply's "replies" as (label, means) pairs. A button that isn't a short one-line label
+    with one of the fixed meanings is dropped; so is a second button with the same label."""
+    if not isinstance(value, list):
+        return []
+    found: list[tuple[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        label, means = item.get("label"), item.get("means")
+        if not isinstance(label, str) or not isinstance(means, str) or means not in REPLY_MEANS:
+            continue
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in label):
+            continue
+        label = " ".join(label.split())
+        if not label or len(label) > REPLY_LABEL_LIMIT or any(label.lower() == seen.lower() for seen, _ in found):
+            continue
+        found.append((label, means))
+        if len(found) == MAX_REPLIES:
+            break
+    return found
+
+
+def replies_for(replies: list[tuple[str, str]], allowed: tuple[str, ...], fallback: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The buttons to show for one question: Gemini's that fit it (`allowed` meanings) when at
+    least two do, else the plain set."""
+    fitting = [(label, means) for label, means in replies if means in allowed]
+    return fitting if len(fitting) >= 2 else list(fallback)
 
 
 LABEL_WORDS = (2, 4)
