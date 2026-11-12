@@ -88,6 +88,10 @@ class BgTask:
     follow_up: bool = False
     earlier: list = field(default_factory=list)
     setup: asyncio.Future | None = None  # the look at the window when the user asked (state.py)
+    # A foreground request handed over while its draft was still being written: that same Gemini
+    # request, still running. The writer waits for it instead of asking again (state.py).
+    adopted: asyncio.Future | None = None
+    announced: bool = False  # the bubble already said the draft is on its way (a handoff)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     state: str = WRITING
     draft: str = ""
@@ -156,11 +160,23 @@ class BackgroundTasks:
             return "writing the draft"
         return f"try {min(task.tries + 1, self._max_tries)} of {self._max_tries}"
 
-    def start(self, request: str, target: object, box: object = None, payload: object = None) -> BgTask | None:
-        """Start a task (None: too many are running already, or Clicky is quitting)."""
-        if self._closed or self.count() >= MAX_TASKS:
+    def has_room(self) -> bool:
+        """Can another task start? (Not while quitting, and at most MAX_TASKS at once.)"""
+        return not self._closed and self.count() < MAX_TASKS
+
+    def start(
+        self, request: str, target: object, box: object = None, payload: object = None, draft: str = "",
+        adopted: asyncio.Future | None = None, announced: bool = False,
+    ) -> BgTask | None:
+        """Start a task (None: too many are running already, or Clicky is quitting).
+
+        A foreground request handed over mid-run brings what it already has: its finished `draft`
+        (nothing is written again), or the Gemini request still writing it (`adopted`).
+        """
+        if not self.has_room():
             return None
-        task = BgTask(request=request, target=target, box=box, payload=payload)
+        task = BgTask(request=request, target=target, box=box, payload=payload, draft=draft.strip(),
+                      adopted=adopted, announced=announced)
         self._tasks.append(task)
         task.job = asyncio.ensure_future(self._run(task))
         logger.info("background: task %s started (%d running)", task.id, self.count())
@@ -188,6 +204,8 @@ class BackgroundTasks:
         task.state, task.why = CANCELLED, why
         if task.job is not None and not task.job.done():
             task.job.cancel()
+        if task.adopted is not None and not task.adopted.done():
+            task.adopted.cancel()  # the Gemini request it took over stops too
         logger.info("background: task %s %s", task.id, why)
 
     async def aclose(self) -> None:
@@ -213,7 +231,7 @@ class BackgroundTasks:
             if task.setup is not None:
                 await task.setup  # what the window held when the user asked (never raises)
             why = "the draft came back empty"
-            for retry in range(len(self._draft_gaps_s) + 1):
+            for retry in range(len(self._draft_gaps_s) + 1 if not task.draft else 0):
                 try:
                     task.draft = (await self._write(task) or "").strip()
                     why = "the draft came back empty"
@@ -256,7 +274,7 @@ class BackgroundTasks:
     async def _land(self, task: BgTask) -> None:
         if task.ready_at is None:
             task.ready_at = self._wall()
-        announced = False
+        announced = task.announced
         why, code = "you were busy the whole time, so Clicky didn't take over your keyboard", "user_busy"
         while True:
             # A try never starts while a question is running or the user is typing or clicking.

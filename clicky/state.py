@@ -7,7 +7,9 @@ import logging
 import os
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from dataclasses import field as dc_field
 from enum import Enum, auto
 from pathlib import Path
 from collections.abc import Callable
@@ -20,6 +22,7 @@ from .audio.heavy_slot import HeavySlot
 from .audio.voice_files import VoiceFiles
 from .browser import open_with_command
 from .input.idle import idle_seconds
+from . import progress as stages
 from .tasks import (
     CAP_REACHED,
     FINAL,
@@ -75,7 +78,7 @@ from .acting.guard import ASK_WITH_BUTTONS, TASK_LIMIT_S, ActTask, ExpectedWindo
 from .acting.links import LINKS, service_of_title
 from .acting.services import CHAT, CODE, EMAIL, service_for
 from .acting.options import LINK, WINDOW, ActingContext, OpenOption, cheapest
-from .writing.browsers import BrowserCheck
+from .writing.browsers import BrowserCheck, listed
 from .writing.typer import DraftTyper, TypedDraft, TypeResult, explanation, find_span, set_clipboard_text
 from .writing.fields import (
     BLOCKED,
@@ -151,6 +154,12 @@ BACKGROUND_STARTED_TEXT = (
     "Keep working, or ask me something else."
 )
 BACKGROUND_READY_LINE = "Your draft is ready."
+# A Write request still running at the 30 s mark (under 60% done) or the 90 s mark goes to the
+# background by itself (progress.py `handoff_due`); the bubble then says this.
+HANDOFF_TEXT = (
+    "This is taking a while, so I'll finish it in the background. Keep working; I'll put it in once you pause."
+)
+HANDOFF_POLL_S = 0.25  # how often the clock and the percent of a running Write request are looked at
 TYPED_STATUS = "Draft typed into your window."  # the spoken status line of a draft typed in full
 
 
@@ -179,6 +188,25 @@ class _Waiting:
     kind: str
     replies: asyncio.Queue  # what the user sends meanwhile (input box or Fn+F5)
     task: asyncio.Task | None  # the Write run that is waiting (Esc, × or another question cancels it)
+
+
+class _Handoff(Exception):
+    """A foreground Write request goes to the background now (raised between its steps, never
+    once typing has started)."""
+
+
+@dataclass
+class _WriteJob:
+    """One Write request running in the foreground: its clock and how far it is (progress.py)."""
+
+    clock: stages.PausableClock  # started when the user sent the request; paused while Clicky waits for them
+    progress: stages.Progress
+    eligible: bool  # may it be handed to the background at all (a window to type into, not a terminal)
+    stage: str = "draft"  # "draft", "check" or "act": what is running right now
+    handoff: bool = False  # the marks were passed: it goes to the background at the next safe point
+    typing: bool = False  # typing has started: it always finishes in the foreground
+    go: asyncio.Event = dc_field(default_factory=asyncio.Event)  # set with `handoff` (wakes the draft stage)
+    watcher: asyncio.Task | None = None
 
 
 class _KnownTranscript:
@@ -288,6 +316,8 @@ class CompanionStateMachine(QObject):
             self._show_untyped_background, self._background_changed, idle_seconds,
         )
         self._delivering: BgTask | None = None  # the background draft being typed right now
+        self._job: _WriteJob | None = None  # the Write request running in the foreground (for the handoff)
+        self._asked: stages.PausableClock | None = None  # started when the user sent the request
         self._queued_prompt: tuple | None = None  # a question sent during those few seconds: runs right after
         self._listen_timer = QTimer(self)
         self._listen_timer.setInterval(1000)
@@ -548,6 +578,7 @@ class CompanionStateMachine(QObject):
             self._speak_task = self._current_task if speak else None
             return
 
+        self._asked = stages.PausableClock()  # the 30 s and 90 s marks count from here
         parsed = ParsedPrompt(
             question=prompt.strip(),
             strong=options.strong,
@@ -1034,7 +1065,14 @@ class CompanionStateMachine(QObject):
         target = self._writing_target
         search: SearchOutcome | None = None
         search_note: str | None = None
-        show = self._overlay.update_bubble_text
+        job: _WriteJob | None = None
+        draft_job: asyncio.Task | None = None
+        handed = False  # the request went to the background: this run no longer touches the bubble
+
+        def show(text: str) -> None:
+            if not handed:
+                self._overlay.update_bubble_text(text)
+
         self._overlay.set_bubble_mode("writing")
         self._overlay.set_bubble_said(said or "")
         self._explain("")
@@ -1111,12 +1149,27 @@ class CompanionStateMachine(QObject):
                     fast_tries=None if parsed.strong else WRITING_FAST_TRIES,
                 )
 
-            answer = await draft_once()
-            if not request.images and model_asks_for_screen(answer.reply.text):
-                show("looking at the window you were in…")
-                request.images = await self._capture_for_writing(target)
-                show("…")
+            async def write_draft() -> RoutedAnswer:
                 answer = await draft_once()
+                if not request.images and model_asks_for_screen(answer.reply.text):
+                    show("looking at the window you were in…")
+                    request.images = await self._capture_for_writing(target)
+                    show("…")
+                    answer = await draft_once()
+                return answer
+
+            job = self._begin_job(target)
+            draft_job = asyncio.ensure_future(write_draft())
+            if await self._handoff_before(job, draft_job):
+                # Still being written at the mark: the same Gemini request carries on, and the
+                # background task takes it over. Nothing is asked twice.
+                handed = True
+                self._hand_off(job, parsed, target, adopted=draft_job)
+                self._end_speech(None, None, error=False)
+                self._finish_question()
+                return
+            answer = await draft_job
+            job.progress.finish(stages.DRAFT)
             reply = answer.reply
             draft = _clean_draft(reply.text)
             succeeded = (
@@ -1149,7 +1202,16 @@ class CompanionStateMachine(QObject):
                     result = await self._type_draft(draft, target)
                     status = speech_text.write_status_line(result, self._draft_copied, replacing)
                 else:
-                    status = await self._place_and_type(draft, question, target)
+                    try:
+                        status = await self._place_and_type(draft, question, target)
+                    except _Handoff:
+                        # Past the mark before any typing: the finished draft goes to the background.
+                        handed = True
+                        self._hand_off(job, parsed, target, draft=draft)
+                        self._end_speech(None, None, error=False)
+                        self._finish_question()
+                        self._run_pending_question()
+                        return
                 if speak and status is not None:  # None: Esc stopped the typing, so say nothing
                     body = await speech_text.fit_for_speech(draft, "writing", self._summarizer())
                     self._say(speech_text.join_spoken(status, body))
@@ -1181,6 +1243,109 @@ class CompanionStateMachine(QObject):
         finally:
             if length_check is not None and not length_check.done():
                 length_check.cancel()
+            if draft_job is not None and not handed and not draft_job.done():
+                draft_job.cancel()  # a new question or the closed bubble ends the Gemini request too
+            self._end_job(job)
+
+    # --- handing a slow request to the background (progress.py) ---------------------------
+
+    def _begin_job(self, target: WritingTarget | None) -> _WriteJob:
+        """Start watching this Write request: its clock (running since the user sent it) and its steps."""
+        clock, self._asked = self._asked or stages.PausableClock(), None
+        eligible = target is not None and target.pid is not None and not target.is_terminal
+        job = _WriteJob(clock, stages.Progress(self._task_kind(target)), eligible)
+        self._job = job
+        if eligible:
+            job.watcher = asyncio.ensure_future(self._watch_handoff(job))
+        return job
+
+    def _end_job(self, job: _WriteJob | None) -> None:
+        if job is None:
+            return
+        if job.watcher is not None and not job.watcher.done():
+            job.watcher.cancel()
+        if self._job is job:
+            self._job = None
+
+    @staticmethod
+    def _task_kind(target: WritingTarget | None) -> str:
+        """Which step list fits the window (progress.py): from the app table, else by the kind of window."""
+        if target is None:
+            return stages.GENERAL
+        service = service_for(target.app_class, target.title)
+        if service is not None:
+            return {EMAIL: stages.EMAIL, CHAT: stages.CHAT, CODE: stages.COMMENT}.get(service.kind, stages.GENERAL)
+        return stages.FORM if listed(target.app_class) else stages.GENERAL
+
+    async def _watch_handoff(self, job: _WriteJob) -> None:
+        """Looks at the clock and the percent until the request must go to the background.
+
+        Never while it waits for the user (the clock is paused then), never once typing has
+        started, and not while no background task can start. A where-to-type check in flight is
+        cancelled (its answer is never used); an acting step in flight finishes first; the draft
+        stage is woken through `job.go`.
+        """
+        while True:
+            await asyncio.sleep(HANDOFF_POLL_S)
+            if job.typing or job.clock.paused or not self._tasks.has_room():
+                continue
+            if not stages.handoff_due(job.clock.elapsed(), job.progress.percent(), job.typing):
+                continue
+            job.handoff = True
+            job.go.set()
+            if job.stage == "check" and self._check_task is not None and not self._check_task.done():
+                self._check_task.cancel()
+            return
+
+    @staticmethod
+    async def _handoff_before(job: _WriteJob, work: asyncio.Future) -> bool:
+        """Wait for `work` (the draft being written). True when the handoff mark came first."""
+        if not job.eligible:
+            return False
+        waiter = asyncio.ensure_future(job.go.wait())
+        try:
+            await asyncio.wait({work, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            waiter.cancel()
+        return job.handoff and not work.done()
+
+    def _hand_off(
+        self, job: _WriteJob, parsed: ParsedPrompt, target: WritingTarget | None, draft: str = "",
+        adopted: asyncio.Future | None = None,
+    ) -> None:
+        """The foreground request becomes a background task, with what it already has: the finished
+        draft, or the Gemini request still writing it. Nothing typed so far, so nothing is typed twice."""
+        task = self._tasks.start(parsed.question, target, payload=parsed, draft=draft, adopted=adopted,
+                                 announced=bool(draft))
+        logger.info("handoff: %s after %.1f s at %d%% (stage %s, draft %s)",
+                    f"task {task.id}" if task is not None else "no room for a task", job.clock.elapsed(),
+                    job.progress.percent(), job.stage, "ready" if draft else "still being written")
+        if task is None:  # can't happen while `has_room` was true a moment ago; never lose the draft
+            if adopted is not None:
+                adopted.cancel()
+            self._explain("Not typed: too many background tasks are running." if draft else "Stopped: too many background tasks are running.")
+            self._bubble_code("handoff_no_room")
+            return
+        task.setup = asyncio.ensure_future(self._note_background_window(task, self._earlier_in(target)))
+        if draft:
+            self._overlay.update_bubble_text(draft)
+        else:
+            self._overlay.update_bubble_text("…")
+        self._explain(HANDOFF_TEXT)
+        self._bubble_code("handoff")
+
+    @contextmanager
+    def _waiting_for_user(self):
+        """While Clicky waits for the user (click the box, the name, a page only they can deal
+        with), the handoff clock stands still."""
+        job = self._job
+        if job is not None:
+            job.clock.pause()
+        try:
+            yield
+        finally:
+            if job is not None:
+                job.clock.resume()
 
     # --- background tasks (tasks.py) --------------------------------------------------
 
@@ -1257,17 +1422,25 @@ class CompanionStateMachine(QObject):
     async def _write_background(self, task: BgTask) -> str:
         """The draft, written without touching the bubble (a question may be using it)."""
         parsed: ParsedPrompt = task.payload
-        router = self._ensure_clients()
-        request = GeminiRequest(user_prompt=task.request, history=list(self._memory.recent))
-        answer = await router.answer(
-            request=request,
-            system_prompt=WRITING_SYSTEM_PROMPT
-            + summary_for_system_prompt(self._memory.summary)
-            + answer_length.instruction(parsed.length or "long", "writing"),
-            on_text=lambda _text: None,
-            on_status=lambda _status: None,
-            fast_tries=WRITING_FAST_TRIES,
-        )
+        adopted, task.adopted = task.adopted, None
+        if adopted is not None:
+            # Handed over while Gemini was still writing: that same request, not a new one.
+            answer = await adopted
+        else:
+            router = self._ensure_clients()
+            request = GeminiRequest(user_prompt=task.request, history=list(self._memory.recent))
+            length = parsed.length or ("long" if BACKGROUND_CUES.search(task.request) else None)
+            answer = await router.answer(
+                request=request,
+                system_prompt=WRITING_SYSTEM_PROMPT
+                + summary_for_system_prompt(self._memory.summary)
+                + answer_length.instruction(length, "writing"),
+                on_text=lambda _text: None,
+                on_status=lambda _status: None,
+                prefer_strong=parsed.strong,
+                strong_timeout_s=settings.writing_strong_timeout_s if parsed.strong else None,
+                fast_tries=None if parsed.strong else WRITING_FAST_TRIES,
+            )
         reply = answer.reply
         draft = _clean_draft(reply.text)
         if not draft or reply.was_blocked or reply.was_cut_off or answer.interrupted_error is not None:
@@ -1564,8 +1737,18 @@ class CompanionStateMachine(QObject):
             status = await self._nothing_typed(draft, line, bubble, needs_user=needs_user)
             return Delivery(FINAL, why, code) if bg is not None else status
 
+        job = self._job if bg is None else None  # the foreground request's clock and steps (for the handoff)
+
+        def handoff_point() -> None:
+            """Between steps: a foreground request past its mark goes to the background here."""
+            if job is not None and job.handoff and not job.typing:
+                raise _Handoff
+
         with_buttons = False  # the one re-ask of a check, with the window's buttons listed
         while True:
+            handoff_point()
+            if job is not None:
+                job.stage = "check"
             if bg is None:
                 earlier = self._earlier_in(target)
             else:  # what the task noted when the user asked, and only in the window it was asked from
@@ -1588,9 +1771,18 @@ class CompanionStateMachine(QObject):
                 task = asyncio.current_task()
                 if task is not None and task.cancelling():
                     raise  # the whole run was cancelled (bubble closed, a new question, the tray)
+                if job is not None and job.handoff and not job.typing:
+                    raise _Handoff from None  # the handoff cancelled this check: its answer is never used
                 return await ended("stopped with Esc", "Stopped before typing.", draft, FINAL, "esc", needs_user=False)
             finally:
                 self._check_task = None
+            if job is not None:
+                job.progress.finish(stages.CHECK)
+                job.progress.set_left(result.steps_left)  # a hint: changes the percent only
+                if result.status == OPEN:
+                    job.progress.expect(stages.OPEN)
+                elif result.status == FOCUS:
+                    job.progress.expect(stages.PRESS if result.press is not None else stages.CLICK)
 
             asked_with_buttons, with_buttons = with_buttons, False
             if act is None:
@@ -1648,7 +1840,13 @@ class CompanionStateMachine(QObject):
                 continue
             if result.status not in (OPEN, FOCUS):
                 break
+            if job is not None:
+                job.stage = "act"  # a step in flight always finishes; the handoff waits for it
             target, why = await self._act_step(act, actor, result, target, acting)
+            if job is not None and target is not None:
+                for done in ((stages.OPEN, stages.SETTLE) if result.status == OPEN else
+                             (stages.PRESS,) if result.press is not None else (stages.CLICK,)):
+                    job.progress.finish(done)
             if target is None:
                 if act.stopped and act.stop_reason == "Esc":
                     return await ended("stopped with Esc", "Stopped.", draft, FINAL, "esc", needs_user=False)
@@ -1663,9 +1861,15 @@ class CompanionStateMachine(QObject):
         if act is not None and result.status != GO:
             # Unsure, stop, failed: the acting task ends here (the click wait works as always).
             self._end_acting(act)
-        if bg is None:
-            return await self._type_checked(draft, request, target, result)
-        return await self._type_background(bg, target, result, earlier)
+        if bg is not None:
+            return await self._type_background(bg, target, result, earlier)
+        handoff_point()
+
+        def typing_starts() -> None:
+            if job is not None:
+                job.typing = True  # from here on it always finishes in the foreground
+
+        return await self._type_checked(draft, request, target, result, on_typing=typing_starts)
 
     async def _type_background(
         self, task: BgTask, target: WritingTarget, result: CheckResult, earlier: list[Earlier]
@@ -1741,7 +1945,8 @@ class CompanionStateMachine(QObject):
         self._waiting = _Waiting("page", replies, asyncio.current_task())
         try:
             try:
-                reply = await asyncio.wait_for(replies.get(), WAIT_S)
+                with self._waiting_for_user():
+                    reply = await asyncio.wait_for(replies.get(), WAIT_S)
             except TimeoutError:
                 reply = None
         finally:
@@ -1768,7 +1973,11 @@ class CompanionStateMachine(QObject):
         return task
 
     def _end_acting(self, task: ActTask | None) -> None:
-        if task is None or self._act_task is not task:
+        if task is None:
+            return
+        if not task.stopped:
+            task.stop("the task is over")  # an ended task never acts again, however it ended
+        if self._act_task is not task:
             return
         self._release_act_grab()
         self._act_task = None
@@ -2017,7 +2226,8 @@ class CompanionStateMachine(QObject):
         replies: asyncio.Queue = asyncio.Queue()
         self._waiting = _Waiting("box", replies, asyncio.current_task())
         try:
-            outcome = await click_wait(steps, self._poll_focus, replies, match, type_into, self._explain, WAIT_S)
+            with self._waiting_for_user():
+                outcome = await click_wait(steps, self._poll_focus, replies, match, type_into, self._explain, WAIT_S)
         finally:
             self._waiting = None
         logger.info("click wait (%s): ended %s, %d of %d piece(s) typed",
@@ -2069,7 +2279,8 @@ class CompanionStateMachine(QObject):
         self._waiting = _Waiting("name", replies, asyncio.current_task())
         try:
             try:
-                text, spoken = await asyncio.wait_for(replies.get(), WAIT_S)
+                with self._waiting_for_user():
+                    text, spoken = await asyncio.wait_for(replies.get(), WAIT_S)
             except TimeoutError:
                 return None, "No name came back, so it's signed without one."
         finally:
