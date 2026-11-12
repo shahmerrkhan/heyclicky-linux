@@ -186,6 +186,7 @@ class _OptionsRow(QWidget):
     """
 
     speak_toggled = pyqtSignal(bool)
+    clear_memory_clicked = pyqtSignal()
 
     # name, label, object name, key, modes where it shows
     TOGGLES = (
@@ -225,6 +226,14 @@ class _OptionsRow(QWidget):
         layout.addWidget(self._length_switch)
 
         layout.addStretch(1)
+        # Forgets the chat (the last turns and the summary) and what Clicky remembers typing.
+        # One press, no confirm step. Settings, the sign-off name and pending tasks stay.
+        self._clear = self._button(
+            "clear memory", "clearBtn", "forget the chat so far and what Clicky typed (settings and background tasks stay)"
+        )
+        self._clear.setCheckable(False)
+        self._clear.clicked.connect(lambda _checked=False: self.clear_memory_clicked.emit())
+        layout.addWidget(self._clear)
         self._speak = self._button("speak: off", "speakBtn", "read typed answers aloud (Alt+K)")
         self._speak.toggled.connect(self._on_speak_toggled)
         layout.addWidget(self._speak)
@@ -323,6 +332,7 @@ class _InputCard(QWidget):
     allow_shell_changed = pyqtSignal(bool)
     workspace_changed = pyqtSignal(str)
     speak_changed = pyqtSignal(bool)
+    clear_memory_requested = pyqtSignal()
 
     SELECTABLE_MODES = ("vision", "code", "writing")
 
@@ -408,6 +418,7 @@ class _InputCard(QWidget):
         # --- options row: strong / search / write, length, speak -------------
         self._options = _OptionsRow(self._card)
         self._options.speak_toggled.connect(self.speak_changed.emit)
+        self._options.clear_memory_clicked.connect(self.clear_memory_requested.emit)
         card_layout.addWidget(self._options)
 
         # --- code-mode row (hidden until mode == 'code') ---------------------
@@ -533,7 +544,8 @@ class _InputCard(QWidget):
             QFrame#modeSwitch QPushButton:disabled {{
                 color: {Colors.TEXT_FAINT};
             }}
-            QPushButton#optStrong, QPushButton#optSearch, QPushButton#optWrite, QPushButton#speakBtn {{
+            QPushButton#optStrong, QPushButton#optSearch, QPushButton#optWrite, QPushButton#speakBtn,
+            QPushButton#clearBtn {{
                 background-color: {Colors.GLASS_INSET};
                 border: none;
                 border-radius: 11px;
@@ -544,7 +556,7 @@ class _InputCard(QWidget):
                 font-weight: 600;
             }}
             QPushButton#optStrong:hover:!checked, QPushButton#optSearch:hover:!checked,
-            QPushButton#optWrite:hover:!checked, QPushButton#speakBtn:hover:!checked {{
+            QPushButton#optWrite:hover:!checked, QPushButton#speakBtn:hover:!checked, QPushButton#clearBtn:hover {{
                 color: {Colors.TEXT};
                 background-color: rgba(255, 255, 255, 52);
             }}
@@ -847,6 +859,7 @@ class Overlay(QObject):
     allow_shell_changed = pyqtSignal(bool)
     workspace_changed = pyqtSignal(str)
     speak_changed = pyqtSignal(bool)  # the input bar's speak switch was flipped
+    clear_memory_requested = pyqtSignal()  # the input bar's "clear memory" button
     bubble_link_clicked = pyqtSignal(str)
     bubble_reply_clicked = pyqtSignal(str)  # a quick-reply button in the bubble
 
@@ -879,6 +892,7 @@ class Overlay(QObject):
         self._input_card.allow_shell_changed.connect(self.allow_shell_changed.emit)
         self._input_card.workspace_changed.connect(self.workspace_changed.emit)
         self._input_card.speak_changed.connect(self.speak_changed.emit)
+        self._input_card.clear_memory_requested.connect(self.clear_memory_requested.emit)
         self._bubble.stop_requested.connect(self.dismiss)
         self._bubble.hide_requested.connect(self.user_hide)
         self._bubble.rolled_up.connect(self._on_bubble_rolled_up)

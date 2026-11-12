@@ -127,6 +127,7 @@ def main() -> int:
     tray.cancel_background_requested.connect(state_machine.cancel_background)
     state_machine.background_changed.connect(lambda _count: tray.set_background_tasks(state_machine.background_lines()))
     tray.cancel_task_requested.connect(state_machine.cancel_background_task)
+    tray.clear_memory_requested.connect(state_machine.clear_memory)
     tray.show()
     # Background tasks saved before a crash or a tray Restart carry on (once the event loop runs).
     loop.call_soon(state_machine.resume_background)

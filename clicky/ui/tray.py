@@ -53,6 +53,7 @@ class TrayController(QObject):
     acting_toggled = pyqtSignal(bool)
     cancel_background_requested = pyqtSignal()
     cancel_task_requested = pyqtSignal(str)  # one background task, by its id
+    clear_memory_requested = pyqtSignal()
     stop_voice_requested = pyqtSignal()
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -80,6 +81,11 @@ class TrayController(QObject):
         self._acting_action.setChecked(True)
         self._acting_action.toggled.connect(self.acting_toggled.emit)
         menu.addAction(self._acting_action)
+
+        # Forgets the chat and what Clicky typed (no confirm step; settings and pending tasks stay).
+        self._clear_memory_action = QAction("Clear memory", self)
+        self._clear_memory_action.triggered.connect(lambda _checked=False: self.clear_memory_requested.emit())
+        menu.addAction(self._clear_memory_action)
 
         # Long drafts being written in the background: how many, and a way to cancel them.
         self._background_action = QAction("No background tasks", self)

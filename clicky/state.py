@@ -366,6 +366,7 @@ class CompanionStateMachine(QObject):
         overlay.speak_changed.connect(self.set_speak_on)
         overlay.bubble_link_clicked.connect(self._on_bubble_link_clicked)
         overlay.bubble_reply_clicked.connect(self._on_reply_clicked)
+        overlay.clear_memory_requested.connect(self.clear_memory)
 
         overlay.apply_agent_mode(
             self._persisted.agent_mode,
@@ -555,6 +556,31 @@ class CompanionStateMachine(QObject):
             return
         self._warmed_at = now
         self._warm_task = asyncio.ensure_future(self._gemini.warm_up(settings.gemini_fast_model))
+
+    def clear_memory(self) -> None:
+        """The "clear memory" button (input bar and tray): one press, no confirm step.
+
+        Forgets the chat memory (the last turns and the running summary; a summary being written
+        is cancelled so the old one can't come back) and the typing memory (what Clicky remembers
+        typing, used to spot a follow-up, and the last draft). Saved settings, the sign-off name
+        and pending background tasks are not touched.
+        """
+        turns, had_summary = len(self._memory.recent), bool(self._memory.summary)
+        self._memory.clear()
+        self._last_fill = None
+        self._last_draft = None
+        logger.info("memory cleared (%d turn(s), summary %s, typing memory)", turns, "yes" if had_summary else "no")
+        if self._foreground_free():
+            self._overlay.set_bubble_said("")
+            self._overlay.update_bubble_footer("")
+            self._overlay.set_bubble_replies([])
+            self._overlay.update_bubble_text("Memory cleared.")
+            self._explain("")
+            self._overlay.show_bubble()
+            self._overlay.bring_back()
+        else:
+            self._add_note("Memory cleared.")  # something is running: its bubble stays, with this note
+        self._bubble_code("memory_cleared")
 
     def user_quit(self) -> None:
         """The user chose Quit (tray or panel): pending background tasks are dropped at shutdown.

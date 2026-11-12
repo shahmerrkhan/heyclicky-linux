@@ -51,6 +51,7 @@ class ChatMemory:
         self.summary = ""
         self._waiting: list[ConversationTurn] = []
         self._task: asyncio.Task | None = None
+        self._cleared = 0  # counts `clear` calls: a summary started before one is never kept
 
     def set_summary_writer(self, write_summary: SummaryWriter) -> None:
         self._write_summary = write_summary
@@ -61,6 +62,18 @@ class ChatMemory:
             self._waiting.append(self.recent.pop(0))
         if self._waiting and (self._task is None or self._task.done()):
             self._task = asyncio.ensure_future(self._summarize())
+
+    def clear(self) -> None:
+        """Forget everything: the latest exchanges, the running summary, and the exchanges still
+        waiting to be summarised. A summary being written right now is cancelled and, if its
+        answer still arrives, thrown away, so the old summary can never come back."""
+        self._cleared += 1
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        self._task = None
+        self.recent = []
+        self._waiting = []
+        self.summary = ""
 
     async def aclose(self) -> None:
         if self._task is not None:
@@ -75,6 +88,7 @@ class ChatMemory:
     async def _summarize(self) -> None:
         # Exchanges that fall out while a summary is being written are picked
         # up by the next loop instead of starting a second request in parallel.
+        started = self._cleared
         while self._waiting:
             batch, self._waiting = self._waiting, []
             if self._write_summary is None:
@@ -92,6 +106,8 @@ class ChatMemory:
             except Exception as exc:  # noqa: BLE001 - a failed summary only loses old detail
                 logger.warning("memory summary failed; keeping the old one: %s", exc)
                 continue
+            if started != self._cleared:
+                return  # the memory was cleared while this summary was written: it is not kept
             if text.strip():
                 self.summary = _limit_words(text.strip(), SUMMARY_WORDS * 2)
 
