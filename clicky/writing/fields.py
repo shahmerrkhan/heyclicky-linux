@@ -68,6 +68,7 @@ from ..acting.words import forbidden_hits
 from ..llm.gemini import GeminiErrorKind, GeminiRequest, LabeledImage, classify_error
 from ..llm.length import DailyLimits, TextModel
 from ..logsafe import log_name
+from ..progress import valid_hints
 from ..screen.capture import CapturedScreen
 from .blank import CODES_LIMIT, ROLES_LIMIT, blank_note, holds_only_objects, is_empty
 from .browsers import BrowserCheck, listed
@@ -157,6 +158,8 @@ status:
 "name_on_screen": the user's own name if the screen clearly shows it (the signed-in account, a "from" line), else null.
 
 "missing": what had to be left empty because the user didn't give it and you may not make it up (for example ["recipient address"]); [] when nothing is missing.
+
+"steps_left" (optional): what is still to come after this answer, as a list of these words only: "open", "switch", "press", "click", "type" (at most 6). for example ["type"] when the text can be typed now, ["press", "type"] when a button has to be pressed first. clicky uses it only to judge how far along it is; it never acts on it.
 
 reply with json only, like:
 {"status": "go", "why": "", "name_on_screen": null, "missing": [], "steps": [{"box": 2, "do": "type", "what": "recipient address", "text": "sam@example.com"}, {"box": 4, "do": "add_start", "what": "message", "main": true, "text": "Hey Sam,\\n\\nI'll be there by 5.\\n\\nBest regards,\\n{MY_NAME}"}], "leave": [{"box": 1, "why": "already has text"}]}
@@ -297,6 +300,8 @@ class CheckResult:
     blocked_kind: str = ""  # BLOCKED: login, password, 2fa, captcha, payment or permission
     buttons: list[Button] = dc_field(default_factory=list)  # the buttons that were listed
     tag: object = None  # the acting task's (task id, step) this answer belongs to
+    # A hint about the steps still to come (progress.py): only fixed names, only for the percent.
+    steps_left: list[str] | None = None
 
 
 Capture = Callable[[], Awaitable[list[CapturedScreen]]]
@@ -463,6 +468,8 @@ def plan_summary(result: CheckResult) -> str:
         steps = [f"press a button that wasn't listed ({len(result.buttons)} listed)"]
     if result.missing:
         steps.append(f"missing: {len(result.missing)}")
+    if result.steps_left is not None:
+        steps.append(f"steps left: {' '.join(result.steps_left) or 'none'}")  # fixed names only
     return f"plan by {result.decided_by or '?'}: {result.status}" + (": " + ", ".join(steps) if steps else "")
 
 
@@ -576,11 +583,26 @@ def read_reply(
     """The model's answer as a result, or None when it's unreadable (the next model is asked).
 
     "open", "focus" and "blocked" count only with `acting` (the tray switch on); without it
-    they are unreadable, as before.
+    they are unreadable, as before. The optional extras (`steps_left`) never make an answer
+    unreadable: one that isn't exactly as asked is dropped and the rest of the answer stands.
     """
     data = _json_object(reply)
     if data is None:
         return None
+    result = _read_answer(data, fields, screens, acting, buttons, point_ok)
+    if result is not None:
+        result.steps_left = valid_hints(data.get("steps_left"))
+    return result
+
+
+def _read_answer(
+    data: dict,
+    fields: list[Field],
+    screens: list[CapturedScreen],
+    acting: ActingContext | None,
+    buttons: list[Button],
+    point_ok: bool,
+) -> CheckResult | None:
     status = data.get("status")
     why = data.get("why") if isinstance(data.get("why"), str) else ""
     if status in (OPEN, FOCUS, BLOCKED):
