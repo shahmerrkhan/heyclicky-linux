@@ -299,7 +299,13 @@ class BackgroundTasks:
                 task.state = DELIVERING
                 task.attempts += 1
                 self._on_change()
-                result = await self._deliver(task)
+                try:
+                    result = await self._deliver(task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - a try that broke is a failed try, never a stuck task
+                    logger.warning("background: task %s: the try failed (%s)", task.id, exc.__class__.__name__)
+                    result = Delivery(RETRY, "something went wrong while placing it", "error")
             counted = result.outcome == RETRY
             if counted:
                 task.tries += 1

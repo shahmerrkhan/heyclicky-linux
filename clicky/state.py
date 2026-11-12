@@ -1311,11 +1311,14 @@ class CompanionStateMachine(QObject):
         await self._nothing_typed(task.draft, f"Not typed: {why}.", task.draft, code="background_not_typed")
 
     async def _deliver_background(self, task: BgTask) -> Delivery:
-        """One try at typing a finished background draft into the window it was asked from.
+        """One try at putting a finished background draft into the window it was asked from.
 
-        The where-to-type check runs again on the screen as it is now (things may have moved);
-        nothing is opened or pressed here (no acting), text only, never Enter. Focus moves to
-        the remembered window and one box in it, and goes back to where the user was afterwards.
+        The where-to-type check runs again on the screen as it is now (things may have moved).
+        With the tray's acting switch on, a try may open a page, switch windows, press a button
+        (Compose, Reply) or click one seen only on the screenshot, exactly as in the foreground:
+        through the acting guard, within its step and time limits for this one try, never a
+        forbidden button, never Enter. The window is checked again on every try (same window, same
+        app). Focus goes back to the window the user was in after the try, however it ended.
         """
         target = refresh_target(task.target)
         now = windows.window_info(task.target.window_id) if target is not None else None
@@ -1329,56 +1332,16 @@ class CompanionStateMachine(QObject):
         self._set_state(CompanionState.RESPONDING)
         self._overlay.set_bubble_mode("writing")
         self._overlay.update_bubble_text(task.draft)
-        self._explain("typing your background draft…")
+        self._explain("putting your background draft in…")
+        self._ensure_clients()
+        act = self._begin_acting(target)  # a fresh guard for this try: its own step and time limits
         try:
-            name_known = my_name.pick_name(settings.my_name, None, self._persisted.my_name)[0] is not None
-            check = asyncio.ensure_future(
-                check_plan(
-                    task.draft, task.request, target, self._gemini, settings.gemini_fast_model, settings.gemini_model,
-                    self._usage, lambda: self._capture_target_window(target), earlier=task.earlier,
-                    max_output_tokens=settings.max_tokens, name_known=name_known, browser_check=self._browser_check,
-                )
-            )
-            self._check_task = check
-            try:
-                result: CheckResult = await check
-            except asyncio.CancelledError:
-                job = asyncio.current_task()
-                if job is not None and job.cancelling():
-                    raise  # the task itself was cancelled (the tray, quitting)
-                self._memory.add(task.request, task.draft)  # Esc ends the task: never tried again
-                await self._nothing_typed(task.draft, "Stopped before typing.", task.draft, needs_user=False)
-                return Delivery(FINAL, "stopped with Esc", "esc")
-            finally:
-                self._check_task = None
-            if result.no_plan:
-                # Gemini was too slow or busy to give a plan: not a try, it is looked at again soon.
-                return Delivery(NO_ANSWER, "Gemini didn't answer in time", "no_plan")
-            if result.status in (FAILED, UNSURE, OPEN, FOCUS, BLOCKED, NEED_BUTTONS):
-                # No box for it right now: nothing was typed, so it can be tried again later.
-                return Delivery(RETRY, result.why or "the box for it couldn't be found", f"check_{result.status}")
-            _steps, rule, why = self._vetted(result, task.request, task.draft, task.earlier)
-            if rule == "model_said_stop":
-                # The model's own "stop" is a failed try: the screen may be different next time.
-                logger.info("fill: nothing typed: the model said stop (its reason: %d characters)", len(result.why))
-                return Delivery(RETRY, why, "model_stop")
-            if why is not None:
-                # A safety rule refused the plan: the task ends here and is never retried.
-                logger.info("fill: nothing typed: plan of %d step(s) refused by rule %s", len(_steps), rule)
-                return Delivery(GIVE_UP, why, f"refused_{rule}")
-
-            def typing_starts() -> None:
-                task.typing_started = True  # right before the first character: never delivered a second time
-
-            status = await self._type_checked(
-                task.draft, task.request, target, result, earlier=task.earlier, on_typing=typing_starts
-            )
-            typed = status == TYPED_STATUS
-            return Delivery(TYPED if typed else FINAL, "" if typed else "it wasn't typed in full", "typed" if typed else "not_typed")
+            return await self._place_and_type_in(task.draft, task.request, target, act, bg=task)
         finally:
+            self._end_acting(act)
             self._delivering = None
             # Back to where the user was (never one of Clicky's own windows).
-            if was_in is not None and was_in.window_id != target.window_id:
+            if was_in is not None and (was_in.window_id != target.window_id or (act is not None and act.steps_used > 0)):
                 try:
                     await self._typer.activate(was_in)
                 except Exception:  # noqa: BLE001 - the draft is typed; focus stays where it is
@@ -1578,16 +1541,35 @@ class CompanionStateMachine(QObject):
             self._end_acting(act)
 
     async def _place_and_type_in(
-        self, draft: str, request: str, target: WritingTarget | None, act: ActTask | None
-    ) -> str | None:
+        self, draft: str, request: str, target: WritingTarget | None, act: ActTask | None, bg: BgTask | None = None
+    ) -> str | Delivery | None:
+        """The check, acting and typing loop. In the foreground it returns the spoken status line.
+
+        `bg`: one try of a background task. The same loop, but an ending that typed nothing is
+        handed back as a `Delivery` (tasks.py decides whether it is tried again) instead of being
+        shown in the bubble, and nothing waits for the user (a page only they can deal with is a
+        failed try).
+        """
         actor = (
             Actor(act, lambda: self.act_on, settings.link_browser_command, self._explain, self._browser_check,
                   self._closeup_look_at_button)
             if act else None
         )
+
+        async def ended(why: str, line: str, bubble: str, outcome: str = RETRY, code: str = "", needs_user: bool = True):
+            """Nothing was typed. Foreground: the bubble says why. Background: how the try ended."""
+            if bg is not None and outcome != FINAL:
+                return Delivery(outcome, why, code)
+            self._memory.add(request, draft)
+            status = await self._nothing_typed(draft, line, bubble, needs_user=needs_user)
+            return Delivery(FINAL, why, code) if bg is not None else status
+
         with_buttons = False  # the one re-ask of a check, with the window's buttons listed
         while True:
-            earlier = self._earlier_in(target)
+            if bg is None:
+                earlier = self._earlier_in(target)
+            else:  # what the task noted when the user asked, and only in the window it was asked from
+                earlier = bg.earlier if target is not None and target.window_id == bg.target.window_id else []
             name_known = my_name.pick_name(settings.my_name, None, self._persisted.my_name)[0] is not None
             acting = self._acting_context(target) if act is not None and target is not None else None
             asked = act.tag() if act is not None else None
@@ -1605,9 +1587,8 @@ class CompanionStateMachine(QObject):
             except asyncio.CancelledError:
                 task = asyncio.current_task()
                 if task is not None and task.cancelling():
-                    raise  # the whole run was cancelled (bubble closed, a new question)
-                self._memory.add(request, draft)
-                return await self._nothing_typed(draft, "Stopped before typing.", draft, needs_user=False)
+                    raise  # the whole run was cancelled (bubble closed, a new question, the tray)
+                return await ended("stopped with Esc", "Stopped before typing.", draft, FINAL, "esc", needs_user=False)
             finally:
                 self._check_task = None
 
@@ -1621,8 +1602,7 @@ class CompanionStateMachine(QObject):
                 # Esc (or another stop) came first: a late or second answer never acts or types.
                 logger.info("acting: task %s: answer for step %s dropped (%s)", act.id,
                             result.tag[1] if isinstance(result.tag, tuple) else "?", act.stop_reason or "not current")
-                self._memory.add(request, draft)
-                return await self._nothing_typed(draft, "Stopped before typing.", draft, needs_user=False)
+                return await ended("stopped with Esc", "Stopped before typing.", draft, FINAL, "esc", needs_user=False)
             # A sign-in (or other) page only the user can deal with comes first: the page Clicky
             # opened may have turned into one (its title then lacks the expected words).
             blocked = ""
@@ -1636,9 +1616,12 @@ class CompanionStateMachine(QObject):
                 problem = window_problem(act.expected, windows.window_info(act.expected.window_id))
                 if problem is not None:
                     act.stop(problem)
-                    self._memory.add(request, draft)
-                    return await self._nothing_typed(draft, f"Not typed: {problem}.", f"Didn't type anything: {problem}.\n\n{draft}")
+                    return await ended(problem, f"Not typed: {problem}.", f"Didn't type anything: {problem}.\n\n{draft}",
+                                       code="window_problem")
             if blocked:
+                if bg is not None:  # nobody is asked in the background: a failed try
+                    act.stop(blocked)
+                    return Delivery(RETRY, blocked, "page_needs_you")
                 stopped = await self._page_needs_you(act, blocked, draft, request)
                 if stopped is not None:
                     return stopped
@@ -1648,14 +1631,16 @@ class CompanionStateMachine(QObject):
                 # A button that wasn't in the list: ask once more with the buttons listed. The re-ask
                 # counts as a step; a second such answer goes to the click wait.
                 if asked_with_buttons:
+                    if bg is not None:
+                        return Delivery(RETRY, "the box for it couldn't be found", "no_usable_button")
                     logger.info("acting: task %s: still no usable button after asking again, so the user clicks", act.id)
                     result = click_wait_result(result, draft)
                     break
                 why = act.authorize(ASK_WITH_BUTTONS, self.act_on, windows.window_info(act.expected.window_id))
                 if why is not None:
                     act.stop(why)
-                    self._memory.add(request, draft)
-                    return await self._nothing_typed(draft, f"Not typed: {why}.", f"Didn't type anything: {why}.\n\n{draft}")
+                    return await ended(why, f"Not typed: {why}.", f"Didn't type anything: {why}.\n\n{draft}",
+                                       code="guard_refused")
                 logger.info("acting: task %s: step %d: asking again with the buttons listed", act.id, act.step + 1)
                 act.next_step()
                 with_buttons = True
@@ -1665,17 +1650,49 @@ class CompanionStateMachine(QObject):
                 break
             target, why = await self._act_step(act, actor, result, target, acting)
             if target is None:
-                self._memory.add(request, draft)
                 if act.stopped and act.stop_reason == "Esc":
-                    return await self._nothing_typed(draft, "Stopped.", draft, needs_user=False)
+                    return await ended("stopped with Esc", "Stopped.", draft, FINAL, "esc", needs_user=False)
                 act.stop(why)
-                return await self._nothing_typed(draft, f"Not typed: {why}.", f"Didn't type anything: {why}.\n\n{draft}")
+                # A button the forbidden words or Gemini's verdict refused is a safety refusal: in
+                # the background that ends the task. Anything else (too slow, not there) is a failed try.
+                refused = actor.last_code in ("button_refused", "click_refused")
+                return await ended(why, f"Not typed: {why}.", f"Didn't type anything: {why}.\n\n{draft}",
+                                   GIVE_UP if refused else RETRY, f"refused_{actor.last_code}" if refused else actor.last_code or "act_failed")
             self._explain("checking where to type…")
 
         if act is not None and result.status != GO:
             # Unsure, stop, failed: the acting task ends here (the click wait works as always).
             self._end_acting(act)
-        return await self._type_checked(draft, request, target, result)
+        if bg is None:
+            return await self._type_checked(draft, request, target, result)
+        return await self._type_background(bg, target, result, earlier)
+
+    async def _type_background(
+        self, task: BgTask, target: WritingTarget, result: CheckResult, earlier: list[Earlier]
+    ) -> Delivery:
+        """The end of a background try: the check's answer, the safety rules, then typing."""
+        if result.no_plan:
+            # Gemini was too slow or busy to give a plan: not a try, it is looked at again soon.
+            return Delivery(NO_ANSWER, "Gemini didn't answer in time", "no_plan")
+        if result.status in (FAILED, UNSURE):
+            # No box for it right now: nothing was typed, so it can be tried again later.
+            return Delivery(RETRY, result.why or "the box for it couldn't be found", f"check_{result.status}")
+        steps, rule, why = self._vetted(result, task.request, task.draft, earlier)
+        if rule == "model_said_stop":
+            # The model's own "stop" is a failed try: the screen may be different next time.
+            logger.info("fill: nothing typed: the model said stop (its reason: %d characters)", len(result.why))
+            return Delivery(RETRY, why, "model_stop")
+        if why is not None:
+            # A safety rule refused the plan: the task ends here and is never retried.
+            logger.info("fill: nothing typed: plan of %d step(s) refused by rule %s", len(steps), rule)
+            return Delivery(GIVE_UP, why, f"refused_{rule}")
+
+        def typing_starts() -> None:
+            task.typing_started = True  # right before the first character: never delivered a second time
+
+        status = await self._type_checked(task.draft, task.request, target, result, earlier=earlier, on_typing=typing_starts)
+        typed = status == TYPED_STATUS
+        return Delivery(TYPED if typed else FINAL, "" if typed else "it wasn't typed in full", "typed" if typed else "not_typed")
 
     async def _act_step(
         self, act: ActTask, actor: Actor, result: CheckResult, target: WritingTarget, acting: ActingContext
