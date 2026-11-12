@@ -111,6 +111,7 @@ def main() -> int:
 
     talk_hint = " Or hold <b>Fn+F5</b> to ask by voice." if settings.voice_enabled and settings.talk_key_code == 63 else ""
     panel = ControlPanel(hotkey_label=_friendly_hotkey_label(settings.hotkey), talk_hint=talk_hint)
+    panel.quit_requested.connect(state_machine.user_quit)  # Quit drops pending background tasks
     panel.quit_requested.connect(app.quit)
 
     restart = RestartRequest(app.quit)
@@ -118,6 +119,7 @@ def main() -> int:
     tray = TrayController()
     tray.open_panel_requested.connect(panel.show_near_cursor)
     tray.restart_requested.connect(restart.request)
+    tray.quit_requested.connect(state_machine.user_quit)
     tray.quit_requested.connect(app.quit)
     tray.set_acting_state(state_machine.act_on)
     tray.acting_toggled.connect(state_machine.set_act_on)
@@ -126,6 +128,8 @@ def main() -> int:
     state_machine.background_changed.connect(lambda _count: tray.set_background_tasks(state_machine.background_lines()))
     tray.cancel_task_requested.connect(state_machine.cancel_background_task)
     tray.show()
+    # Background tasks saved before a crash or a tray Restart carry on (once the event loop runs).
+    loop.call_soon(state_machine.resume_background)
 
     _show_missing_key_notice(tray)
 

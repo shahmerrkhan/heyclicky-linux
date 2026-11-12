@@ -27,6 +27,8 @@ Rules, all in this file so they can be tested with fakes:
     pauses. These are not delivery tries. If every one fails, the bubble says so.
   - Two tasks never type into the same box: the second one's draft goes to the bubble instead.
   - Cancelled or quit: nothing more is typed.
+  - Pending tasks are saved (taskstore.py, by state.py) and carry on after a crash or a tray
+    Restart: `resume`. The cap keeps counting real time while Clicky is not running.
 The pieces that touch Gemini, the screen and the keyboard are handed in by state.py.
 """
 
@@ -58,6 +60,7 @@ ACTIVE_STATES = (WRITING, WAITING, DELIVERING)
 TYPED, RETRY, FINAL, GIVE_UP, NO_ANSWER = "typed", "retry", "final", "give up", "no answer"
 # How a task that typed nothing ended (`BgTask.end_code`): the tries ran out, the time ran out.
 TRIES_USED, CAP_REACHED = "tries_used", "cap_reached"
+RESTARTED_TYPING = "restarted_mid_typing"  # saved with typing started, then Clicky restarted
 
 
 @dataclass
@@ -183,6 +186,20 @@ class BackgroundTasks:
         self._on_change()
         return task
 
+    def resume(self, task: BgTask) -> BgTask | None:
+        """Carry on with a task saved before a restart (taskstore.py). Its draft, if it has one, is
+        not written again; one that had started typing is never typed again (`_run`)."""
+        if self._closed:
+            return None
+        task.state = WAITING if task.draft else WRITING
+        self._tasks.append(task)
+        task.job = asyncio.ensure_future(self._run(task))
+        logger.info("background: task %s resumed after a restart (%s, %d failed tries so far)", task.id,
+                    "typing had started" if task.typing_started else "draft ready" if task.draft else "no draft yet",
+                    task.tries)
+        self._on_change()
+        return task
+
     def cancel(self, task_id: str) -> bool:
         task = next((t for t in self._tasks if t.id == task_id and t.state in ACTIVE_STATES), None)
         if task is None:
@@ -208,6 +225,11 @@ class BackgroundTasks:
             task.adopted.cancel()  # the Gemini request it took over stops too
         logger.info("background: task %s %s", task.id, why)
 
+    def newest_ready(self) -> BgTask | None:
+        """The running task whose draft was finished last (None when no draft is ready)."""
+        ready = [t for t in self.running() if t.draft and t.ready_at is not None]
+        return max(ready, key=lambda t: t.ready_at) if ready else None
+
     async def aclose(self) -> None:
         """Quitting: stop every task and wait for them to unwind. Nothing is typed."""
         self._closed = True
@@ -228,6 +250,12 @@ class BackgroundTasks:
     async def _run(self, task: BgTask) -> None:
         started = self._clock()
         try:
+            if task.typing_started:
+                # Saved while it was being typed, then Clicky restarted: how much landed is unknown,
+                # so it is never typed again. The draft goes to the bubble and the clipboard.
+                await self._end_untyped(task, "Clicky restarted while it was being typed, so it may have been "
+                                        "partly typed", RESTARTED_TYPING)
+                return
             if task.setup is not None:
                 await task.setup  # what the window held when the user asked (never raises)
             why = "the draft came back empty"
@@ -252,6 +280,8 @@ class BackgroundTasks:
             logger.info("background: task %s: draft ready after %.1f s (%d characters)", task.id,
                         self._clock() - started, len(task.draft))
             task.state = WAITING
+            if task.ready_at is None:
+                task.ready_at = self._wall()  # the cap counts from here, in real time (saved with the task)
             self._on_change()
             await self._land(task)
         except asyncio.CancelledError:

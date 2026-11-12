@@ -23,15 +23,18 @@ from .audio.voice_files import VoiceFiles
 from .browser import open_with_command
 from .input.idle import idle_seconds
 from . import progress as stages
+from . import taskstore
 from .tasks import (
     CAP_REACHED,
     FINAL,
     GIVE_UP,
     IDLE_BEFORE_FOCUS_S,
     NO_ANSWER,
+    RESTARTED_TYPING,
     RETRY,
     TRIES_USED,
     TYPED,
+    MAX_TASKS,
     BackgroundTasks,
     BgTask,
     Delivery,
@@ -317,6 +320,8 @@ class CompanionStateMachine(QObject):
         )
         self._delivering: BgTask | None = None  # the background draft being typed right now
         self._job: _WriteJob | None = None  # the Write request running in the foreground (for the handoff)
+        self._store_frozen = False  # shutting down: the saved task list is left exactly as it is
+        self._drop_tasks = False  # the user chose Quit: pending tasks are dropped, not resumed
         self._asked: stages.PausableClock | None = None  # started when the user sent the request
         self._queued_prompt: tuple | None = None  # a question sent during those few seconds: runs right after
         self._listen_timer = QTimer(self)
@@ -522,8 +527,13 @@ class CompanionStateMachine(QObject):
         self._warmed_at = now
         self._warm_task = asyncio.ensure_future(self._gemini.warm_up(settings.gemini_fast_model))
 
+    def user_quit(self) -> None:
+        """The user chose Quit (tray or panel): pending background tasks are dropped at shutdown.
+        Without this (a tray Restart, a crash, logging out) they stay saved and carry on next time."""
+        self._drop_tasks = True
+
     async def aclose(self) -> None:
-        await self._tasks.aclose()  # quitting: background tasks stop and type nothing
+        await self._close_tasks()
         task = self._current_task
         if self._warm_task is not None and not self._warm_task.done():
             self._warm_task.cancel()
@@ -1369,6 +1379,110 @@ class CompanionStateMachine(QObject):
 
     def _background_changed(self) -> None:
         self.background_changed.emit(self._tasks.count())
+        self._save_tasks()
+
+    # --- pending tasks on disk (taskstore.py) -------------------------------------------
+
+    async def _close_tasks(self) -> None:
+        """Shutting down: background tasks stop and type nothing.
+
+        The saved list is frozen first, so stopping the tasks doesn't empty it: after a tray
+        Restart (or a crash, where this never runs) they carry on from the file. When the user
+        chose Quit they are dropped instead: the newest finished draft is left on the clipboard
+        and the file is deleted.
+        """
+        self._store_frozen = True
+        newest = self._tasks.newest_ready() if self._drop_tasks else None
+        await self._tasks.aclose()
+        if not self._drop_tasks:
+            return
+        if newest is not None:
+            try:
+                await set_clipboard_text(newest.draft)
+            except Exception:  # noqa: BLE001 - quitting anyway
+                logger.info("background: the newest draft couldn't be copied at quit")
+        taskstore.delete()
+        logger.info("background: quit dropped the pending tasks (newest draft %s)",
+                    "copied" if newest is not None else "none")
+
+    def _save_tasks(self) -> None:
+        """The running tasks, written to the private state file (every change of a task's state)."""
+        if self._store_frozen:
+            return
+        taskstore.save([self._task_record(t) for t in self._tasks.running()])
+
+    @staticmethod
+    def _task_record(task: BgTask) -> dict:
+        target, parsed = task.target, task.payload
+        return {
+            "id": task.id,
+            "request": task.request,
+            "draft": task.draft,
+            # The window: ids, the app's class and name. Never its title.
+            "target": {"window_id": target.window_id, "pid": target.pid, "app_class": target.app_class,
+                       "app_name": target.app_name},
+            "follow_up": task.follow_up,
+            "earlier": [
+                {"text": e.text, "what": e.what, "label": e.label,
+                 "box": None if e.box is None else {
+                     "name": e.box.name, "role": e.box.role, "multi_line": e.box.multi_line,
+                     "x": e.box.x, "y": e.box.y, "w": e.box.w, "h": e.box.h}}
+                for e in task.earlier
+            ],
+            "tries": task.tries,
+            "attempts": task.attempts,
+            "typing_started": task.typing_started,
+            "ready_at": task.ready_at,
+            "length": getattr(parsed, "length", None),
+            "strong": bool(getattr(parsed, "strong", False)),
+        }
+
+    @staticmethod
+    def _task_from(record: dict) -> BgTask:
+        t = record["target"]
+        target = WritingTarget(int(t["window_id"]), t.get("pid") if isinstance(t.get("pid"), int) else None,
+                               str(t["app_class"]), "", 0, 0, 0, 0)
+        earlier = []
+        for e in record.get("earlier") or []:
+            if not isinstance(e, dict) or not isinstance(e.get("text"), str):
+                continue
+            b = e.get("box")
+            box = None
+            if isinstance(b, dict):
+                box = Field(id="", role=str(b.get("role", "")), name=str(b.get("name", "")), description="",
+                            multi_line=bool(b.get("multi_line")), focused=False, x=int(b.get("x", -1)),
+                            y=int(b.get("y", -1)), w=int(b.get("w", -1)), h=int(b.get("h", -1)), readable=False,
+                            text=None, length=0)
+            earlier.append(Earlier(e["text"], str(e.get("what", "")), str(e.get("label", "")), box))
+        length = record.get("length") if isinstance(record.get("length"), str) else None
+        ready_at = record.get("ready_at")
+        task = BgTask(
+            request=record["request"], target=target,
+            payload=ParsedPrompt(question=record["request"], strong=bool(record.get("strong")), length=length),
+            id=record["id"], draft=record.get("draft") or "",
+            follow_up=bool(record.get("follow_up")) and bool(earlier), earlier=earlier,
+            tries=int(record.get("tries") or 0), attempts=int(record.get("attempts") or 0),
+            typing_started=bool(record.get("typing_started")),
+            ready_at=float(ready_at) if isinstance(ready_at, (int, float)) and not isinstance(ready_at, bool) else None,
+        )
+        return task
+
+    def resume_background(self) -> int:
+        """At start: carry on with the tasks saved before a crash or a tray Restart. Returns how many."""
+        records = taskstore.load()
+        resumed = 0
+        for record in records[: MAX_TASKS]:
+            try:
+                task = self._task_from(record)
+            except (KeyError, TypeError, ValueError):
+                logger.warning("background tasks: one saved task couldn't be read and was dropped")
+                continue
+            if self._tasks.resume(task) is not None:
+                resumed += 1
+        if records:
+            logger.info("background: %d saved task(s) found, %d resumed", len(records), resumed)
+        self._save_tasks()
+        return resumed
 
     def _foreground_free(self) -> bool:
         """No question is being asked, answered, waited on or typed, and the input bar is closed."""
@@ -1476,6 +1590,9 @@ class CompanionStateMachine(QObject):
             self._bubble_code("background_no_draft")
             return
         self._memory.add(task.request, task.draft)
+        if task.end_code == RESTARTED_TYPING:
+            await self._nothing_typed(task.draft, f"Not typed again: {why}.", task.draft, code="background_restarted_mid_typing")
+            return
         if task.end_code in (TRIES_USED, CAP_REACHED):
             # Every try failed, or the time ran out: said plainly, with the last reason. Never spoken.
             line = f"Clicky tried but couldn't get your draft into {task.target.app_name}. Last reason: {why}."
@@ -1499,6 +1616,10 @@ class CompanionStateMachine(QObject):
             return Delivery(RETRY, f"the {task.target.app_name} window it was for is closed or hidden", "window_gone")
         if (now.app_class or "").lower() != (task.target.app_class or "").lower():
             return Delivery(GIVE_UP, "the window it was for shows a different app now", "window_changed")
+        if task.target.pid is not None and now.pid is not None and now.pid != task.target.pid:
+            # The same window number, another process (the app was restarted): not the window it was
+            # asked from, so nothing is typed there. Counts as "closed".
+            return Delivery(RETRY, f"the {task.target.app_name} window it was for is closed or hidden", "window_gone")
         target = replace(target, title=now.title or target.title)
         was_in = active_window_target()
         self._delivering = task
@@ -1893,6 +2014,7 @@ class CompanionStateMachine(QObject):
 
         def typing_starts() -> None:
             task.typing_started = True  # right before the first character: never delivered a second time
+            self._save_tasks()  # on disk before anything is typed: a crash now never leads to a second typing
 
         status = await self._type_checked(task.draft, task.request, target, result, earlier=earlier, on_typing=typing_starts)
         typed = status == TYPED_STATUS
