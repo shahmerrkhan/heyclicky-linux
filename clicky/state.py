@@ -747,6 +747,11 @@ class CompanionStateMachine(QObject):
         self._explanation = text
         self._overlay.set_bubble_explanation(text)
 
+    @staticmethod
+    def _bubble_code(code: str) -> None:
+        """For the log: which message the bubble showed, as a code (never its text)."""
+        logger.info("bubble: showed %s", code)
+
     def _add_note(self, note: str) -> None:
         self._explain(f"{self._explanation} {note}".strip())
 
@@ -1036,6 +1041,7 @@ class CompanionStateMachine(QObject):
             router = self._ensure_clients()
             if self._start_background(parsed, target):
                 show(BACKGROUND_STARTED_TEXT)
+                self._bubble_code("background_started")
                 self._end_speech(None, None, error=False)
                 self._finish_question()  # the input bar is free again; the task carries on by itself
                 return
@@ -1237,6 +1243,7 @@ class CompanionStateMachine(QObject):
         )
         self._overlay.show_bubble()
         self._overlay.bring_back()
+        self._bubble_code("background_ready")
         if self._persisted.speak_on:
             self._say(BACKGROUND_READY_LINE)
 
@@ -1248,9 +1255,10 @@ class CompanionStateMachine(QObject):
         if not task.draft:
             self._overlay.update_bubble_text(f"The background draft couldn't be written: {why}.")
             self._overlay.bring_back()
+            self._bubble_code("background_no_draft")
             return
         self._memory.add(task.request, task.draft)
-        await self._nothing_typed(task.draft, f"Not typed: {why}.", task.draft)
+        await self._nothing_typed(task.draft, f"Not typed: {why}.", task.draft, code="background_not_typed")
 
     async def _deliver_background(self, task: BgTask) -> Delivery:
         """One try at typing a finished background draft into the window it was asked from.
@@ -1735,11 +1743,14 @@ class CompanionStateMachine(QObject):
             if refused is not None:
                 rule, why = refused
         if why is not None:
-            logger.info("fill: nothing typed: plan of %d step(s) refused by rule %s", len(steps), rule)
+            logger.info("fill: nothing typed: plan of %d step(s) refused by rule %s%s", len(steps), rule,
+                        f" (the model's reason: {len(result.why)} characters)" if rule == "model_said_stop" else "")
             known, _ = my_name.pick_name(settings.my_name, result.name_on_screen, self._persisted.my_name)
             shown = shown_text([replace(s, text=my_name.fill_name(s.text, known)) for s in steps]) if steps else draft
             self._memory.add(request, draft)
-            return await self._nothing_typed(shown, f"Not typed: {why}.", f"Didn't type anything: {why}.\n\n{shown}")
+            return await self._nothing_typed(
+                shown, f"Not typed: {why}.", f"Didn't type anything: {why}.\n\n{shown}", code=f"not_typed_{rule}"
+            )
 
         name_note = ""
         if my_name.needs_name([s.text for s in steps]):
@@ -1801,7 +1812,9 @@ class CompanionStateMachine(QObject):
         pieces = remember_typed(earlier, typed)
         self._last_fill = (window_id, pieces) if pieces else None
 
-    async def _nothing_typed(self, copy_text: str, line: str, bubble: str, needs_user: bool = True) -> str:
+    async def _nothing_typed(
+        self, copy_text: str, line: str, bubble: str, needs_user: bool = True, code: str = "not_typed"
+    ) -> str:
         """Nothing was typed: the bubble shows why and the text, which is copied to the clipboard.
 
         What Clicky typed before (in `_last_fill`) is still there, so it stays remembered.
@@ -1810,6 +1823,7 @@ class CompanionStateMachine(QObject):
         self._draft_copied, self._last_draft = copied, None
         self._overlay.update_bubble_text(bubble)
         self._explain(line + (" It's copied to your clipboard." if copied else ""))
+        self._bubble_code(f"{code} ({'copied' if copied else 'not copied'})")
         if needs_user:
             self._overlay.bring_back()
         return f"Couldn't type the draft, so it's {'on your clipboard' if copied else 'in the bubble'}."
@@ -1825,6 +1839,7 @@ class CompanionStateMachine(QObject):
             self._overlay.update_bubble_text(rest)
         self._draft_copied = copied
         self._explain(outcome_line(outcome, result.focused, copied))
+        self._bubble_code("typed" if outcome.complete else f"typed_partly_{outcome.code or 'stopped'}")
         if not outcome.complete and not outcome.stopped:
             self._overlay.bring_back()  # something wasn't typed: a hidden bubble comes back to say so
         self._last_draft = None
@@ -1880,6 +1895,8 @@ class CompanionStateMachine(QObject):
                 "Not sure which boxes these go in. Click each box and Clicky types the piece that fits it "
                 '(reply "done" to stop early).'
             )
+
+        self._bubble_code("click_the_box_no_plan" if result.no_plan else "click_the_box")
 
         async def match(pieces: list[Step], box, window: WritingTarget):
             return await match_piece(

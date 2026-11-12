@@ -204,14 +204,29 @@ class BackgroundTasks:
         why, code = "you were busy the whole time, so Clicky didn't take over your keyboard", "user_busy"
         while True:
             # Never while a question is running or the user is typing or clicking.
+            wait_from = last = self._clock()
+            busy_s = question_s = 0.0  # for the log: what the wait was spent on
             while not (self._ready() and self._user_idle() and not self._lock.locked()):
                 if not announced and self._ready():
                     self._announce(task)  # the bubble says it's ready even while the user keeps typing
                     announced = True
                 if self._clock() >= deadline:
+                    logger.info("background: task %s: waited %.1f s and gave up (you busy %.1f s, a question "
+                                "running %.1f s)", task.id, self._clock() - wait_from, busy_s, question_s)
                     await self._end_untyped(task, why, code)
                     return
+                question_running = not self._ready()
                 await self._sleep(BUSY_POLL_S)
+                now = self._clock()
+                if question_running:
+                    question_s += now - last
+                elif not self._lock.locked():
+                    busy_s += now - last
+                last = now
+            idle = self._idle_seconds()
+            logger.info("background: task %s: try %d starts after waiting %.1f s (you busy %.1f s, a question "
+                        "running %.1f s, idle reading %s s)", task.id, task.tries + 1, self._clock() - wait_from,
+                        busy_s, question_s, "?" if idle is None else f"{idle:.1f}")
             if not announced:
                 self._announce(task)
                 announced = True
