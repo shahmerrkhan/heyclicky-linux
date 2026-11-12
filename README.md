@@ -132,15 +132,42 @@ With the tray switch **Open apps and press buttons (Write)** on (the default), C
 - **No browser setup is needed**: no extension, no debugging port, no special launcher.
 - If anything fails or isn't certain, nothing is clicked: the bubble shows the draft, copies it and says what happened.
 
-### Long drafts in the background
+### Drafts in the background
 
-Ask for a long job in your own words ("write a **very long** email to Sam about…", "…**in the background**", "**take your time**") and Clicky says it will come back. The input bar is free at once, and other questions work as usual meanwhile.
+A Write request that takes long finishes in the background, so you get your hands back.
 
-- When the draft is ready, the bubble shows it (and says "Your draft is ready." with the speak switch on).
-- Then Clicky types it into the window you asked from, through the same where-to-type check, run on the screen as it is at that moment. It waits until you've left the keyboard and mouse alone for 3 seconds, switches to that window, types, and switches back to where you were. It only types: nothing is opened, pressed or sent.
-- If the window is closed or hidden or the box can't be found, it tries again with growing pauses for 5 minutes. After that the draft stays in the bubble, is copied to your clipboard, and the bubble says exactly why it wasn't typed. A finished draft is never dropped.
+**When a request goes to the background**
+
+- At once, when you ask for a long job in your own words ("write a **very long** email to Sam about…", "…**in the background**", "**take your time**").
+- By itself, when it is still running **30 seconds** after you sent it and is less than 60% done. A request that is 60% done or more stays in front; if it is still not typing at **90 seconds**, it goes to the background anyway. Typing that has started always finishes in front. Both clocks stand still while Clicky waits for you (to click a box, for your name, or for the reminder below).
+- How far a request is comes from a short list of steps (write the draft, check where it goes, open or press something, type), each weighted by how long it usually takes (`clicky/progress.py`). The where-to-type reply may add a hint about the steps still to come; that only changes the percent, never what Clicky does. The percent is not shown.
+- Nothing starts over at the handoff: a draft Gemini is still writing carries on as the same request, a where-to-type check in flight is cancelled and never used, and a step that is opening or pressing something finishes first.
+
+**How the draft is put in**
+
+- The bubble says "This is taking a while, so I'll finish it in the background. Keep working; I'll put it in once you pause." When the draft is ready it is shown in the bubble.
+- A try only starts once you have left the keyboard and mouse alone for 3 seconds and no question is running. Each try looks at the screen again: the window (same window, same app), its boxes, a fresh screenshot, the where-to-type check and the safety rules. With the tray's acting switch on, a try may also open a page, switch windows, press Compose or Reply, or click a button it sees on the screenshot, through the same guard and limits as in front (8 steps and 60 seconds per try). Focus goes back to the window you were in after every try. **It never presses Send or Enter.**
+- **10 tries** over about 5 minutes (5, 10, 15, 20, 30, 40, 50, 60 and 70 seconds apart). A failed try is one where no box was found, the model said "stop", or the window was closed or hidden. Waiting for your pause and Gemini giving no answer don't count as tries.
+- A safety rule that refuses (the box already has text, a button on the never-press list) ends the task at once and says why. It is not tried again.
+- After the 10th failed try, or 10 minutes after the draft was ready, the bubble comes back: "Clicky tried but couldn't get your draft into … Last reason: …". The draft stays in the bubble and is copied to your clipboard. Nothing is spoken for failed tries.
+- If Gemini can't write the draft, it is asked again up to 5 times (5, 10, 20, 30 and 60 seconds apart); if all fail the bubble says the draft couldn't be written.
 - Two background drafts never go into the same box, and a draft is never typed twice. Text already in the box is never overwritten.
-- The tray menu shows how many are running and cancels them. Quitting Clicky stops them; nothing is typed.
+- **Esc** stops a try for good. The tray menu has one line per task ("Draft for opera: try 3 of 10") with its own Cancel, and one entry that cancels them all. At most 3 tasks run at once.
+
+**Restart, crash and Quit**
+
+- Pending tasks are saved in a private file (`~/.local/state/clicky/background.json`, readable only by you, deleted when no task is left). It holds the request and the draft, so delete it if that matters to you. Nothing from it is ever written to the log.
+- After a crash or the tray's **Restart** the tasks carry on. A task that had started typing is never typed again: its draft goes to the bubble and the clipboard. If the window it was for is gone, nothing is typed anywhere else.
+- **Quit** drops them: the newest finished draft is copied to your clipboard and the file is deleted.
+
+**Reminder before something new**
+
+If a background task is still unfinished when you send a new request, Clicky says so first ("You still have an unfinished task: …"), once per task, with three buttons: **Finish it** (try it now, once you pause, then run the new request), **Wait** (run the new request now, leave the task pending) and **Drop it** (cancel the task, then run the new request). Your new request is never lost.
+
+### Quick-reply buttons and clearing the memory
+
+- When Clicky asks you something ("click the box you want", your name, a page only you can deal with), the bubble shows 2 to 4 short buttons. Gemini suggests them inside the reply Clicky already has (no extra request); without suggestions they are a plain **Done** and **Not now**. Pressing one only sends that text as your answer. It never presses anything on the page and never takes focus. In the click-the-box wait, **Not now** hands the draft to the background.
+- **clear memory** (in the input bar, and **Clear memory** in the tray) forgets the chat so far (the last 5 exchanges and the summary) and what Clicky remembers typing, at once, with no confirm step. Saved settings, your sign-off name and pending background tasks stay.
 
 Clicky always starts in **Vision** mode; the mode you pick isn't saved.
 
