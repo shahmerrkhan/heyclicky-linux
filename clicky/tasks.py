@@ -8,18 +8,21 @@ other draft, run against the screen as it is at that moment.
 
 Rules, all in this file so they can be tested with fakes:
   - Nothing is delivered while a question is running in the foreground or while the user is
-    using the keyboard or mouse: delivery waits until they have been idle IDLE_BEFORE_FOCUS_S.
-    An idle time that can't be read counts as "busy".
+    using the keyboard or mouse: a try only starts once they have been idle IDLE_BEFORE_FOCUS_S.
+    An idle time that can't be read counts as "busy". Once a try has started it carries on.
   - One delivery at a time, and a task's delivery reaches the typing stage at most once
     (`BgTask.typing_started`, set right before the first character is typed): after that it
     is never retried, whatever happened.
+  - Up to MAX_TRIES tries, with growing pauses in between (TRY_GAPS_S). A failed try is one
+    where nothing was typed because the place wasn't there: no box found, the model said "stop",
+    the window closed or hidden. Every try looks at the screen again.
+  - Not counted as tries: Gemini giving no plan in time (asked again after NO_ANSWER_GAP_S), and
+    waiting for the user to pause.
   - A safety rule that refuses the plan (the box already has text, a made-up address) ends the
-    task at once: the user is told why, and it is never retried. The model's own "stop" is only
-    a failed try.
-  - A delivery that typed nothing because the place wasn't there (window closed or hidden,
-    box not found, no plan) is retried with growing pauses (BACKOFF_S) until DELIVERY_LIMIT_S
-    after the draft was ready. Then the draft goes to the bubble and the clipboard, with the
-    reason. A finished draft is never dropped.
+    task at once: the user is told why, and it is never retried.
+  - After the last failed try, or DELIVERY_CAP_S of real time after the draft was ready, the
+    draft goes to the bubble and the clipboard with the last reason. A finished draft is never
+    dropped, and nothing is spoken for failed tries.
   - Two tasks never type into the same box: the second one's draft goes to the bubble instead.
   - Cancelled or quit: nothing more is typed.
 The pieces that touch Gemini, the screen and the keyboard are handed in by state.py.
@@ -37,8 +40,10 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 IDLE_BEFORE_FOCUS_S = 3.0  # the user must have left keyboard and mouse alone this long
-DELIVERY_LIMIT_S = 300.0  # how long a ready draft keeps trying to land
-BACKOFF_S = (2.0, 4.0, 8.0, 15.0, 30.0)  # pauses between tries (the last one repeats)
+MAX_TRIES = 10  # failed tries before the draft goes to the bubble and the clipboard
+TRY_GAPS_S = (5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0)  # the pauses between the tries (5 min)
+DELIVERY_CAP_S = 600.0  # real time after the draft is ready: then the failure bubble, whatever happened
+NO_ANSWER_GAP_S = 5.0  # Gemini gave no plan: looked at again after this long (not a try)
 BUSY_POLL_S = 0.5  # how often "is the user idle, is Clicky free?" is looked at
 SHOW_WAIT_S = 600.0  # a draft that couldn't be typed waits this long at most for the bubble to be free
 MAX_TASKS = 3  # running at once
@@ -47,7 +52,9 @@ WRITING, WAITING, DELIVERING = "writing", "waiting", "delivering"
 DONE, FAILED, CANCELLED = "done", "failed", "cancelled"
 ACTIVE_STATES = (WRITING, WAITING, DELIVERING)
 
-TYPED, RETRY, FINAL, GIVE_UP = "typed", "retry", "final", "give up"
+TYPED, RETRY, FINAL, GIVE_UP, NO_ANSWER = "typed", "retry", "final", "give up", "no answer"
+# How a task that typed nothing ended (`BgTask.end_code`): the tries ran out, the time ran out.
+TRIES_USED, CAP_REACHED = "tries_used", "cap_reached"
 
 
 @dataclass
@@ -55,9 +62,10 @@ class Delivery:
     """How one delivery try ended.
 
     TYPED: the draft is in the box. FINAL: it ended some other way the user was already told
-    about (a rule refused it, Esc, typed partly); never tried again. RETRY: nothing was typed
-    and the place may come back. GIVE_UP: nothing was typed and trying again can't help or
-    isn't allowed (a safety rule refused the plan, the window shows another app now).
+    about (Esc, typed partly); never tried again. RETRY: a failed try, nothing was typed and
+    the place may come back. NO_ANSWER: Gemini gave no plan in time; nothing was typed and it
+    doesn't count as a try. GIVE_UP: nothing was typed and trying again can't help or isn't
+    allowed (a safety rule refused the plan, the window shows another app now).
     """
 
     outcome: str
@@ -80,8 +88,11 @@ class BgTask:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     state: str = WRITING
     draft: str = ""
-    why: str = ""  # why it failed or wasn't typed
-    tries: int = 0
+    why: str = ""  # why it failed or wasn't typed (the last reason)
+    end_code: str = ""  # how a task that typed nothing ended (TRIES_USED, CAP_REACHED, or the try's code)
+    tries: int = 0  # failed tries so far (the ones that count)
+    attempts: int = 0  # every try that ran, counted or not (for the log)
+    ready_at: float | None = None  # real clock time when the draft was ready
     typing_started: bool = False  # set once, right before the first character could be typed
     job: asyncio.Task | None = None
 
@@ -109,15 +120,19 @@ class BackgroundTasks:
         idle_seconds: Callable[[], float | None] = lambda: None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        delivery_limit_s: float = DELIVERY_LIMIT_S,
-        backoff_s: tuple[float, ...] = BACKOFF_S,
+        try_gaps_s: tuple[float, ...] = TRY_GAPS_S,
+        cap_s: float = DELIVERY_CAP_S,
+        no_answer_gap_s: float = NO_ANSWER_GAP_S,
+        max_tries: int = MAX_TRIES,
         idle_before_focus_s: float = IDLE_BEFORE_FOCUS_S,
         show_wait_s: float = SHOW_WAIT_S,
+        wall: Callable[[], float] = time.time,  # real clock time, for the cap
     ) -> None:
         self._write, self._deliver, self._ready = write, deliver, ready
         self._announce, self._show_untyped, self._on_change = announce, show_untyped, on_change
-        self._idle_seconds, self._clock, self._sleep = idle_seconds, clock, sleep
-        self._limit_s, self._backoff_s = delivery_limit_s, backoff_s
+        self._idle_seconds, self._clock, self._sleep, self._wall = idle_seconds, clock, sleep, wall
+        self._gaps_s, self._cap_s, self._no_answer_gap_s = try_gaps_s, cap_s, no_answer_gap_s
+        self._max_tries = max_tries
         self._idle_needed_s, self._show_wait_s = idle_before_focus_s, show_wait_s
         self._tasks: list[BgTask] = []
         self._typed_boxes: set[tuple] = set()  # boxes a background draft went into
@@ -130,6 +145,12 @@ class BackgroundTasks:
 
     def count(self) -> int:
         return len(self.running())
+
+    def progress(self, task: BgTask) -> str:
+        """Where a running task is, for the tray: "writing the draft" or "try 3 of 10"."""
+        if task.state == WRITING:
+            return "writing the draft"
+        return f"try {min(task.tries + 1, self._max_tries)} of {self._max_tries}"
 
     def start(self, request: str, target: object, box: object = None, payload: object = None) -> BgTask | None:
         """Start a task (None: too many are running already, or Clicky is quitting)."""
@@ -210,23 +231,33 @@ class BackgroundTasks:
         finally:
             self._on_change()
 
+    def _cap_left(self, task: BgTask) -> float:
+        """Seconds left before DELIVERY_CAP_S after the draft was ready (real clock time)."""
+        return (task.ready_at or self._wall()) + self._cap_s - self._wall()
+
+    async def _pause(self, task: BgTask, seconds: float) -> bool:
+        """Wait between tries. False when the cap came first."""
+        left = self._cap_left(task)
+        await self._sleep(max(0.0, min(seconds, left)))
+        return self._cap_left(task) > 0
+
     async def _land(self, task: BgTask) -> None:
-        ready_at = self._clock()
-        deadline = ready_at + self._limit_s
+        if task.ready_at is None:
+            task.ready_at = self._wall()
         announced = False
         why, code = "you were busy the whole time, so Clicky didn't take over your keyboard", "user_busy"
         while True:
-            # Never while a question is running or the user is typing or clicking.
+            # A try never starts while a question is running or the user is typing or clicking.
             wait_from = last = self._clock()
             busy_s = question_s = 0.0  # for the log: what the wait was spent on
             while not (self._ready() and self._user_idle() and not self._lock.locked()):
                 if not announced and self._ready():
                     self._announce(task)  # the bubble says it's ready even while the user keeps typing
                     announced = True
-                if self._clock() >= deadline:
+                if self._cap_left(task) <= 0:
                     logger.info("background: task %s: waited %.1f s and gave up (you busy %.1f s, a question "
                                 "running %.1f s)", task.id, self._clock() - wait_from, busy_s, question_s)
-                    await self._end_untyped(task, why, code)
+                    await self._end_untyped(task, why, CAP_REACHED)
                     return
                 question_running = not self._ready()
                 await self._sleep(BUSY_POLL_S)
@@ -236,10 +267,13 @@ class BackgroundTasks:
                 elif not self._lock.locked():
                     busy_s += now - last
                 last = now
+            if self._cap_left(task) <= 0:
+                await self._end_untyped(task, why, CAP_REACHED)
+                return
             idle = self._idle_seconds()
-            logger.info("background: task %s: try %d starts after waiting %.1f s (you busy %.1f s, a question "
-                        "running %.1f s, idle reading %s s)", task.id, task.tries + 1, self._clock() - wait_from,
-                        busy_s, question_s, "?" if idle is None else f"{idle:.1f}")
+            logger.info("background: task %s: try %d of %d starts after waiting %.1f s (you busy %.1f s, a "
+                        "question running %.1f s, idle reading %s s)", task.id, task.tries + 1, self._max_tries,
+                        self._clock() - wait_from, busy_s, question_s, "?" if idle is None else f"{idle:.1f}")
             if not announced:
                 self._announce(task)
                 announced = True
@@ -251,11 +285,15 @@ class BackgroundTasks:
                 return
             async with self._lock:
                 task.state = DELIVERING
-                task.tries += 1
+                task.attempts += 1
                 self._on_change()
                 result = await self._deliver(task)
-            logger.info("background: task %s: delivery try %d: %s%s", task.id, task.tries, result.outcome,
-                        f" ({result.code})" if result.code else "")
+            counted = result.outcome == RETRY
+            if counted:
+                task.tries += 1
+            logger.info("background: task %s: delivery try %d: %s%s%s", task.id, task.tries if counted else task.tries + 1,
+                        result.outcome, f" ({result.code})" if result.code else "",
+                        "" if counted or result.outcome != NO_ANSWER else ", not counted as a try")
             if result.outcome == TYPED:
                 key = task.box_key()
                 if key is not None:
@@ -269,19 +307,27 @@ class BackgroundTasks:
             if result.outcome == GIVE_UP:
                 await self._end_untyped(task, why, code)
                 return
-            pause = self._backoff_s[min(task.tries - 1, len(self._backoff_s) - 1)]
-            if self._clock() + pause >= deadline:
-                await self._end_untyped(task, why, code)
-                return
             task.state = WAITING
             self._on_change()
-            await self._sleep(pause)
+            if result.outcome == NO_ANSWER:
+                # Gemini is slow or busy: not a try. Looked at again shortly, until the cap.
+                if not await self._pause(task, self._no_answer_gap_s):
+                    await self._end_untyped(task, why, CAP_REACHED)
+                    return
+                continue
+            if task.tries >= self._max_tries:
+                await self._end_untyped(task, why, TRIES_USED)
+                return
+            if not await self._pause(task, self._gaps_s[min(task.tries - 1, len(self._gaps_s) - 1)]):
+                await self._end_untyped(task, why, CAP_REACHED)
+                return
 
     async def _end_untyped(self, task: BgTask, why: str, code: str) -> None:
         """The draft (if any) goes to the bubble and the clipboard with the reason. Waits for the
         bubble to be free first, so a question being answered is never overwritten."""
-        task.why = why
-        logger.info("background: task %s: not typed (%s) after %d delivery tries", task.id, code, task.tries)
+        task.why, task.end_code = why, code
+        logger.info("background: task %s: not typed (%s) after %d failed tries (%d tries ran)", task.id, code,
+                    task.tries, task.attempts)
         waited_until = self._clock() + self._show_wait_s
         while not self._ready() and self._clock() < waited_until:
             await self._sleep(BUSY_POLL_S)

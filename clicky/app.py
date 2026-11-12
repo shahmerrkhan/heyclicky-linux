@@ -123,6 +123,8 @@ def main() -> int:
     tray.acting_toggled.connect(state_machine.set_act_on)
     state_machine.background_changed.connect(tray.set_background_count)
     tray.cancel_background_requested.connect(state_machine.cancel_background)
+    state_machine.background_changed.connect(lambda _count: tray.set_background_tasks(state_machine.background_lines()))
+    tray.cancel_task_requested.connect(state_machine.cancel_background_task)
     tray.show()
 
     _show_missing_key_notice(tray)

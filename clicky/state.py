@@ -20,7 +20,19 @@ from .audio.heavy_slot import HeavySlot
 from .audio.voice_files import VoiceFiles
 from .browser import open_with_command
 from .input.idle import idle_seconds
-from .tasks import FINAL, GIVE_UP, IDLE_BEFORE_FOCUS_S, RETRY, TYPED, BackgroundTasks, BgTask, Delivery
+from .tasks import (
+    CAP_REACHED,
+    FINAL,
+    GIVE_UP,
+    IDLE_BEFORE_FOCUS_S,
+    NO_ANSWER,
+    RETRY,
+    TRIES_USED,
+    TYPED,
+    BackgroundTasks,
+    BgTask,
+    Delivery,
+)
 from .config import ENV_FILE, settings
 from .llm.claude_code import (
     ClaudeCodeClient,
@@ -1181,6 +1193,15 @@ class CompanionStateMachine(QObject):
         if cancelled and self._foreground_free():
             self._explain(f"Cancelled {cancelled} background task{'s' if cancelled != 1 else ''}. Nothing was typed.")
 
+    def background_lines(self) -> list[tuple[str, str]]:
+        """One line per running background task, for the tray: (task id, "Draft for opera: try 3 of 10")."""
+        return [(t.id, f"Draft for {t.target.app_name}: {self._tasks.progress(t)}") for t in self._tasks.running()]
+
+    def cancel_background_task(self, task_id: str) -> None:
+        """The tray's Cancel on one task: it stops; nothing more is typed for it."""
+        if self._tasks.cancel(task_id) and self._foreground_free():
+            self._explain("Cancelled that background task. Nothing was typed.")
+
     def _background_changed(self) -> None:
         self.background_changed.emit(self._tasks.count())
 
@@ -1282,6 +1303,11 @@ class CompanionStateMachine(QObject):
             self._bubble_code("background_no_draft")
             return
         self._memory.add(task.request, task.draft)
+        if task.end_code in (TRIES_USED, CAP_REACHED):
+            # Every try failed, or the time ran out: said plainly, with the last reason. Never spoken.
+            line = f"Clicky tried but couldn't get your draft into {task.target.app_name}. Last reason: {why}."
+            await self._nothing_typed(task.draft, line, task.draft, code=f"background_failed_{task.end_code}")
+            return
         await self._nothing_typed(task.draft, f"Not typed: {why}.", task.draft, code="background_not_typed")
 
     async def _deliver_background(self, task: BgTask) -> Delivery:
@@ -1325,6 +1351,9 @@ class CompanionStateMachine(QObject):
                 return Delivery(FINAL, "stopped with Esc", "esc")
             finally:
                 self._check_task = None
+            if result.no_plan:
+                # Gemini was too slow or busy to give a plan: not a try, it is looked at again soon.
+                return Delivery(NO_ANSWER, "Gemini didn't answer in time", "no_plan")
             if result.status in (FAILED, UNSURE, OPEN, FOCUS, BLOCKED, NEED_BUTTONS):
                 # No box for it right now: nothing was typed, so it can be tried again later.
                 return Delivery(RETRY, result.why or "the box for it couldn't be found", f"check_{result.status}")

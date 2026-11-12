@@ -52,6 +52,7 @@ class TrayController(QObject):
     voice_toggled = pyqtSignal(bool)
     acting_toggled = pyqtSignal(bool)
     cancel_background_requested = pyqtSignal()
+    cancel_task_requested = pyqtSignal(str)  # one background task, by its id
     stop_voice_requested = pyqtSignal()
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -85,8 +86,10 @@ class TrayController(QObject):
         self._background_action.setEnabled(False)
         self._background_action.triggered.connect(self.cancel_background_requested.emit)
         menu.addAction(self._background_action)
-
-        menu.addSeparator()
+        # One line per running task ("Draft for opera: try 3 of 10"), each with its own Cancel.
+        self._menu = menu
+        self._task_menus: list[QMenu] = []
+        self._tasks_end = menu.addSeparator()
 
         restart_action = QAction("Restart", self)
         restart_action.triggered.connect(self.restart_requested.emit)
@@ -127,6 +130,23 @@ class TrayController(QObject):
                 f"Cancel {count} background task{'s' if count != 1 else ''} (nothing more is typed)"
             )
         self._background_action.setEnabled(count > 0)
+
+    def set_background_tasks(self, lines: list[tuple[str, str]]) -> None:
+        """The running background tasks, one line each: (task id, text). Each line opens a Cancel."""
+        for old in self._task_menus:
+            self._menu.removeAction(old.menuAction())
+            old.deleteLater()
+        self._task_menus = []
+        for task_id, text in lines:
+            sub = QMenu(text, self._menu)
+            cancel = QAction("Cancel (nothing more is typed)", sub)
+            cancel.triggered.connect(lambda _checked=False, task_id=task_id: self.cancel_task_requested.emit(task_id))
+            sub.addAction(cancel)
+            self._menu.insertMenu(self._tasks_end, sub)
+            self._task_menus.append(sub)
+
+    def background_task_lines(self) -> list[str]:
+        return [m.title() for m in self._task_menus]
 
     def show_notice(self, title: str, message: str) -> None:
         """Desktop notification from the tray icon (stays ~10 s)."""
