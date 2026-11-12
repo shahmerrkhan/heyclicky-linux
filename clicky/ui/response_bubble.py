@@ -211,6 +211,7 @@ class ResponseBubble(QWidget):
     stop_requested = pyqtSignal()
     hide_requested = pyqtSignal()  # "–": roll the bubble out of the way (the answer keeps going)
     link_clicked = pyqtSignal(str)
+    reply_clicked = pyqtSignal(str)  # a quick-reply button: its text is the user's answer
     rolled_up = pyqtSignal()  # a roll-up ended: the bubble is hidden now
 
     MODE_LABELS = {"vision": "Vision", "code": "Code", "writing": "Write"}
@@ -347,6 +348,17 @@ class ResponseBubble(QWidget):
         self._explain.hide()
         column.addWidget(self._explain)
 
+        # --- quick-reply buttons (when Clicky asks something): pressing one answers with its
+        # text. They never take focus and never press anything outside Clicky. ---------------
+        self._replies = QWidget(self._card)
+        self._replies.setObjectName("replyRow")
+        self._reply_row = QHBoxLayout(self._replies)
+        self._reply_row.setContentsMargins(0, 0, 0, 0)
+        self._reply_row.setSpacing(8)
+        self._reply_labels: list[str] = []
+        self._replies.hide()
+        column.addWidget(self._replies)
+
         # Footer under the answer: search sources, search/model notes,
         # and the usage estimates. Rich text so links are clickable;
         # clicks are emitted as `link_clicked` and the state machine picks the browser.
@@ -415,6 +427,18 @@ class ResponseBubble(QWidget):
                 padding: 9px 12px;
                 font-family: "{Fonts.FAMILY}";
                 font-size: {Fonts.FOOTER_PX}px;
+            }}
+            QPushButton#replyButton {{
+                color: {Colors.EXPLAIN_TEXT};
+                background-color: {Colors.EXPLAIN_BG};
+                border: 1px solid {Colors.DIVIDER};
+                border-radius: 10px;
+                padding: 6px 12px;
+                font-family: "{Fonts.FAMILY}";
+                font-size: {Fonts.FOOTER_PX}px;
+            }}
+            QPushButton#replyButton:hover {{
+                border: 1px solid {Colors.EXPLAIN_TEXT};
             }}
             QLabel#bubbleFooter {{
                 color: {Colors.TEXT_DIM};
@@ -547,6 +571,32 @@ class ResponseBubble(QWidget):
         self._explain.setText(text)
         self._explain.setVisible(bool(text))
         self._refit()
+
+    def set_reply_buttons(self, labels: list[str]) -> None:
+        """Quick-reply buttons under the explanation (empty list: none). A click emits
+        `reply_clicked` with the button's text; the buttons never take focus."""
+        labels = [str(label) for label in labels if str(label).strip()]
+        if labels == self._reply_labels:
+            return
+        while self._reply_row.count():
+            item = self._reply_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._reply_labels = labels
+        for label in labels:
+            button = QPushButton(label, self._replies)
+            button.setObjectName("replyButton")
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, label=label: self.reply_clicked.emit(label))
+            self._reply_row.addWidget(button)
+        self._reply_row.addStretch(1)
+        self._replies.setVisible(bool(labels))
+        self._refit()
+
+    def reply_buttons(self) -> list[str]:
+        return list(self._reply_labels)
 
     def show_at_top_centre(self, area: QRect) -> None:
         """Roll it down at the top centre of `area` (a screen's usable area, global coordinates).

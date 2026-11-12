@@ -161,6 +161,8 @@ status:
 
 "steps_left" (optional): what is still to come after this answer, as a list of these words only: "open", "switch", "press", "click", "type" (at most 6). for example ["type"] when the text can be typed now, ["press", "type"] when a button has to be pressed first. clicky uses it only to judge how far along it is; it never acts on it.
 
+"label" (optional): 2 to 4 words that name this task for the user, like "email to Sam" or "reply to Priya". clicky only shows it to the user as a reminder of an unfinished task. it is its own field: never put it in any "text", and it is never typed anywhere.
+
 reply with json only, like:
 {"status": "go", "why": "", "name_on_screen": null, "missing": [], "steps": [{"box": 2, "do": "type", "what": "recipient address", "text": "sam@example.com"}, {"box": 4, "do": "add_start", "what": "message", "main": true, "text": "Hey Sam,\\n\\nI'll be there by 5.\\n\\nBest regards,\\n{MY_NAME}"}], "leave": [{"box": 1, "why": "already has text"}]}
 """
@@ -302,6 +304,9 @@ class CheckResult:
     tag: object = None  # the acting task's (task id, step) this answer belongs to
     # A hint about the steps still to come (progress.py): only fixed names, only for the percent.
     steps_left: list[str] | None = None
+    # A few words naming the task for the user (the reminder of an unfinished task). Shown only:
+    # it is never typed, never logged, and never part of a step.
+    label: str = ""
 
 
 Capture = Callable[[], Awaitable[list[CapturedScreen]]]
@@ -583,7 +588,7 @@ def read_reply(
     """The model's answer as a result, or None when it's unreadable (the next model is asked).
 
     "open", "focus" and "blocked" count only with `acting` (the tray switch on); without it
-    they are unreadable, as before. The optional extras (`steps_left`) never make an answer
+    they are unreadable, as before. The optional extras (`steps_left`, `label`) never make an answer
     unreadable: one that isn't exactly as asked is dropped and the rest of the answer stands.
     """
     data = _json_object(reply)
@@ -592,7 +597,26 @@ def read_reply(
     result = _read_answer(data, fields, screens, acting, buttons, point_ok)
     if result is not None:
         result.steps_left = valid_hints(data.get("steps_left"))
+        result.label = task_label(data.get("label"))
     return result
+
+
+LABEL_WORDS = (2, 4)
+LABEL_LIMIT = 40  # characters
+
+
+def task_label(value: object) -> str:
+    """The reply's "label" when it is 2 to 4 words on one line, at most LABEL_LIMIT characters,
+    with no control characters; otherwise "" (the app's name is used instead)."""
+    if not isinstance(value, str):
+        return ""
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return ""
+    words = value.split()
+    label = " ".join(words)
+    if not LABEL_WORDS[0] <= len(words) <= LABEL_WORDS[1] or len(label) > LABEL_LIMIT:
+        return ""
+    return label
 
 
 def _read_answer(

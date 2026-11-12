@@ -26,6 +26,8 @@ Rules, all in this file so they can be tested with fakes:
   - Gemini failing to write the draft is tried again up to len(DRAFT_GAPS_S) times, with those
     pauses. These are not delivery tries. If every one fails, the bubble says so.
   - Two tasks never type into the same box: the second one's draft goes to the bubble instead.
+  - While Clicky reminds the user of an unfinished task (`hold` / `release`), no try starts and
+    the cap stands still.
   - Cancelled or quit: nothing more is typed.
   - Pending tasks are saved (taskstore.py, by state.py) and carry on after a crash or a tray
     Restart: `resume`. The cap keeps counting real time while Clicky is not running.
@@ -95,6 +97,9 @@ class BgTask:
     # request, still running. The writer waits for it instead of asking again (state.py).
     adopted: asyncio.Future | None = None
     announced: bool = False  # the bubble already said the draft is on its way (a handoff)
+    label: str = ""  # a few words naming the task for the reminder ("email to Sam"); shown only, never typed
+    reminded: bool = False  # the user was reminded of it once, before a new request
+    hurry: asyncio.Event = field(default_factory=asyncio.Event)  # "Finish it": the next try doesn't wait for its gap
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     state: str = WRITING
     draft: str = ""
@@ -149,6 +154,7 @@ class BackgroundTasks:
         self._typed_boxes: set[tuple] = set()  # boxes a background draft went into
         self._lock = asyncio.Lock()  # one delivery at a time
         self._closed = False
+        self._held_at: float | None = None  # the reminder is open: no try starts, and the cap stands still
 
     # --- the list -----------------------------------------------------------------
     def running(self) -> list[BgTask]:
@@ -292,14 +298,49 @@ class BackgroundTasks:
             self._on_change()
 
     def _cap_left(self, task: BgTask) -> float:
-        """Seconds left before DELIVERY_CAP_S after the draft was ready (real clock time)."""
-        return (task.ready_at or self._wall()) + self._cap_s - self._wall()
+        """Seconds left before DELIVERY_CAP_S after the draft was ready (real clock time). While
+        the reminder is open (`hold`) the time stands still."""
+        now = self._held_at if self._held_at is not None else self._wall()
+        return (task.ready_at or now) + self._cap_s - now
 
     async def _pause(self, task: BgTask, seconds: float) -> bool:
-        """Wait between tries. False when the cap came first."""
+        """Wait between tries (cut short by "Finish it"). False when the cap came first."""
         left = self._cap_left(task)
-        await self._sleep(max(0.0, min(seconds, left)))
+        if not task.hurry.is_set():
+            nap = asyncio.ensure_future(self._sleep(max(0.0, min(seconds, left))))
+            hurry = asyncio.ensure_future(task.hurry.wait())
+            try:
+                await asyncio.wait({nap, hurry}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                nap.cancel()
+                hurry.cancel()
+        task.hurry.clear()
         return self._cap_left(task) > 0
+
+    # --- the reminder (state.py): hold everything while the user decides ---------------
+    def hold(self) -> None:
+        """The reminder is open: no try starts, and the 10-minute cap stands still."""
+        if self._held_at is None:
+            self._held_at = self._wall()
+
+    def release(self) -> None:
+        """The reminder is answered: the time it was open isn't counted against any task."""
+        if self._held_at is None:
+            return
+        held_for = max(0.0, self._wall() - self._held_at)
+        self._held_at = None
+        for task in self.running():
+            if task.ready_at is not None:
+                task.ready_at += held_for
+        self._on_change()
+
+    def to_remind(self) -> BgTask | None:
+        """A running task the user hasn't been reminded of yet (the oldest first)."""
+        return next((t for t in self.running() if not t.reminded), None)
+
+    def hurry(self, task: BgTask) -> None:
+        """"Finish it": the task's next try starts as soon as the user is idle, without its gap."""
+        task.hurry.set()
 
     async def _land(self, task: BgTask) -> None:
         if task.ready_at is None:
@@ -310,7 +351,7 @@ class BackgroundTasks:
             # A try never starts while a question is running or the user is typing or clicking.
             wait_from = last = self._clock()
             busy_s = question_s = 0.0  # for the log: what the wait was spent on
-            while not (self._ready() and self._user_idle() and not self._lock.locked()):
+            while not (self._held_at is None and self._ready() and self._user_idle() and not self._lock.locked()):
                 if not announced and self._ready():
                     self._announce(task)  # the bubble says it's ready even while the user keeps typing
                     announced = True

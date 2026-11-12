@@ -34,6 +34,8 @@ from .tasks import (
     RETRY,
     TRIES_USED,
     TYPED,
+    ACTIVE_STATES,
+    DELIVERING,
     MAX_TASKS,
     BackgroundTasks,
     BgTask,
@@ -103,6 +105,7 @@ from .writing.fields import (
     click_wait_result,
     earlier_for,
     focused_field,
+    task_label,
     list_fields,
     set_closeup,
     match_piece,
@@ -162,6 +165,10 @@ BACKGROUND_READY_LINE = "Your draft is ready."
 HANDOFF_TEXT = (
     "This is taking a while, so I'll finish it in the background. Keep working; I'll put it in once you pause."
 )
+# Before a new request, when a background task is still unfinished (once per task):
+REMINDER_BUTTONS = ("Finish it", "Wait", "Drop it")
+REMINDER_HINT = "Finish it first, let it wait, or drop it? Your new request runs right after."
+FINISH_WAIT_S = 30.0  # "Finish it": how long the new request waits for the task's try to start
 HANDOFF_POLL_S = 0.25  # how often the clock and the percent of a running Write request are looked at
 TYPED_STATUS = "Draft typed into your window."  # the spoken status line of a draft typed in full
 
@@ -209,7 +216,18 @@ class _WriteJob:
     handoff: bool = False  # the marks were passed: it goes to the background at the next safe point
     typing: bool = False  # typing has started: it always finishes in the foreground
     go: asyncio.Event = dc_field(default_factory=asyncio.Event)  # set with `handoff` (wakes the draft stage)
+    label: str = ""  # the check's few words naming the task (for the reminder, if it is handed off)
     watcher: asyncio.Task | None = None
+
+
+@dataclass
+class _Reminder:
+    """Clicky reminded the user of an unfinished background task instead of running their new
+    request at once. The request is held here until they pick Finish it, Wait or Drop it."""
+
+    task: BgTask
+    held: tuple  # the new request: (prompt, region, options). It is never lost.
+    finishing: asyncio.Task | None = None  # "Finish it": waiting for the task's try to end
 
 
 class _KnownTranscript:
@@ -320,6 +338,7 @@ class CompanionStateMachine(QObject):
         )
         self._delivering: BgTask | None = None  # the background draft being typed right now
         self._job: _WriteJob | None = None  # the Write request running in the foreground (for the handoff)
+        self._reminder: _Reminder | None = None  # an unfinished task was pointed out; a new request is held
         self._store_frozen = False  # shutting down: the saved task list is left exactly as it is
         self._drop_tasks = False  # the user chose Quit: pending tasks are dropped, not resumed
         self._asked: stages.PausableClock | None = None  # started when the user sent the request
@@ -337,6 +356,7 @@ class CompanionStateMachine(QObject):
         overlay.workspace_changed.connect(self._on_workspace_changed)
         overlay.speak_changed.connect(self.set_speak_on)
         overlay.bubble_link_clicked.connect(self._on_bubble_link_clicked)
+        overlay.bubble_reply_clicked.connect(self._on_reply_clicked)
 
         overlay.apply_agent_mode(
             self._persisted.agent_mode,
@@ -556,8 +576,16 @@ class CompanionStateMachine(QObject):
 
     # --- slots ----------------------------------------------------------------
 
+    def _on_reply_clicked(self, label: str) -> None:
+        """A quick-reply button in the bubble: its text is the user's answer, exactly as if they
+        had typed it. Nothing outside Clicky is pressed."""
+        self._on_prompt_submitted(label, None, AskOptions())
+
     def _on_prompt_submitted(self, prompt: str, region: QRect | None, options: AskOptions | None = None) -> None:
         options = options or AskOptions()
+        if self._reminder is not None:
+            self._answer_reminder(prompt, region, options)
+            return
         if self._delivering is not None and self._waiting is None:
             # A background draft is being typed this very moment (a few seconds): the question
             # runs right after, so the two never share the bubble or the keyboard.
@@ -567,6 +595,12 @@ class CompanionStateMachine(QObject):
             if self._offer_reply(prompt, spoken=False):
                 return
             self._end_wait()  # anything else ends the wait and runs as a new question
+        else:
+            unfinished = self._tasks.to_remind()
+            if unfinished is not None:
+                self._remind(unfinished, (prompt, region, options))
+                return
+        self._overlay.set_bubble_replies([])
         # The speak switch: typed questions, and a Code-mode voice transcript sent from the bar.
         speak = self._persisted.speak_on
         self._stop_voice_processes()
@@ -610,7 +644,90 @@ class CompanionStateMachine(QObject):
         )
         self._speak_task = self._current_task if speak else None
 
+    # --- the reminder before a new request ----------------------------------------------
+
+    def _remind(self, task: BgTask, held: tuple) -> None:
+        """A background task is still unfinished and the user starts something new: say so first,
+        once per task, with three buttons. The new request is held and never lost; while the
+        reminder is open no background try starts and the 10-minute cap stands still."""
+        task.reminded = True
+        self._reminder = _Reminder(task, held)
+        self._tasks.hold()
+        name = task.label or f"the draft for {task.target.app_name}"
+        self._set_state(CompanionState.IDLE)
+        self._overlay.set_bubble_mode("writing")
+        self._overlay.set_bubble_said("")
+        self._overlay.update_bubble_footer("")
+        self._overlay.update_bubble_text(f"You still have an unfinished task: {name}.")
+        self._explain(REMINDER_HINT)
+        self._overlay.set_bubble_replies(list(REMINDER_BUTTONS))
+        self._overlay.show_bubble()
+        self._overlay.bring_back()
+        self._bubble_code("reminder")
+        logger.info("reminder: shown for task %s (its name: %d characters)", task.id, len(name))
+        self._save_tasks()
+
+    def _answer_reminder(self, prompt: str, region: QRect | None, options: AskOptions) -> None:
+        """The user's answer to the reminder: a button, or the same words typed."""
+        reminder = self._reminder
+        said = re.sub(r"[^a-z ]", "", prompt.lower()).strip()
+        if reminder.finishing is not None:
+            # Already finishing: whatever comes now is the user's newest request, held instead.
+            reminder.held = (prompt, region, options)
+            return
+        if said in ("finish it", "finish", "finish it first"):
+            choice = "finish"
+        elif said in ("wait", "let it wait", "later", "not now"):
+            choice = "wait"
+        elif said in ("drop it", "drop", "cancel it"):
+            choice = "drop"
+        else:
+            self._explain("Pick one first: Finish it, Wait or Drop it. Your new request runs right after.")
+            return
+        logger.info("reminder: task %s: the user chose %s", reminder.task.id, choice)
+        self._overlay.set_bubble_replies([])
+        if choice == "finish":
+            self._tasks.release()
+            self._tasks.hurry(reminder.task)
+            self._overlay.update_bubble_text(reminder.task.draft or "…")
+            self._explain("Finishing it first: leave the keyboard and mouse alone for 3 seconds. Your new request runs right after.")
+            self._bubble_code("reminder_finishing")
+            reminder.finishing = asyncio.ensure_future(self._finish_first(reminder))
+            return
+        if choice == "drop":
+            self._tasks.cancel(reminder.task.id)
+        self._end_reminder(run_held=True)
+
+    async def _finish_first(self, reminder: _Reminder) -> None:
+        """"Finish it": wait for the task's next try (it still needs the user's idle gap) to start
+        and end, then run the held request. If no try can start within FINISH_WAIT_S, the task
+        stays pending and the held request runs anyway."""
+        task, tries_before = reminder.task, reminder.task.attempts
+        deadline = time.monotonic() + FINISH_WAIT_S
+        while task.state in ACTIVE_STATES and task.attempts == tries_before and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        while task.state == DELIVERING or self._delivering is task:
+            await asyncio.sleep(0.1)
+        if self._reminder is reminder:
+            self._end_reminder(run_held=True)
+
+    def _end_reminder(self, run_held: bool) -> None:
+        reminder, self._reminder = self._reminder, None
+        if reminder is None:
+            return
+        if reminder.finishing is not None and not reminder.finishing.done() and reminder.finishing is not asyncio.current_task():
+            reminder.finishing.cancel()
+        self._overlay.set_bubble_replies([])
+        self._tasks.release()
+        if run_held:
+            self._on_prompt_submitted(*reminder.held)  # the held request: never lost
+
     def _on_overlay_dismissed(self) -> None:
+        held = None
+        if self._reminder is not None:
+            # The reminder was closed (Esc, ×): the same as "Wait". The held request still runs.
+            held = self._reminder.held
+            self._end_reminder(run_held=False)
         self._end_wait()
         if self._wait_voice_task is not None and not self._wait_voice_task.done():
             self._wait_voice_task.cancel()
@@ -618,6 +735,8 @@ class CompanionStateMachine(QObject):
         self._stop_voice_processes()
         self._voice_busy = False
         self._set_state(CompanionState.IDLE)
+        if held is not None:
+            self._on_prompt_submitted(*held)  # never lost
 
     def _on_mode_changed(self, mode: str) -> None:
         if mode not in ("vision", "code", "writing"):
@@ -1336,6 +1455,7 @@ class CompanionStateMachine(QObject):
             self._explain("Not typed: too many background tasks are running." if draft else "Stopped: too many background tasks are running.")
             self._bubble_code("handoff_no_room")
             return
+        task.label = job.label
         task.setup = asyncio.ensure_future(self._note_background_window(task, self._earlier_in(target)))
         if draft:
             self._overlay.update_bubble_text(draft)
@@ -1433,6 +1553,8 @@ class CompanionStateMachine(QObject):
             "attempts": task.attempts,
             "typing_started": task.typing_started,
             "ready_at": task.ready_at,
+            "label": task.label,
+            "reminded": task.reminded,
             "length": getattr(parsed, "length", None),
             "strong": bool(getattr(parsed, "strong", False)),
         }
@@ -1463,6 +1585,7 @@ class CompanionStateMachine(QObject):
             follow_up=bool(record.get("follow_up")) and bool(earlier), earlier=earlier,
             tries=int(record.get("tries") or 0), attempts=int(record.get("attempts") or 0),
             typing_started=bool(record.get("typing_started")),
+            label=task_label(record.get("label")), reminded=bool(record.get("reminded")),
             ready_at=float(ready_at) if isinstance(ready_at, (int, float)) and not isinstance(ready_at, bool) else None,
         )
         return task
@@ -1488,6 +1611,8 @@ class CompanionStateMachine(QObject):
         """No question is being asked, answered, waited on or typed, and the input bar is closed."""
         if self._state != CompanionState.IDLE or self._waiting is not None or self._delivering is not None:
             return False
+        if self._reminder is not None and self._reminder.finishing is None:
+            return False  # the reminder is waiting for the user's choice: the bubble is theirs
         if self._current_task is not None and not self._current_task.done():
             return False
         return not self._overlay.input_visible()
@@ -1897,6 +2022,11 @@ class CompanionStateMachine(QObject):
                 return await ended("stopped with Esc", "Stopped before typing.", draft, FINAL, "esc", needs_user=False)
             finally:
                 self._check_task = None
+            if result.label:  # a few words naming the task: shown in the reminder only, never typed
+                if job is not None:
+                    job.label = result.label
+                if bg is not None:
+                    bg.label = result.label
             if job is not None:
                 job.progress.finish(stages.CHECK)
                 job.progress.set_left(result.steps_left)  # a hint: changes the percent only

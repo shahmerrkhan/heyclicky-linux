@@ -848,6 +848,7 @@ class Overlay(QObject):
     workspace_changed = pyqtSignal(str)
     speak_changed = pyqtSignal(bool)  # the input bar's speak switch was flipped
     bubble_link_clicked = pyqtSignal(str)
+    bubble_reply_clicked = pyqtSignal(str)  # a quick-reply button in the bubble
 
     def __init__(self) -> None:
         super().__init__()
@@ -884,6 +885,7 @@ class Overlay(QObject):
         self._pill.clicked.connect(self.unhide)
         self._pill.close_requested.connect(self.dismiss)
         self._bubble.link_clicked.connect(self.bubble_link_clicked.emit)
+        self._bubble.reply_clicked.connect(self.bubble_reply_clicked.emit)
         self._area_selector.area_selected.connect(self._on_area_selected)
         self._area_selector.cancelled.connect(self._on_area_selection_cancelled)
 
@@ -1019,6 +1021,14 @@ class Overlay(QObject):
 
     def set_bubble_said(self, text: str) -> None:
         self._bubble.set_said(text)
+
+    def set_bubble_replies(self, labels: list[str]) -> None:
+        """Quick-reply buttons in the bubble (an empty list removes them)."""
+        self._note_change(list(labels) != self._bubble.reply_buttons())
+        self._bubble.set_reply_buttons(labels)
+
+    def bubble_replies(self) -> list[str]:
+        return self._bubble.reply_buttons()
 
     def set_bubble_explanation(self, text: str) -> None:
         self._note_change(text != self._bubble.explanation())
