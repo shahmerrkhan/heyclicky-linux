@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from pathlib import Path
+from collections.abc import Callable
 from typing import cast
 
 from PyQt6.QtCore import QObject, QRect, QTimer, pyqtSignal
@@ -1319,8 +1320,7 @@ class CompanionStateMachine(QObject):
                 job = asyncio.current_task()
                 if job is not None and job.cancelling():
                     raise  # the task itself was cancelled (the tray, quitting)
-                task.typing_started = True  # Esc: never tried again
-                self._memory.add(task.request, task.draft)
+                self._memory.add(task.request, task.draft)  # Esc ends the task: never tried again
                 await self._nothing_typed(task.draft, "Stopped before typing.", task.draft, needs_user=False)
                 return Delivery(FINAL, "stopped with Esc", "esc")
             finally:
@@ -1328,8 +1328,22 @@ class CompanionStateMachine(QObject):
             if result.status in (FAILED, UNSURE, OPEN, FOCUS, BLOCKED, NEED_BUTTONS):
                 # No box for it right now: nothing was typed, so it can be tried again later.
                 return Delivery(RETRY, result.why or "the box for it couldn't be found", f"check_{result.status}")
-            task.typing_started = True  # from here on this draft is never delivered a second time
-            status = await self._type_checked(task.draft, task.request, target, result, earlier=task.earlier)
+            _steps, rule, why = self._vetted(result, task.request, task.draft, task.earlier)
+            if rule == "model_said_stop":
+                # The model's own "stop" is a failed try: the screen may be different next time.
+                logger.info("fill: nothing typed: the model said stop (its reason: %d characters)", len(result.why))
+                return Delivery(RETRY, why, "model_stop")
+            if why is not None:
+                # A safety rule refused the plan: the task ends here and is never retried.
+                logger.info("fill: nothing typed: plan of %d step(s) refused by rule %s", len(_steps), rule)
+                return Delivery(GIVE_UP, why, f"refused_{rule}")
+
+            def typing_starts() -> None:
+                task.typing_started = True  # right before the first character: never delivered a second time
+
+            status = await self._type_checked(
+                task.draft, task.request, target, result, earlier=task.earlier, on_typing=typing_starts
+            )
             typed = status == TYPED_STATUS
             return Delivery(TYPED if typed else FINAL, "" if typed else "it wasn't typed in full", "typed" if typed else "not_typed")
         finally:
@@ -1751,11 +1765,13 @@ class CompanionStateMachine(QObject):
     async def _type_checked(
         self, draft: str, request: str, target: WritingTarget | None, result: CheckResult,
         earlier: list[Earlier] | None = None,
+        on_typing: Callable[[], None] | None = None,
     ) -> str | None:
         """The check said where to type (or why not): the safety rules (fill.py), then typing.
 
         `earlier`: what this request is a follow-up to. None: whatever Clicky typed last in that
-        window (the foreground); a background task hands in what it noted when the user asked."""
+        window (the foreground); a background task hands in what it noted when the user asked.
+        `on_typing`: called once, right before the first character can be typed."""
         if earlier is None:
             earlier = self._earlier_in(target)
         if result.status == FAILED:
@@ -1763,13 +1779,7 @@ class CompanionStateMachine(QObject):
             logger.info("fill: nothing typed: check_failed")
             self._memory.add(request, draft)
             return await self._nothing_typed(draft, f"Not typed: {result.why}.", f"{FAILED_TEXT}\n\n{draft}")
-        steps = soften(result.steps, earlier) if result.status == GO else result.steps
-        why = (result.why or "it couldn't be done in that window") if result.status == STOP else None
-        rule = "model_said_stop" if why is not None else ""
-        if why is None:
-            refused = vet_rule(steps, request, draft, result.fields, earlier)
-            if refused is not None:
-                rule, why = refused
+        steps, rule, why = self._vetted(result, request, draft, earlier)
         if why is not None:
             logger.info("fill: nothing typed: plan of %d step(s) refused by rule %s%s", len(steps), rule,
                         f" (the model's reason: {len(result.why)} characters)" if rule == "model_said_stop" else "")
@@ -1803,12 +1813,17 @@ class CompanionStateMachine(QObject):
         else:
             assert target is not None
             fill_started = time.monotonic()
-            outcome = await self._with_esc_grab(
-                "\n".join(s.text for s in steps),
-                lambda cancel: run_steps(
+            def type_steps(cancel: asyncio.Event):
+                if on_typing is not None:
+                    on_typing()  # Esc is held and the rules passed: typing starts now
+                return run_steps(
                     target, steps, self._typer.type_draft, cancel, self._typer.activate, self._move_to_clear,
                     earlier, self._typer.rewrite_part,
-                ),
+                )
+
+            outcome = await self._with_esc_grab(
+                "\n".join(s.text for s in steps),
+                type_steps,
                 refused=lambda why: FillOutcome(rest=list(steps), why=why, code="esc_grab_refused"),
             )
             methods = sorted({t.result.method for t in outcome.typed if t.result.method})
@@ -1829,6 +1844,20 @@ class CompanionStateMachine(QObject):
         if result.missing:
             self._add_note(f"Left empty: {_join_labels(result.missing)} (you didn't give it, and Clicky never makes it up).")
         return status
+
+    @staticmethod
+    def _vetted(
+        result: CheckResult, request: str, draft: str, earlier: list[Earlier]
+    ) -> tuple[list[Step], str, str | None]:
+        """The plan after the safety rules (fill.py): (steps, rule, why). `why` is None when it may
+        be typed; otherwise `rule` names what refused it ("model_said_stop": the model itself)."""
+        steps = soften(result.steps, earlier) if result.status == GO else result.steps
+        if result.status == STOP:
+            return steps, "model_said_stop", result.why or "it couldn't be done in that window"
+        refused = vet_rule(steps, request, draft, result.fields, earlier)
+        if refused is not None:
+            return steps, refused[0], refused[1]
+        return steps, "", None
 
     def _earlier_in(self, target: WritingTarget | None) -> list[Earlier]:
         """What Clicky typed last time in this window, from a checked draft (empty: not a follow-up)."""

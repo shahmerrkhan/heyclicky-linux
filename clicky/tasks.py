@@ -11,7 +11,11 @@ Rules, all in this file so they can be tested with fakes:
     using the keyboard or mouse: delivery waits until they have been idle IDLE_BEFORE_FOCUS_S.
     An idle time that can't be read counts as "busy".
   - One delivery at a time, and a task's delivery reaches the typing stage at most once
-    (`BgTask.typing_started`): after that it is never retried, whatever happened.
+    (`BgTask.typing_started`, set right before the first character is typed): after that it
+    is never retried, whatever happened.
+  - A safety rule that refuses the plan (the box already has text, a made-up address) ends the
+    task at once: the user is told why, and it is never retried. The model's own "stop" is only
+    a failed try.
   - A delivery that typed nothing because the place wasn't there (window closed or hidden,
     box not found, no plan) is retried with growing pauses (BACKOFF_S) until DELIVERY_LIMIT_S
     after the draft was ready. Then the draft goes to the bubble and the clipboard, with the
@@ -52,7 +56,8 @@ class Delivery:
 
     TYPED: the draft is in the box. FINAL: it ended some other way the user was already told
     about (a rule refused it, Esc, typed partly); never tried again. RETRY: nothing was typed
-    and the place may come back. GIVE_UP: nothing was typed and trying again can't help.
+    and the place may come back. GIVE_UP: nothing was typed and trying again can't help or
+    isn't allowed (a safety rule refused the plan, the window shows another app now).
     """
 
     outcome: str
